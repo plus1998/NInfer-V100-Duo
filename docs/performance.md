@@ -103,12 +103,12 @@ the measured 512-token decode window. The bundled 65,536-token benchmark corpus 
 this case:
 
 ```bash
-cmake -S . -B build-v100 -DNINFER_BUILD_BENCHMARKS=ON
-cmake --build build-v100 --target ninfer_bench ninfer_v100_corpus -j
+cmake -S . -B build-v100-duo -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-v100-duo --target ninfer_bench ninfer_v100_corpus -j
 
 LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-build-v100/bench/ninfer_v100_corpus \
-  /Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+build-v100-duo/bench/ninfer_v100_corpus \
+  /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
   /tmp/v100-code-85000.ids --code-chat 85000 --output-tokens 1024 \
   src/core/host_worker_pool.h \
   src/core/host_worker_pool.cpp \
@@ -121,8 +121,8 @@ build-v100/bench/ninfer_v100_corpus \
   src/ops/kernel/gqa_attention_decode_i8_tc_volta.cuh
 
 LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-build-v100/bench/ninfer_bench \
-  --weights /Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+build-v100-duo/bench/ninfer_bench \
+  --weights /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
   --tp 2 --devices 0,1 --max-ctx 180000 --kv-dtype int8 \
   --prefill-chunk 1024 --mtp-draft-tokens 3 --lm-head-draft \
   --corpus /tmp/v100-code-85000.ids \
@@ -203,8 +203,8 @@ Reproduce the prompt and comparison using the existing artifact and Python 3.11 
 
 ```bash
 LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-build-v100/bench/ninfer_v100_corpus \
-  /Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+build-v100-duo/bench/ninfer_v100_corpus \
+  /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
   /tmp/v100-code-512.ids --code-chat 512 --output-tokens 1024 \
   src/core/host_worker_pool.h
 
@@ -249,12 +249,12 @@ artifact:
 
 ```bash
 export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-NINFER_V100_DUO_ARTIFACT=/Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
-  build-v100/tests/ninfer_qwen3_8_27b_v100-duo_prefix_real_test
+NINFER_V100_DUO_ARTIFACT=/Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  build-v100-duo/tests/ninfer_qwen3_8_27b_v100-duo_prefix_real_test
 
 .venv/bin/python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact /Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
-  --server-bin build-v100/apps/ninfer-serve --backend mtp \
+  --artifact /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer \
+  --server-bin build-v100-duo/apps/ninfer-serve --backend mtp \
   --tp 2 --devices 0,1 --kv-dtype int8
 ```
 

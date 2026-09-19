@@ -5,7 +5,7 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 : "${NINFER_GPU_UUID:?set NINFER_GPU_UUID to the UUID of the preferred V100 SXM2}"
 readonly NINFER_GPU_UUID
-readonly NINFER_EXECUTABLE="${NINFER_EXECUTABLE:-${REPOSITORY_ROOT}/build-v100/apps/ninfer}"
+readonly NINFER_EXECUTABLE="${NINFER_EXECUTABLE:-${REPOSITORY_ROOT}/build-v100-duo/apps/ninfer}"
 
 if [[ ! -x "${NINFER_EXECUTABLE}" ]]; then
     echo "ninfer executable is missing: ${NINFER_EXECUTABLE}" >&2

@@ -1,4 +1,4 @@
-# Ninfer V100 Duo
+# NInfer V100 Duo
 
 C++/CUDA inference engine for the official **Qwen3.8-27B NVFP4** artifact on
 **2x Tesla V100-SXM2 16 GB NVLink**. The NVFP4 arithmetic is implemented in software for Volta;
@@ -29,6 +29,16 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
 
 The official v3 artifact is read directly. No conversion, downgrade, or runtime weight repacking is
 performed.
+
+## Quick Start
+
+After downloading the model to the default path above, build and start NInfer with one command
+each:
+
+```bash
+tools/v100/build.sh
+tools/v100/ninfer-v100-duo.sh
+```
 
 ## Performance
 
@@ -63,16 +73,18 @@ fit this two-card 16 GiB profile.
 
 ## Build
 
+For a fresh checkout, the equivalent manual dependency, configure, and build steps are:
+
 ```bash
-git clone https://github.com/plus1998/ninfer-v100-nvlink-duo.git
-cd ninfer-v100-nvlink-duo
+git clone https://github.com/plus1998/NInfer-V100-Duo.git
+cd NInfer-V100-Duo
 tools/v100/build_dependencies.sh
 
 PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build-v100-duo -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=70
-cmake --build build-v100 -j
+cmake --build build-v100-duo -j
 ```
 
 ## Run
@@ -87,32 +99,13 @@ Recommended production configuration:
 | Speculative decoding | `--spec mtp --draft-tokens 3 --lm-head-draft` |
 | Concurrency | `--max-concurrency 1` |
 
-Start the HTTP server directly with the complete recommended configuration:
+The no-argument command uses the official model path, binds to `127.0.0.1:8080`, and starts one
+request slot. To select another model or override server options, pass them explicitly:
 
 ```bash
-./build-v100/apps/ninfer-serve \
-  ~/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer \
-  --tp 2 --devices 0,1 \
-  --max-context 196608 \
-  --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --max-concurrency 1 \
-  --host 127.0.0.1 --port 8080
-```
-
-The convenience launcher supplies the same TP2, context, KV, and MTP defaults:
-
-```bash
-# CLI
-NINFER_V100_DUO_ARTIFACT=~/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer \
 tools/v100/ninfer-v100-duo.sh \
-  --prompt "Hello" --max-new 128 --greedy --no-thinking
-
-# HTTP Server
-NINFER_V100_DUO_EXECUTABLE="$PWD/build-v100/apps/ninfer-serve" \
-NINFER_V100_DUO_ARTIFACT=~/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer \
-tools/v100/ninfer-v100-duo.sh \
-  --host 127.0.0.1 --port 8080 --max-concurrency 1
+  model=/path/to/model.ninfer \
+  --host 0.0.0.0 --port 8081 --max-concurrency 1
 ```
 
 ## Requirements
@@ -121,7 +114,7 @@ tools/v100/ninfer-v100-duo.sh \
 - 2x V100-SXM2 16 GB with NVLink
 - CUDA 12.8
 - CMake 3.28+, C++20, Ninja
-- FFmpeg dev libs, libcurl, pkg-config
+- OpenSSL and zlib development headers, pkg-config
 
 ## License
 

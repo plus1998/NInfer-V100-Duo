@@ -764,7 +764,7 @@ selected `lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`, with the
 .venv/bin/python -m tools.convert.qwen3_8_27b.convert_gguf \
   --model /path/to/Qwen3.8-27B-Q4_K_M.gguf \
   --mmproj /path/to/mmproj-Qwen3.8-27B-BF16.gguf \
-  --out /Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer
+  --out /Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer
 ```
 
 For third-party Q4_K_M GGUFs (e.g. community fine-tunes) that use the same Qwen3.8-27B base

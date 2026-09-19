@@ -230,9 +230,9 @@ def main():
     parser.add_argument("--capacities", nargs="+", type=int, default=DEFAULT_CAPACITIES)
     parser.add_argument("--corpus", type=Path, default=Path("/tmp/v100-code-512.ids"))
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--ninfer", type=Path, default=ROOT / "build-v100/bench/ninfer_bench")
+    parser.add_argument("--ninfer", type=Path, default=ROOT / "build-v100-duo/bench/ninfer_bench")
     parser.add_argument("--weights", type=Path,
-                        default=Path("/Models/ninfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer"))
+                        default=Path("/Models/NInfer-V100-Duo/qwen3_8_27b_q4_k_m.ninfer"))
     parser.add_argument("--gguf", type=Path, default=Path(
         "/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"))
     parser.add_argument("--llama-server", type=Path, default=Path(
