@@ -12,5 +12,6 @@ NINFER_DEPS_DIR="${deps_dir}" "${script_dir}/build_dependencies.sh"
 PKG_CONFIG_PATH="${deps_dir}/install/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \
     cmake -S "${repo_dir}" -B "${build_dir}" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-        -DCMAKE_CUDA_ARCHITECTURES=70
-cmake --build "${build_dir}" -j
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF
+cmake --build "${build_dir}" --target ninfer ninfer-serve -j

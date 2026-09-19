@@ -27,17 +27,16 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
   --local-dir ~/models/Qwen3.8-27B-nvfp4-NInfer
 ```
 
-The official v3 artifact is read directly. No conversion, downgrade, or runtime weight repacking is
-performed.
+NInfer uses the official v3 artifact.
 
 ## Quick Start
 
-After downloading the model to the default path above, build and start NInfer with one command
-each:
+After downloading the model, build and start NInfer:
 
 ```bash
 tools/v100/build.sh
-tools/v100/ninfer-v100-duo.sh
+tools/v100/ninfer-v100-duo.sh \
+  model="$HOME/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer"
 ```
 
 ## Performance
@@ -83,8 +82,9 @@ tools/v100/build_dependencies.sh
 PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
 cmake -S . -B build-v100-duo -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
-  -DCMAKE_CUDA_ARCHITECTURES=70
-cmake --build build-v100-duo -j
+  -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF
+cmake --build build-v100-duo --target ninfer ninfer-serve -j
 ```
 
 ## Run
@@ -99,8 +99,8 @@ Recommended production configuration:
 | Speculative decoding | `--spec mtp --draft-tokens 3 --lm-head-draft` |
 | Concurrency | `--max-concurrency 1` |
 
-The no-argument command uses the official model path, binds to `127.0.0.1:8080`, and starts one
-request slot. To select another model or override server options, pass them explicitly:
+The launcher requires the model path, binds to `127.0.0.1:8080`, and starts one request slot by
+default. Additional server options override those defaults:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh \
@@ -114,7 +114,7 @@ tools/v100/ninfer-v100-duo.sh \
 - 2x V100-SXM2 16 GB with NVLink
 - CUDA 12.8
 - CMake 3.28+, C++20, Ninja
-- OpenSSL and zlib development headers, pkg-config
+- zlib development headers, pkg-config
 
 ## License
 

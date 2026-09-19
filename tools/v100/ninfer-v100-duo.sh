@@ -8,14 +8,12 @@ repo_dir=$(cd -- "${script_dir}/../.." && pwd)
 readonly executable="${repo_dir}/build-v100-duo/apps/ninfer-serve"
 readonly runtime_lib_dir="${repo_dir}/build/_deps/install/lib"
 readonly cuda_lib_dir=/usr/local/cuda-12.8/lib64
-artifact="${HOME}/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<EOF
-usage: ${BASH_SOURCE[0]} [model=PATH] [ninfer-serve options]
+usage: ${BASH_SOURCE[0]} model=PATH [ninfer-serve options]
 
 Starts the HTTP server with the dual-V100 production defaults:
-  model=${artifact}
   --tp 2 --devices 0,1 --max-context 196608 --kv-dtype int8
   --spec mtp --draft-tokens 3 --lm-head-draft
   --max-concurrency 1 --host 127.0.0.1 --port 8080
@@ -25,18 +23,12 @@ EOF
     exit 0
 fi
 
-if [[ "${1:-}" == model=* ]]; then
-    if [[ -z "${1#model=}" ]]; then
-        echo "model path must not be empty (see --help)" >&2
-        exit 2
-    fi
-    artifact=${1#model=}
-    shift
-elif [[ "${1:-}" == *=* ]]; then
-    echo "unknown setting: ${1%%=*} (see --help)" >&2
+if [[ "${1:-}" != model=* || -z "${1#model=}" ]]; then
+    echo "first argument must be model=PATH (see --help)" >&2
     exit 2
 fi
-readonly artifact
+readonly artifact=${1#model=}
+shift
 
 if [[ ! -x "${executable}" ]]; then
     echo "ninfer executable is missing: ${executable}" >&2
