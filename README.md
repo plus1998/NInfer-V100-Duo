@@ -40,21 +40,34 @@ python3 -m tools.convert.qwen3_8_27b.convert_gguf \
 
 ## Performance
 
-Official Qwen3.8-27B NVFP4 artifact, TP2, NVLink, INT8 KV, CUDA Graphs, MTP3, 32K context:
+Official Qwen3.8-27B NVFP4 v3 artifact, TP2, NVLink, INT8 group-64 KV, CUDA Graphs, optimized
+MTP3, greedy decoding, and the production 196,608-token context capacity.
 
-| Workload | Throughput | MTP accept |
-|---|---:|---:|
-| PP1K | 997.27 tok/s | n/a |
-| PP10K | 997.93 tok/s | n/a |
-| PP20K | 975.24 tok/s | n/a |
-| TG128 | 55.38 tok/s | 30.65% |
+The deterministic synthetic continuation measures the high-acceptance ceiling. It uses
+`PP6144+TG256`, a 1,024-token prefill chunk, one discarded warmup, and three measured repetitions:
 
-Measured on two V100-SXM2 16 GB cards with CUDA 12.8. Each card holds 10.46 GiB of weights. The
-published single-V100 result is about 219 tok/s, but used a different prompt with about 99% MTP
-acceptance; it is a reference point, not a hardware scaling ratio for this 30.65%-acceptance run.
-The production context capacity is 196,608 tokens; a 201,024-token diagnostic configuration has
-also run, but leaves only about 133 MiB free per card. The native 262,144-token model ceiling does
-not fit this two-card 16 GiB profile.
+| Prefill | Decode | MTP accepted | Tokens/round |
+|---:|---:|---:|---:|
+| 1,012.85 +/- 0.14 tok/s | **109.39 +/- 0.05 tok/s** | **576 / 576 (100%)** | 4.00 |
+
+Real programming behavior was measured through one persistent `ninfer-serve` process with prefix
+reuse disabled. The three repository code fixtures use the same fixed seed and request up to 4,096
+completion tokens:
+
+| Fixture | Prompt | Completion | Finish | Decode | MTP accepted | Tokens/round |
+|---|---:|---:|---|---:|---:|---:|
+| CUDA/C++ | 144 | 4,096 | output limit | 89.8 tok/s | 2,805 / 3,868 (72.5%) | 3.17 |
+| Python | 122 | 4,096 | output limit | 95.9 tok/s | 2,890 / 3,612 (80.0%) | 3.40 |
+| TypeScript | 122 | 200 | stop token | 98.8 tok/s | 144 / 174 (82.8%) | 3.48 |
+| **Request mean** | | | | **94.8 +/- 4.6 tok/s** | **78.4% +/- 5.3%** | **3.35 +/- 0.16** |
+
+These measurements used two V100-SXM2 16 GB cards and CUDA 12.8. Decode is committed output-token
+throughput and excludes the first token produced by prefill. The synthetic row is an acceptance
+ceiling, not expected application throughput; the code row is a three-request workload sample, not
+a quality evaluation. Each card holds 10.46 GiB of weights. The production context allocation
+leaves about 235 MiB startup headroom per card. A 201,024-token diagnostic configuration has also
+run, but leaves only about 133 MiB free per card. The native 262,144-token model ceiling does not
+fit this two-card 16 GiB profile.
 
 Optional Q4_K_M profile, TP2, NVLink, INT8 KV, CUDA Graphs, MTP3, 262K context:
 
