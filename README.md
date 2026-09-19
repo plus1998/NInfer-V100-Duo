@@ -5,7 +5,7 @@ C++/CUDA inference engine for the official **Qwen3.8-27B NVFP4** artifact on
 the model is tensor-parallel across both cards and communicates over direct NVLink peer access.
 
 Based on [Neroued/ninfer](https://github.com/Neroued/ninfer) and
-[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100). See [NOTICE](NOTICE).
+[geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 
 ## Platform
 
@@ -20,7 +20,6 @@ Based on [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 | Artifact | Source | Size |
 |---|---|---:|
 | `qwen3_8_27b_nvfp4.ninfer` | [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | 23.7 GB |
-| `qwen3_8_27b_tturbo_q4_k_m.ninfer` | [DavidAU/Qwen3.8-27B-TWIN-TURBO...GGUF](https://huggingface.co/DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored-NM-DAU-NEO-MTP-GGUF) Q4_K_M (optional local profile) | 18 GB |
 
 ```bash
 hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
@@ -29,14 +28,7 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
 ```
 
 The official v3 artifact is read directly. No conversion, downgrade, or runtime weight repacking is
-performed. To build the optional Q4_K_M profile instead:
-
-```bash
-python3 -m tools.convert.qwen3_8_27b.convert_gguf \
-  --model <path-to-Q4_K_M.gguf> \
-  --mmproj <path-to-mmproj-BF16.gguf> \
-  --out ~/models/qwen3_8_27b_tturbo_q4_k_m.ninfer
-```
+performed.
 
 ## Performance
 
@@ -69,33 +61,11 @@ leaves about 235 MiB startup headroom per card. A 201,024-token diagnostic confi
 run, but leaves only about 133 MiB free per card. The native 262,144-token model ceiling does not
 fit this two-card 16 GiB profile.
 
-Optional Q4_K_M profile, TP2, NVLink, INT8 KV, CUDA Graphs, MTP3, 262K context:
-
-| Prompt | Prefill (tok/s) | Decode (tok/s) | MTP accept | TTFT |
-|---:|---:|---:|---:|---:|
-| ~1K | 1,286 | 55 | 53% | 0.74 s |
-| ~10K | 1,409 | 54 | 53% | 6.40 s |
-| ~20K | 1,376 | 54 | 57% | 13.04 s |
-| ~100K | 1,090 | 42 | 55% | 81.87 s |
-| ~200K | 830 | 31 | 46% | 214.88 s |
-
-### GPU Memory
-
-Dual V100-SXM2, TP2, 256K context:
-
-| | Per GPU | 2 GPUs |
-|---|---:|---:|
-| Weights | 8.4 GiB | 16.8 GiB |
-| KV cache (INT8) | 3.2 GiB | 6.3 GiB |
-| Other | 3.4 GiB | 6.9 GiB |
-| **Used** | **15.0 GiB** | **30.0 GiB** |
-| **Free** | **1.0 GiB** | **2.0 GiB** |
-
 ## Build
 
 ```bash
-git clone https://github.com/tuxKOH/ninfer-V100-Duo.git
-cd ninfer-V100-Duo
+git clone https://github.com/plus1998/ninfer-v100-nvlink-duo.git
+cd ninfer-v100-nvlink-duo
 tools/v100/build_dependencies.sh
 
 PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
@@ -106,6 +76,31 @@ cmake --build build-v100 -j
 ```
 
 ## Run
+
+Recommended production configuration:
+
+| Option | Value |
+|---|---|
+| Tensor parallelism | `--tp 2 --devices 0,1` |
+| Context capacity | `--max-context 196608` |
+| KV cache | `--kv-dtype int8` |
+| Speculative decoding | `--spec mtp --draft-tokens 3 --lm-head-draft` |
+| Concurrency | `--max-concurrency 1` |
+
+Start the HTTP server directly with the complete recommended configuration:
+
+```bash
+./build-v100/apps/ninfer-serve \
+  ~/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 \
+  --max-context 196608 \
+  --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --max-concurrency 1 \
+  --host 127.0.0.1 --port 8080
+```
+
+The convenience launcher supplies the same TP2, context, KV, and MTP defaults:
 
 ```bash
 # CLI
@@ -130,4 +125,4 @@ tools/v100/ninfer-v100-duo.sh \
 
 ## License
 
-Apache 2.0. See [NOTICE](NOTICE).
+Apache 2.0.
