@@ -6,7 +6,7 @@
 // with a direct bf16 epilogue output. Compute-bound prefill shapes only -- decode/small-T
 // stays on the existing SIMT GemvPair/SmallTExact paths, which are already bandwidth-
 // efficient and would pay the (T-independent) dequant cost for little benefit at small T.
-// See docs/v100.md.
+// See the V100 performance summary.
 
 #include "core/arena.h"
 #include "core/tensor.h"

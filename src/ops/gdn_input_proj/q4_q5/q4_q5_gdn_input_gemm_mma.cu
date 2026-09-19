@@ -35,8 +35,11 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
 
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                   Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kValueRows = 6144;
-    using Schedule                    = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+    // value_z_weight always stacks V then Z at equal row counts (value_z_weight.n / 2),
+    // true at both the tp1 parent (12288 -> 6144) and the tp2 column shard (6144 -> 3072) -- read at
+    // runtime instead of the tp1-only literal so this launcher serves both shapes unchanged.
+    const std::int32_t kValueRows = value_z_weight.n / 2;
+    using Schedule                = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =

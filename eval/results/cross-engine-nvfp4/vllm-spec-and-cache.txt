@@ -1,0 +1,6 @@
+vLLM per-tier speculative counters (each tier ran on a freshly booted server, so
+the counters below are that tier's request alone; 512 completion tokens each).
+250k: drafts=202 draft_tokens=606 accepted=311 (51.32%) per_pos=[152,96,63] prefix_hits=0/249955
+653k: drafts=511 draft_tokens=1533 accepted=0 (0.00%) per_pos=[0,0,0]   prefix_hits=0/652955
+700k: drafts=511 draft_tokens=1533 accepted=0 (0.00%) per_pos=[0,0,0]   prefix_hits=0/699955
+250k warm repeat: prefix_hits=248000/249955 (99.22%), TTFT 1.80 s

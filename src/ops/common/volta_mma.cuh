@@ -2,9 +2,15 @@
 
 // Volta (sm_70) tensor-core primitives for GQA attention: the mma.sync.m8n8k4 QK^T/PV
 // instructions and their warp-level fragment addressing, transcribed faithfully from
-// llama.cpp's ggml-cuda/mma.cuh (MIT licensed). The formulas are checked against an independent
-// host oracle, and semantic operand roles follow llama.cpp's Volta fattn-mma-f16.cuh call sites
-// rather than being inferred from tile shape alone.
+// llama.cpp's ggml-cuda/mma.cuh (MIT licensed) rather than re-derived -- this bit-twiddling
+// is exactly the kind of thing worth reusing validated code for; even llama.cpp's own
+// maintainers needed a permutation-quirk escape hatch here. Every formula in this file was
+// independently verified against a host-computed reference on real V100 hardware before
+// being wired into any real kernel (see the V100 performance summary and the scratch_volta_mma_*
+// validation harnesses this was developed against). Semantic operand roles (which tensor
+// maps to the mma "A" vs "B" slot) were traced against llama.cpp's actual
+// fattn-mma-f16.cuh call sites for the Volta branch specifically, not assumed from tile
+// shape alone -- see the V100 performance summary for why that distinction mattered.
 //
 // Fragment shapes (all per-warp, 8 registers or fewer per thread):
 //   Q  (QK^T "A" operand): 32 rows x 8 real k-elems, 4 half2 regs/thread, I-major.
@@ -136,7 +142,7 @@ __device__ __forceinline__ void volta_mma_pv(half2 (&pv)[4], const half2 (&p)[4]
 
 // Convert the QK^T float D-tile (post-softmax, i.e. P) directly into the half2 layout the PV
 // mma's "A" operand needs -- register-only, one warp shuffle, no shared memory (Volta-
-// specific; Turing+ needs an actual transpose here, Volta doesn't -- see docs/v100.md).
+// specific; Turing+ needs an actual transpose here, Volta doesn't -- see the V100 performance summary).
 __device__ __forceinline__ void volta_softmax_to_half2(half2 (&p)[4], const float (&d)[8]) {
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 4) {

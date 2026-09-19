@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -138,6 +139,22 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         .automatic_headroom_bytes             = policy.automatic_headroom_bytes,
         .planned_slack_bytes                  = available_runtime_bytes - reservation,
     };
+}
+
+KvCapacityResolution
+resolve_kv_capacity_symmetric(const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
+                              std::span<const std::size_t> available_runtime_bytes_per_device) {
+    if (available_runtime_bytes_per_device.empty()) {
+        throw std::invalid_argument(
+            "KV capacity resolution requires at least one device budget");
+    }
+    // Every device must end up with the same page count (KV addressing is symmetric across
+    // devices), so the plan is bounded by whichever device has the least free memory. Each
+    // device's own curve is symmetric by construction (equal head split), so resolving once
+    // against the bottleneck budget yields the correct per-device reservation for every device.
+    const std::size_t bottleneck_bytes = *std::min_element(
+        available_runtime_bytes_per_device.begin(), available_runtime_bytes_per_device.end());
+    return resolve_kv_capacity(policy, curve, bottleneck_bytes);
 }
 
 } // namespace ninfer::runtime

@@ -6,10 +6,10 @@
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
 namespace ninfer::ops::detail {
+namespace {
 
-void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                   cudaStream_t stream) {
-    using Geometry = Nvfp4GdnInputGeometry;
+template <class Geometry, class Output>
+void launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, cudaStream_t stream) {
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
@@ -17,9 +17,22 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)});
+        Output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)});
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                   cudaStream_t stream) {
+    launch<Nvfp4GdnInputGeometry, Nvfp4GdnInputOutput>(x, weight, qkv, z, stream);
+}
+
+// The tp2 column shard, instantiated at Nvfp4GdnInputTp2ColumnGeometry.
+void nvfp4_gdn_input_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                         Tensor& z, cudaStream_t stream) {
+    launch<Nvfp4GdnInputTp2ColumnGeometry, Nvfp4GdnInputShardOutput<Nvfp4GdnInputTp2ColumnGeometry>>(
+        x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

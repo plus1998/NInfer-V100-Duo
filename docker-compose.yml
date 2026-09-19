@@ -1,0 +1,28 @@
+﻿services:
+  ninfer-serve:
+    image: ninfer:tp2-3060x2
+    container_name: ninfer-tp2-srv
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /data/ninfer-3060X2/models:/workspace/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      ninfer-serve /workspace/models/qwen3_8_27b.ninfer
+      --host 0.0.0.0
+      --port 8080
+      --tp 2
+      --devices 0,1
+      --max-context 65536
+      --kv-capacity 65536
+      --kv-dtype int8
+      --spec mtp
+      --draft-tokens 3
+      --lm-head-draft

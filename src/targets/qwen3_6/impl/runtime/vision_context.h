@@ -1,5 +1,4 @@
 #pragma once
-
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -8,7 +7,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
-#include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <array>
@@ -39,22 +38,17 @@ struct VisionScheduleConfig {
     static constexpr int rotary_dim          = VisionConfig::rotary_dim;
     static constexpr float rope_theta        = VisionConfig::rope_theta;
     static constexpr float norm_eps          = VisionConfig::norm_epsilon;
-    static constexpr float attention_scale   = 0.11785113019775792F;
 };
 
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
+    [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
-    [[nodiscard]] static std::size_t workspace_bytes(std::size_t patches,
-                                                     std::size_t merged_tokens);
-    [[nodiscard]] static VisionWorkspacePlan plan_workspace(std::uint32_t max_merged_tokens,
-                                                            std::size_t general_capacity_bytes);
-    [[nodiscard]] static Tensor bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
-                                            std::size_t merged_tokens);
-    void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                const VisionWorkspacePlan& plan) const;
+    [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
+                                                              std::uint32_t max_segments);
+    void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
 
 private:
     struct BlockW {
@@ -97,31 +91,22 @@ struct VisionChunk {
 
 class VisionPrefillSession {
 public:
-    VisionPrefillSession(DeviceContext& device, const LoadedModelData& model, DeviceSpan workspace,
-                         const VisionWorkspacePlan& workspace_plan,
-                         qwen3_6::PreparedPromptData& prompt, const VisionPrefillPlan& plan,
-                         std::size_t& handoff_peak_bytes);
+    VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
+                         WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
-    void retire_handoff() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
-
-    [[nodiscard]] std::size_t active_handoff_bytes() const noexcept {
-        return active_handoff_bytes_;
-    }
 
 private:
     DeviceContext& device_;
-    DeviceSpan workspace_;
-    const VisionWorkspacePlan& workspace_plan_;
+    WorkspaceArena& workspace_;
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
-    std::size_t& handoff_peak_bytes_;
+    runtime::TransientRegion transient_;
     VisionContext context_;
-    std::size_t next_use_ = 0;
     std::optional<std::uint32_t> active_item_;
-    std::size_t active_handoff_bytes_ = 0;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
 };

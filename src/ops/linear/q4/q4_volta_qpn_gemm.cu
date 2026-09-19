@@ -52,21 +52,6 @@ void launch_q4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
-                              const Tensor& row_to_global_ids, std::uint64_t* partial_keys,
-                              std::int32_t producer_groups, cudaStream_t stream) {
-    const std::int32_t n = w.n;
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
-    const std::int32_t padded_groups = w.padded_shape[1] / Q4RowSplitStorage::kGroupK;
-    const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
-    q4_volta_qpn_gemm_kernel<1, 4, true><<<grid, S::kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
-        static_cast<const std::int32_t*>(row_to_global_ids.data), partial_keys, producer_groups);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

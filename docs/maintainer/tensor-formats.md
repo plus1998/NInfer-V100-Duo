@@ -26,6 +26,15 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `Q6G64_F16S` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `W8G32_F16S` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
 
+`GGML_K` is the closed mixed-row format for preserved GGUF Q4_K_M checkpoints. Each row selects
+GGML Q4_K or Q6_K, with 256 represented values per block. Q4_K uses exact stored FP16 `d` and
+`dmin`, six-bit unsigned subblock scales and minima, and unsigned four-bit codes:
+`w = d * scale[subblock32] * code - dmin * min[subblock32]`. Q6_K uses exact stored FP16 `d`,
+signed eight-bit subblock scales, and six-bit codes: `w = d * scale[subblock16] * (code - 32)`.
+Packing and byte order are the GGML Q4_K (144 bytes) and Q6_K (210 bytes) codecs. No encoder or
+recomputed scale is implied. `ggml-k256-v1` row descriptors select the codec; the original formats
+of all rows remain part of the fused matrix's represented public input.
+
 The block-scaled floating-point weight format is:
 
 | Canonical name | Code | K group | Block scale | Global field |

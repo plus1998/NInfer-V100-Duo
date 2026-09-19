@@ -77,7 +77,11 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
     constexpr int kDefaultThreads = 256;
     const std::int32_t width      = projected.ne[1];
     const std::int32_t batch      = projected.ne[2];
-    if constexpr (Channels == 10240) {
+    // The narrow-CTA specialization for the single-row W=4 decode shape. It applies to the tp2
+    // shard for the same reason it applies to the tp1 geometry -- the kernel is channel-parallel, so
+    // the choice is purely "how many channels per CTA" -- and withholding it would have made the
+    // shard pay a 256-wide block for 5120 channels on the latency-critical verify path.
+    if constexpr (Channels == 10240 || Channels == 5120) {
         if (width == 4 && batch == 1) {
             constexpr int kT4Threads = 64;
             gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
@@ -123,6 +127,18 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
     if (projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 4096) {
         launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
+                                       initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
+    // tp == 2 shard of the 27B <10240, 2048, 2048, 6144> geometry. The GDN conv is
+    // depthwise, so channel c never mixes with any other channel; device r owns 8 of 16 key heads
+    // (Q and K, 1024 channels each) and 24 of 48 value heads (3072 channels), concatenated in the
+    // parent's own Q|K|V order -- byte-for-byte the packing `gdn_input_proj_column_parallel`
+    // writes and the channel set `gdn/convolution`'s three-block ShardPlan hands this device
+    // (bindings.cpp: channels [1024r,+1024) u [2048+1024r,+1024) u [4096+3072r,+3072)).
+    if (projected.ne[0] == 5120 && query.ne[0] == 1024 && key.ne[0] == 1024 &&
+        value.ne[0] == 3072) {
+        launch<5120, 1024, 1024, 3072>(projected, conv_weight, state_read, valid_columns,
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }

@@ -1,5 +1,4 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
-#include <ninfer/targets/qwen3_6/startup_features.h>
 
 #include <algorithm>
 #include <limits>
@@ -24,17 +23,20 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 }
 
 void validate_spec(const RoundStateSpec& spec) {
+    if (spec.enable_mtp && spec.enable_dflash) {
+        throw std::invalid_argument("RoundState speculative extensions are mutually exclusive");
+    }
     if (spec.hidden <= 0) { throw std::invalid_argument("RoundState hidden must be positive"); }
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
     }
-    if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window == 0) {
+    if (spec.enable_mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
-    if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
+    if (spec.enable_mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
     }
-    if (is_masked_draft_backend(spec.backend) &&
+    if (spec.enable_dflash &&
         (spec.draft_window == 0 || spec.draft_window > kDFlashDecodeMaximumDrafts)) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
@@ -52,7 +54,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (spec.backend == SpeculativeBackend::None) {
+    if (!spec.enable_mtp && !spec.enable_dflash) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
@@ -96,10 +98,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
-    state_source_slots =
-        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
-    state_destination_slots =
-        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    lanes    = ingress_tensor(offsetof(OrdinaryDecodeIngress, lanes), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -121,7 +120,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     const auto i32            = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    if (layout.spec.backend == SpeculativeBackend::Mtp) {
+    if (layout.spec.enable_mtp) {
         layout.mtp.emplace();
         const auto ar_steps =
             checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
@@ -133,47 +132,45 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         layout.mtp->target_input_ids = i32(columns, "MTP prefill target input ids");
         layout.mtp->target_positions = i32(columns, "MTP prefill target positions");
 
+        layout.mtp_decode.emplace();
+        MtpDecodeStateLayout& decode = *layout.mtp_decode;
+        decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, "MTP decode ingress");
+        decode.egress  = builder.add(sizeof(MtpDecodeEgress), kArenaAlign, "MTP decode egress");
         const auto batch =
             checked_i32(layout.spec.batch_capacity, "RoundState MTP batch capacity exceeds int32");
-        const auto add_decode = [&](MtpDecodeStateLayout& decode, std::int32_t verify_columns,
-                                    const char* prefix) {
-            decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, prefix);
-            decode.egress  = builder.add(sizeof(MtpDecodeEgress), kArenaAlign, prefix);
-            decode.verify_ids = add_tensor(builder, DType::I32, {verify_columns, batch}, prefix);
-            decode.target_positions =
-                add_tensor(builder, DType::I32, {verify_columns, batch}, prefix);
-            decode.target_argmax =
-                add_tensor(builder, DType::I32, {verify_columns, batch}, prefix);
-            decode.target_logits =
-                add_tensor(builder, DType::BF16,
-                           {layout.spec.output_rows, verify_columns, batch}, prefix);
-            decode.target_hidden = add_tensor(
-                builder, DType::BF16, {layout.spec.hidden, verify_columns, batch}, prefix);
-            decode.target_continuation_hidden =
-                add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, prefix);
-            decode.proposal_logits = add_tensor(
-                builder, DType::BF16, {layout.spec.output_rows, batch}, prefix);
-            decode.alignment_ids =
-                add_tensor(builder, DType::I32, {verify_columns, batch}, prefix);
-            decode.alignment_hidden = add_tensor(
-                builder, DType::BF16, {layout.spec.hidden, verify_columns, batch}, prefix);
-            decode.ar_hidden =
-                add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, prefix);
-            decode.next_hidden =
-                add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, prefix);
-            decode.ar_positions =
-                add_tensor(builder, DType::I32, {batch, ar_steps}, prefix);
-            decode.ar_rope_positions =
-                add_tensor(builder, DType::I32, {batch, ar_steps}, prefix);
-            decode.ar_valid_columns =
-                add_tensor(builder, DType::I32, {batch, ar_steps}, prefix);
-        };
-        add_decode(layout.mtp_decode.emplace(), columns, "MTP decode frame");
-        add_decode(layout.mtp_lookup_decode.emplace(),
-                   static_cast<std::int32_t>(kMtpLookupMaximumWidth),
-                   "MTP lookup decode frame");
+        decode.verify_ids =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode verify ids");
+        decode.target_positions =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target positions");
+        decode.target_argmax =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode target argmax");
+        decode.target_logits =
+            add_tensor(builder, DType::BF16, {layout.spec.output_rows, columns, batch},
+                       "MTP decode target logits");
+        decode.target_hidden = add_tensor(
+            builder, DType::BF16, {layout.spec.hidden, columns, batch}, "MTP decode target hidden");
+        decode.target_continuation_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+                       "MTP decode target continuation hidden");
+        decode.proposal_logits = add_tensor(builder, DType::BF16, {layout.spec.output_rows, batch},
+                                            "MTP decode proposal logits");
+        decode.alignment_ids =
+            add_tensor(builder, DType::I32, {columns, batch}, "MTP decode alignment ids");
+        decode.alignment_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, columns, batch},
+                       "MTP decode alignment hidden");
+        decode.ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
+                                      "MTP decode autoregressive hidden");
+        decode.next_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
+        decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive positions");
+        decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive rope positions");
+        decode.ar_valid_columns  = add_tensor(builder, DType::I32, {batch, ar_steps},
+                                              "MTP decode autoregressive valid columns");
     }
-    if (is_masked_draft_backend(layout.spec.backend)) {
+    if (layout.spec.enable_dflash) {
         layout.dflash_prefill.emplace().produced_count = i32(1, "DFlash prefill produced count");
         DFlashDecodeStateLayout& decode                = layout.dflash_decode.emplace();
         decode.ingress =
@@ -186,14 +183,6 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash proposal ids");
         decode.proposal_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash proposal positions");
-        decode.verify_positions =
-            add_tensor(builder, DType::I32, {columns, batch}, "target verify cache positions");
-        if (layout.spec.backend == SpeculativeBackend::DFlash2) {
-            decode.candidate_ids =
-                add_tensor(builder, DType::I32, {16, columns - 1, batch}, "DFlash2 candidate ids");
-            decode.proposal_q = add_tensor(builder, DType::FP32, {16, columns - 1, batch},
-                                           "DFlash2 sampled proposal q");
-        }
         decode.append_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
@@ -224,20 +213,17 @@ DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillSt
     : produced_count(layout.produced_count.bind(backing)) {}
 
 MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                               std::uint32_t batch_capacity, std::uint32_t verify_window,
-                               std::uint32_t proposal_window) {
-    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || verify_window == 0 ||
-        verify_window > kMtpLookupMaximumDrafts || proposal_window == 0 ||
-        proposal_window > kMtpDecodeMaximumDrafts) {
+                               std::uint32_t batch_capacity, std::uint32_t draft_window) {
+    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
+        draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("MTP decode state dimensions are outside the supported domain");
     }
     static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
     static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
     const auto batch          = static_cast<std::int32_t>(batch_capacity);
-    const auto drafts         = static_cast<std::int32_t>(verify_window);
-    const auto proposal       = static_cast<std::int32_t>(proposal_window);
+    const auto drafts         = static_cast<std::int32_t>(draft_window);
     const auto width          = drafts + 1;
-    const auto steps          = std::max(proposal - 1, 1);
+    const auto steps          = std::max(drafts - 1, 1);
     ingress                   = layout.ingress.bind(backing);
     egress                    = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,
@@ -265,10 +251,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         ingress_tensor(offsetof(MtpDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     mtp_kv_table_rows =
         ingress_tensor(offsetof(MtpDecodeIngress, mtp_kv_table_rows), DType::I32, {batch});
-    state_source_slots =
-        ingress_tensor(offsetof(MtpDecodeIngress, state_source_slots), DType::I32, {batch});
-    state_destination_slots =
-        ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
+    lanes       = ingress_tensor(offsetof(MtpDecodeIngress, lanes), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
@@ -280,7 +263,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     accepted_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, accepted_drafts), DType::I32, {batch});
     next_drafts =
-        egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, proposal});
+        egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
@@ -332,22 +315,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, proposal_extents), DType::I32, {batch});
     target_valid_columns =
         ingress_tensor(offsetof(DFlashDecodeIngress, target_valid_columns), DType::I32, {batch});
-    proposal_valid_columns =
-        ingress_tensor(offsetof(DFlashDecodeIngress, proposal_valid_columns), DType::I32, {batch});
-    verify_positions = layout.verify_positions.bind(backing);
-    if (layout.candidate_ids) { candidate_ids = layout.candidate_ids->bind(backing); }
-    if (layout.proposal_q) { proposal_q = layout.proposal_q->bind(backing); }
-    target_rope_positions = ingress_tensor(offsetof(DFlashDecodeIngress, target_rope_positions),
-                                           DType::I32, {width, batch});
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    active_lanes = ingress_tensor(offsetof(DFlashDecodeIngress, active_lanes), DType::I32, {batch});
-    state_source_slots =
-        ingress_tensor(offsetof(DFlashDecodeIngress, state_source_slots), DType::I32, {batch});
-    state_destination_slots =
-        ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
+    lanes    = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =
@@ -384,11 +356,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }
     if (layout.mtp_decode) {
         mtp_decode.emplace(backing, *layout.mtp_decode, layout.spec.batch_capacity,
-                           layout.spec.draft_window, layout.spec.draft_window);
-    }
-    if (layout.mtp_lookup_decode) {
-        mtp_lookup_decode.emplace(backing, *layout.mtp_lookup_decode, layout.spec.batch_capacity,
-                                  kMtpLookupMaximumDrafts, layout.spec.draft_window);
+                           layout.spec.draft_window);
     }
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,

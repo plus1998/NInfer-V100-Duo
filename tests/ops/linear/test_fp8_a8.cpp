@@ -56,6 +56,35 @@ int run_fp8_a8() {
         run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                   {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
 
+    // Independent FP64-oracle conformance at the tp2 ROW-split K extents
+    // (linear_add's own o_proj/gdn_output 6144->3072, mlp/down 17408->8704). The split suite
+    // (tests/ops/test_linear_add_split.cpp, tests/ops/test_linear_split.cpp) only proves split-vs-
+    // tp1 PAIRWISE parity at these shapes; per AGENTS.md that is supplementary, not a substitute for
+    // this oracle check. A split-path defect that adds error while staying inside the pairwise bound
+    // could still push true oracle error past the accepted A8 budget -- this closes that gap by
+    // running ops::linear() directly at the halved-K shapes (Fp8Residual6144Tp2RowGeometry /
+    // Fp8Residual17408Tp2RowGeometry, src/ops/linear/fp8/fp8_config.h) against the SAME FP64 oracle
+    // and the SAME kA8Tolerance-shaped criterion (tolerance_for(ActivationCompute::A8) above) every
+    // other FP8 A8 shape in this file is held to -- no separate, weaker bound for the shard shapes.
+    constexpr std::array residual6144_shard_invocations{
+        Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {5120, 3072, 861U, Comparison::Sampled, true,
+                           residual6144_shard_invocations});
+    constexpr std::array residual17408_shard_invocations{
+        Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                          {5120, 8704, 863U, Comparison::Sampled, true,
+                           residual17408_shard_invocations});
+
     struct Problem {
         std::int32_t rows;
         std::int32_t input_rows;
@@ -66,7 +95,8 @@ int run_fp8_a8() {
     for (const Problem problem :
          {Problem{14336, 5120, false, false}, Problem{16384, 5120, false, false},
           Problem{34816, 5120, true, false}, Problem{5120, 6144, false, false},
-          Problem{5120, 17408, false, false}}) {
+          Problem{5120, 17408, false, false}, Problem{5120, 3072, false, false},
+          Problem{5120, 8704, false, false}}) {
         const std::size_t one = ops::linear_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, problem.rows, problem.input_rows,
             ops::LinearPolicy::AllowA8, 1, 1);

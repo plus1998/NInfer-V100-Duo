@@ -219,6 +219,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     }
     out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {2048});
 
+    binder.validate_unconsumed_matching("dflash2");
     load_plan.materialization = binder.finish();
     return load_plan;
 }

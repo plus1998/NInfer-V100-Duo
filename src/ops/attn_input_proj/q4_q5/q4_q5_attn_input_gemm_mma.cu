@@ -55,16 +55,21 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Row splits are read from the OUTPUT tensors' own row counts rather than hardcoded, so this same
+// launcher already serves both the tp1 parent (query_key/gate_value [7168,5120], q/gate [6144,T],
+// k/v [1024,T]) and the tp2 column shard (query_key/gate_value [3584,5120], q/gate [3072,T], k/v
+// [512,T]) -- there is no compile-time-exact row count baked into this path, only into the small-T
+// exact kernels in q4_q5_attn_input_small_t.cu, which the shard does not use.
 template <class Schedule>
 void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     const bool full = (x.ne[1] % Schedule::BN) == 0;
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
-        full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
-        stream);
+        full, x, make_job(query_key_weight, 0, q.ne[0], q),
+        make_job(query_key_weight, q.ne[0], k.ne[0], k), stream);
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, 6144, gate),
-        make_job(gate_value_weight, 6144, 1024, v), stream);
+        full, x, make_job(gate_value_weight, 0, gate.ne[0], gate),
+        make_job(gate_value_weight, gate.ne[0], v.ne[0], v), stream);
 }
 
 template <class Schedule>

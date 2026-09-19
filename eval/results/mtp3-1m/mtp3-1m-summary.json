@@ -1,0 +1,395 @@
+{
+  "max_context": 1048576,
+  "steps": {
+    "boot": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-boot-20260828T165149Z",
+      "prompt_tokens": "15",
+      "generated_tokens": "10",
+      "finish_reason": "stop-token",
+      "prefill_speed": "447.56 tok/s",
+      "decode_speed": "213.84 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "1.44 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.54 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "913.75 KiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "3",
+        "fallback steps": "0",
+        "drafted tokens": "9",
+        "accepted tokens": "7",
+        "acceptance rate": "77.78%",
+        "acceptance length": "3.33 tok/round",
+        "accepted by pos": "3,2,2"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30515,
+        "gpu 1": 29566,
+        "process 1585211@gpu0": 29526,
+        "process 1585211@gpu1": 29526
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 63.5,
+          "draw_mean_w": 53.5
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 70.5,
+          "draw_mean_w": 60.5
+        }
+      },
+      "generated_ids": 0
+    },
+    "needle-a-mtp3": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-needle-a-mtp3-20260828T165228Z",
+      "prompt_tokens": "1045954",
+      "generated_tokens": "24",
+      "finish_reason": "stop-token",
+      "prefill_speed": "930.41 tok/s",
+      "decode_speed": "132.60 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "1.44 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.54 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "6",
+        "fallback steps": "0",
+        "drafted tokens": "18",
+        "accepted tokens": "18",
+        "acceptance rate": "100.00%",
+        "acceptance length": "4.00 tok/round",
+        "accepted by pos": "6,6,6"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30522,
+        "gpu 1": 29568,
+        "process 1585918@gpu0": 29528,
+        "process 1585918@gpu1": 29528
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 331.7,
+          "draw_mean_w": 314.9
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 365.1,
+          "draw_mean_w": 331.4
+        }
+      },
+      "generated_ids": 24
+    },
+    "needle-a-off": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-needle-a-off-20260828T171124Z",
+      "prompt_tokens": "1045954",
+      "generated_tokens": "24",
+      "finish_reason": "stop-token",
+      "prefill_speed": "930.92 tok/s",
+      "decode_speed": "44.58 tok/s",
+      "gpu0_reserved": "26.93 GiB",
+      "gpu1_reserved": "26.93 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.08 GiB",
+        "kv pool": "16.50 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "16.66 GiB",
+        "workspace": "182.81 MiB",
+        "cuda graphs": "2.00 MiB",
+        "reserved": "26.93 GiB",
+        "free/total": "2.96 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 182.81 MiB",
+      "mtp": {},
+      "vram_peak_mib": {
+        "gpu 0": 29061,
+        "gpu 1": 28110,
+        "process 1604152@gpu0": 28070,
+        "process 1604152@gpu1": 28070
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 349.4,
+          "draw_mean_w": 315.1
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 381.5,
+          "draw_mean_w": 333.2
+        }
+      },
+      "generated_ids": 24
+    },
+    "needle-b-mtp3": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-needle-b-mtp3-20260828T173021Z",
+      "prompt_tokens": "1045955",
+      "generated_tokens": "24",
+      "finish_reason": "stop-token",
+      "prefill_speed": "929.57 tok/s",
+      "decode_speed": "132.80 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "2.56 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.53 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "6",
+        "fallback steps": "0",
+        "drafted tokens": "18",
+        "accepted tokens": "17",
+        "acceptance rate": "94.44%",
+        "acceptance length": "3.83 tok/round",
+        "accepted by pos": "6,6,5"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30551,
+        "gpu 1": 29568,
+        "process 1620022@gpu0": 29528,
+        "process 1620022@gpu1": 29528
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 370.4,
+          "draw_mean_w": 315.8
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 399.6,
+          "draw_mean_w": 333.3
+        }
+      },
+      "generated_ids": 24
+    },
+    "decode-greedy": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-decode-greedy-20260828T174919Z",
+      "prompt_tokens": "949885",
+      "generated_tokens": "12000",
+      "finish_reason": "output-limit",
+      "prefill_speed": "1007.98 tok/s",
+      "decode_speed": "135.78 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "1.44 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.53 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "3153",
+        "fallback steps": "0",
+        "drafted tokens": "9457",
+        "accepted tokens": "8846",
+        "acceptance rate": "93.54%",
+        "acceptance length": "3.81 tok/round",
+        "accepted by pos": "3061,2940,2845"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30518,
+        "gpu 1": 29568,
+        "process 1635937@gpu0": 29528,
+        "process 1635937@gpu1": 29528
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 400.1,
+          "draw_mean_w": 321.5
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 400.3,
+          "draw_mean_w": 338.3
+        }
+      },
+      "generated_ids": 12000,
+      "stream": {
+        "tokens": 12000,
+        "distinct": 308,
+        "distinct_ratio": 0.0257,
+        "period": 187,
+        "repeats": 57
+      }
+    },
+    "decode-sampled": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-decode-sampled-20260828T180643Z",
+      "prompt_tokens": "949885",
+      "generated_tokens": "12000",
+      "finish_reason": "output-limit",
+      "prefill_speed": "1008.17 tok/s",
+      "decode_speed": "122.21 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "3.00 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.53 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "3518",
+        "fallback steps": "1",
+        "drafted tokens": "10552",
+        "accepted tokens": "8480",
+        "acceptance rate": "80.36%",
+        "acceptance length": "3.41 tok/round",
+        "accepted by pos": "3142,2784,2554"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30518,
+        "gpu 1": 29568,
+        "process 1650470@gpu0": 29528,
+        "process 1650470@gpu1": 29528
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 400.2,
+          "draw_mean_w": 322.0
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 400.2,
+          "draw_mean_w": 339.0
+        }
+      },
+      "generated_ids": 12000,
+      "stream": {
+        "tokens": 12000,
+        "distinct": 740,
+        "distinct_ratio": 0.0617,
+        "period": null,
+        "repeats": null
+      }
+    },
+    "decode-novel": {
+      "log": "/home/pc/Projects/ninfer-1m/eval/server-logs/qwen3_8_27b_nvfp4-1m-mtp3-decode-novel-20260828T183021Z",
+      "prompt_tokens": "949885",
+      "generated_tokens": "1341",
+      "finish_reason": "output-limit",
+      "prefill_speed": "1010.19 tok/s",
+      "decode_speed": "99.51 tok/s",
+      "gpu0_reserved": "28.42 GiB",
+      "gpu1_reserved": "28.42 GiB",
+      "gpu0_breakdown": {
+        "weights": "10.46 GiB",
+        "kv pool": "17.53 GiB",
+        "gdn state": "146.81 MiB",
+        "sequence": "17.69 GiB",
+        "workspace": "192.93 MiB",
+        "cuda graphs": "2.56 MiB",
+        "reserved": "28.42 GiB",
+        "free/total": "1.53 GiB / 31.33 GiB"
+      },
+      "workspace_peak": "112.29 MiB / 192.93 MiB",
+      "mtp": {
+        "draft window": "3",
+        "rounds": "486",
+        "fallback steps": "0",
+        "drafted tokens": "1456",
+        "accepted tokens": "854",
+        "acceptance rate": "58.65%",
+        "acceptance length": "2.76 tok/round",
+        "accepted by pos": "395,276,183"
+      },
+      "vram_peak_mib": {
+        "gpu 0": 30521,
+        "gpu 1": 29568,
+        "process 1669400@gpu0": 29528,
+        "process 1669400@gpu1": 29528
+      },
+      "power": {
+        "0": {
+          "limit_w": 400.0,
+          "draw_peak_w": 409.3,
+          "draw_mean_w": 314.7
+        },
+        "1": {
+          "limit_w": 400.0,
+          "draw_peak_w": 402.6,
+          "draw_mean_w": 330.8
+        }
+      },
+      "generated_ids": 1341,
+      "stream": {
+        "tokens": 1341,
+        "distinct": 304,
+        "distinct_ratio": 0.2267,
+        "period": null,
+        "repeats": null
+      }
+    }
+  },
+  "needle_identity": {
+    "bundle": "A",
+    "mtp3_tokens": 24,
+    "mtp_off_tokens": 24,
+    "identical": true,
+    "first_divergence_index": null
+  },
+  "needle_answers": {
+    "A": {
+      "mtp3_answer": "The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.",
+      "needle_answer_mtp_off": "The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.",
+      "match": true
+    },
+    "B": {
+      "mtp3_answer": "The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.",
+      "needle_answer_mtp_off": "The best thing to do in San Francisco is eat a sandwich and sit in Dolores Park on a sunny day.",
+      "match": true
+    }
+  },
+  "mtp_cost_gib": {
+    "weights": 0.38,
+    "kv pool": 1.03,
+    "gdn state": 0.0,
+    "sequence": 1.03,
+    "workspace": 0.01,
+    "reserved": 1.49,
+    "nvidia_smi_process_peak": 1.424
+  }
+}

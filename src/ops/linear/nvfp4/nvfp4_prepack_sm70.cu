@@ -38,10 +38,10 @@ __global__ void prepack_qpn_kernel(const std::uint8_t* __restrict__ input_codes,
                                                       (native_nibble(source_row, high_k) << 4));
     }
 
-    const int scale_tile      = group / 4;
-    const int scale_lane      = group & 3;
-    const int row_inner       = row & 127;
-    const int scales_per_m128 = k / 64;
+    const int scale_tile       = group / 4;
+    const int scale_lane       = group & 3;
+    const int row_inner        = row & 127;
+    const int scales_per_m128  = k / 64;
     const std::int64_t scale_offset =
         static_cast<std::int64_t>((row / 128) * scales_per_m128 + scale_tile) * 512 +
         (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;

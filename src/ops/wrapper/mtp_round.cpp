@@ -48,17 +48,13 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                             const Tensor& remaining_budgets, const Tensor& licensed_counts,
                             const Tensor& rope_deltas, Tensor& alignment_ids, Tensor& next_extents,
                             Tensor& ar_positions, Tensor& ar_rope_positions,
-                            Tensor& ar_valid_columns, std::int32_t proposal_window,
-                            std::int32_t max_context,
+                            Tensor& ar_valid_columns, std::int32_t max_context,
                             cudaStream_t stream) {
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 16) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,16]");
-    }
-    if (proposal_window < 1 || proposal_window > 7 || proposal_window >= T) {
-        throw std::invalid_argument("mtp_prepare_next_round: proposal window must be in [1,7]");
+    if (T < 2 || T > 6) {
+        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,6]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {
@@ -73,7 +69,7 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     require_vector(rope_deltas, DType::I32, batch, op, "rope_deltas");
     require_matrix(alignment_ids, DType::I32, T, batch, op, "alignment_ids");
     require_vector(next_extents, DType::I32, batch, op, "next_extents");
-    const std::int32_t steps = std::max(proposal_window - 1, 1);
+    const std::int32_t steps = std::max(T - 2, 1);
     require_row_pitched_matrix(ar_positions, batch, steps, op, "ar_positions");
     require_row_pitched_matrix(ar_rope_positions, batch, steps, op, "ar_rope_positions");
     require_row_pitched_matrix(ar_valid_columns, batch, steps, op, "ar_valid_columns");
@@ -85,8 +81,7 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     detail::mtp_prepare_next_round_launch(verify_ids, next_anchors, accepted, updated_frontiers,
                                           remaining_budgets, licensed_counts, rope_deltas,
                                           alignment_ids, next_extents, ar_positions,
-                                          ar_rope_positions, ar_valid_columns, proposal_window,
-                                          max_context, stream);
+                                          ar_rope_positions, ar_valid_columns, max_context, stream);
 }
 
 } // namespace ninfer::ops

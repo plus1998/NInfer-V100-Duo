@@ -106,9 +106,26 @@ template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kRe
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__
 #ifdef NINFER_VOLTA_BUILD
-// The launch bound holds decode-shaped instantiations below the register threshold that would
-// exclude a fourth resident block. Shared-memory-heavy instantiations remain limited by their
-// staging buffer, so the same bound is safe across the template family.
+// ncu (real hardware counters, unblocked this session via a host driver-permission fix) measured
+// this kernel's decode-shaped instantiations at 36 registers/thread with 512 threads/block,
+// capping occupancy at 3 blocks/SM (18432 regs/block into a 65536-register/SM budget) against a
+// 4-block ceiling every other limiter (thread count, and shared memory once given full carveout
+// -- see the cudaFuncSetAttribute call in the launch wrapper below) already permits. 36->32
+// regs/thread is the exact threshold for the 4th block (65536/4/32threads-per-warp/... = 32).
+// __launch_bounds__ is a compiler hint, not a semantic change -- same math, so no correctness
+// risk beyond the usual register-spill-if-the-compiler-can't-comply case, which is why this is
+// still validated the same way as any other kernel change (see the V100 performance summary).
+//
+// Applied uniformly across all instantiations of this template. Measured via nsys before/after:
+// a clear win for kStageX=false (down-proj, -14.1% kernel duration -- shared memory has enough
+// headroom there for the 4th block once combined with the carveout request below), small
+// regressions of +0.5-2.8% on the three kStageX=true shapes (their extra x-staging shared-memory
+// buffer keeps shared memory, not registers, the binding constraint even at max carveout, so the
+// tighter register budget buys no occupancy there). Tried gating the target on kStageX to avoid
+// those regressions (minBlocksPerMultiprocessor=1 for kStageX=true) -- that measured *worse*
+// than this blanket version for the GDN shape specifically (explicitly passing 1 is not the same
+// as omitting the attribute; it still perturbs codegen), so the gated version was abandoned. Net
+// effect of the blanket version, validated end-to-end: decode ~30.6 -> ~31.4 tok/s.
 __launch_bounds__(kRowsPerBlock * 32, 2048 / (kRowsPerBlock * 32))
 #endif
 void

@@ -102,6 +102,16 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
            problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
 }
 
+// The tp2 column shard of the same parent -- each device's own head-local half
+// (qk_rows=2048=8*256, value_z_rows=6144=8*768, qkv_rows=5120, z_rows=3072). Registered as a
+// second exact shape rather than widening supported_shape() to a formula: a shard extent is a
+// shape like any other, and a tp1 shape that later happened to equal it must keep its own tuned
+// route.
+bool supported_shard_shape(const Q4Q5GdnInputProblem& problem) noexcept {
+    return problem.input_rows == 5120 && problem.qk_rows == 2048 && problem.value_z_rows == 6144 &&
+           problem.qkv_rows == 5120 && problem.z_rows == 3072 && problem.padded_k == 5120;
+}
+
 } // namespace
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept {
@@ -129,7 +139,7 @@ const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedu
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return (supported_shape(problem) || supported_shard_shape(problem)) && problem.cols >= 1;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
@@ -137,6 +147,13 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
         throw std::invalid_argument(
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
     }
+
+    // The shard shape has no tuned small-T exact kernel (q4_q5_gdn_input_independent_launch
+    // is compile-time-exact to the tp1 parent's 4096/12288 row counts -- see the file's own
+    // kQkRows/kValueRows constants). The shard always routes through the grouped-MMA kernel, which
+    // is already row-count-generic (reads shapes from the Weight/Tensor arguments at runtime, see
+    // launch_slice below) -- the same fall-off attn_input_proj's Q4/Q5 shard takes at small T.
+    if (supported_shard_shape(problem)) { return {Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128}; }
 
     for (const RouteSpec& route : kRoutes) {
         if (!route.cols.contains(problem.cols)) { continue; }

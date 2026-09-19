@@ -23,10 +23,6 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
                                    cudaStream_t stream);
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream);
-#ifdef NINFER_VOLTA_BUILD
-void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               cudaStream_t stream);
-#endif
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);

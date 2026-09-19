@@ -23,7 +23,5 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 void launch_bf16_cutlass_sm70(const Tensor& x, const Weight& weight, Tensor& out,
                               cudaStream_t stream);
 #endif
-void launch_bf16_n256_k5120(const Tensor& x, const Weight& weight, Tensor& out,
-                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

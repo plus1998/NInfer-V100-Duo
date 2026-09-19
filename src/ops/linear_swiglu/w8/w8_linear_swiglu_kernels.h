@@ -16,8 +16,6 @@ void w8_linear_swiglu_simt_pair_c4_launch(const Tensor& x, const Weight& w, Tens
                                           cudaStream_t stream);
 void w8_linear_swiglu_simt_pair_c8_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream);
-void w8_linear_swiglu_volta_qpn_split_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                              cudaStream_t stream);
 void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
                                             cudaStream_t stream);
 void w8_linear_swiglu_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& out,

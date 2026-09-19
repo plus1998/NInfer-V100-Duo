@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/engine/context_cost.h"
+#include "runtime/engine/request_memory.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
@@ -11,6 +11,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+struct ExecutionContext;
 
 namespace targets {
 
@@ -34,13 +35,13 @@ struct Qwen3_6_27BInstance {
 
     std::unique_ptr<LoadedQwen3_6_27B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
+    runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27B::Program> program;
 
     Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
                         runtime::KvCapacityResolution resolution,
-                        Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device,
-                        const StartupObserver& startup_observer);
+                        Qwen3_6_27B::SequencePlan sequence_plan, ExecutionContext& execution);
     ~Qwen3_6_27BInstance();
 
     Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
@@ -64,13 +65,13 @@ struct Qwen3_6_35BA3BInstance {
 
     std::unique_ptr<LoadedQwen3_6_35BA3B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
+    runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_35BA3B::Program> program;
 
     Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
                            runtime::KvCapacityResolution resolution,
-                           Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device,
-                           const StartupObserver& startup_observer);
+                           Qwen3_6_35BA3B::SequencePlan sequence_plan, ExecutionContext& execution);
     ~Qwen3_6_35BA3BInstance();
 
     Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;
@@ -84,11 +85,10 @@ struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    runtime::ContextMachineCostModel context_cost;
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
-                                                 DeviceContext& device);
+                                                 ExecutionContext& execution);
 
 } // namespace targets
 } // namespace ninfer

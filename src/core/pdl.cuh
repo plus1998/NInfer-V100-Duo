@@ -20,6 +20,11 @@ struct LaunchConfig {
 template <class... KernelArgs, class... CallArgs>
 [[nodiscard]] inline cudaError_t
 launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+#if defined(NINFER_SM8X_COMPAT) || defined(NINFER_VOLTA_BUILD)
+    kernel<<<launch.grid, launch.block, launch.dynamic_smem_bytes, launch.stream>>>(
+        std::forward<CallArgs>(args)...);
+    return cudaGetLastError();
+#else
     cudaLaunchAttribute attribute{};
     attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attribute.val.programmaticStreamSerializationAllowed = 1;
@@ -33,6 +38,7 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.numAttrs         = 1;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
+#endif
 }
 
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but

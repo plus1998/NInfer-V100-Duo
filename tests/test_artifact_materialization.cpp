@@ -107,8 +107,29 @@ int main() {
         const auto validation_plan = validation_binder.finish();
         require(validation_plan.object_count == 4 && validation_plan.host_objects.size() == 1 &&
                     validation_plan.device_objects.size() == 1 &&
-                    validation_plan.device_capacity_bytes == kSecondTensor.size(),
+                    validation_plan.device_capacity_bytes[0] == kSecondTensor.size(),
                 "validate-only tensor was included in the materialization plan");
+
+        // A sharded placement that names no range for a device is a shard-map bug, not a request
+        // to replicate: the binder must refuse it rather than quietly reserving a full copy.
+        {
+            ninfer::artifact::Binder sharded_binder(reader, 2);
+            require(sharded_binder.device_count() == 2, "binder did not record its device count");
+            sharded_binder.set_shard_resolver([](std::string_view) {
+                ninfer::artifact::ShardPlacement placement;
+                placement.axis = ninfer::artifact::ShardAxis::Rows;
+                placement.device_ranges[0].push_back(ninfer::artifact::SliceRange{0, 2});
+                return placement; // device 1 deliberately left empty
+            });
+            const auto sharded = sharded_binder.require_tensor(
+                "weights/second", ninfer::artifact::NumericFormat::BF16,
+                ninfer::artifact::StorageLayout::ContiguousLeV1, retained_shape);
+            bool rejected = false;
+            try {
+                sharded_binder.materialize_on_device(sharded);
+            } catch (const ninfer::artifact::ArtifactError&) { rejected = true; }
+            require(rejected, "a sharded object with no range for a device was not rejected");
+        }
 
         int device_count              = 0;
         const cudaError_t count_error = cudaGetDeviceCount(&device_count);
@@ -148,7 +169,7 @@ int main() {
 
         const ninfer::artifact::MaterializationPlan plan = binder.finish();
         require(plan.object_count == 4 && plan.host_objects.size() == 1 &&
-                    plan.device_objects.size() == 3 && plan.device_capacity_bytes == 772,
+                    plan.device_objects.size() == 3 && plan.device_capacity_bytes[0] == 772,
                 "binder produced the wrong materialization plan");
 
         ninfer::DeviceContext device(0);
@@ -193,8 +214,8 @@ int main() {
                                             ninfer::artifact::Reader::direct_io_alignment +
                                             kTailReadBytes,
                 "materialization statistics are incomplete");
-        require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
-                    materialized.device_arena().used() == plan.device_capacity_bytes,
+        require(materialized.device_arena().capacity() == plan.device_capacity_bytes[0] &&
+                    materialized.device_arena().used() == plan.device_capacity_bytes[0],
                 "materialized tensor does not own the planned device backing");
         return 0;
     } catch (const std::exception& error) {

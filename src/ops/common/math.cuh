@@ -24,7 +24,7 @@ __device__ __forceinline__ float exp2_approx(float x) {
 }
 
 // cvt.rn.bf16x2.f32 is Ampere+ only (like cp.async, this was missing from the original
-// full-tree audit — see docs/v100.md). Below sm_80, __floats2bfloat162_rn is the
+// full-tree audit — see the V100 performance summary). Below sm_80, __floats2bfloat162_rn is the
 // portable equivalent: a standard cuda_bf16.h intrinsic (software round-to-nearest-even
 // on pre-Ampere, not a hardware instruction), already used elsewhere in this codebase
 // (e.g. Q4MmaDecodeAtom::decode_pair) for exactly this reason.
@@ -41,26 +41,6 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     std::memcpy(&out, &packed, sizeof(out));
     return out;
 #endif
-}
-
-__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
-    const __half2 packed = __floats2half2_rn(lo, hi);
-    return load_vec<std::uint32_t>(&packed);
-}
-
-__device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
-    const __nv_bfloat162 source = load_vec<__nv_bfloat162>(&bits);
-    const __half2 converted =
-        __halves2half2(__half(__low2bfloat16(source)), __half(__high2bfloat16(source)));
-    return load_vec<std::uint32_t>(&converted);
-}
-
-__device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
-    return make_int4(
-        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.x))),
-        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.y))),
-        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.z))),
-        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.w))));
 }
 
 __device__ __forceinline__ float2 bf16x2_to_float2(__nv_bfloat162 value) {

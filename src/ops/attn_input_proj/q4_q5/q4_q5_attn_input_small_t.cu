@@ -92,7 +92,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& q, Tensor& key, cu
         // GroupedHomogeneousPairMma* (T>16) need Ampere+ mma/ldmatrix, trap-stubbed on sm_70.
         // launch_q4_simt_route already takes cols as a runtime grid parameter (the switch above
         // is only picking a tile-size schedule for tuning, not a kernel limit), so it
-        // generalizes to any T unchanged. See docs/v100.md.
+        // generalizes to any T unchanged. See the V100 performance summary.
         if (x.ne[1] > 16) {
             launch_q4_simt_route<Q4AttnSimtR8C8Schedule>(x, weight, q, key, stream);
             return;

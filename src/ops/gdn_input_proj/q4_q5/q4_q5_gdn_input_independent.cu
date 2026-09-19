@@ -75,7 +75,7 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
     // sm_70. launch_q4_simt_route<Q4GdnSimtR8C8Schedule> is a plain SIMT dot-product kernel that
     // already takes cols as a runtime grid parameter (div_up(cols, kColsPerTile)) with no
     // compile-time T bound -- the T<=16 split above is a routing choice, not a kernel limit, so
-    // it generalizes to any prefill width unchanged. See docs/v100.md.
+    // it generalizes to any prefill width unchanged. See the V100 performance summary.
     launch_q4_simt_route<Q4GdnSimtR8C8Schedule>(x, weight, out, stream);
     return;
 #else
@@ -174,7 +174,7 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
 #ifdef NINFER_VOLTA_BUILD
     // Same reasoning as launch_q4 above: launch_q5_simt_r8_c8 is a plain SIMT kernel with cols
     // as a runtime grid parameter, so it generalizes past T=16 unchanged once
-    // GroupedMixedMmaR64C128 is unavailable. See docs/v100.md.
+    // GroupedMixedMmaR64C128 is unavailable. See the V100 performance summary.
     launch_q5_simt_r8_c8(x, weight, value, z, stream);
     return;
 #else

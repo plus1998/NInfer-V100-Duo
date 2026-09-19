@@ -12,10 +12,8 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 7;
+inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
-inline constexpr std::uint32_t kMtpLookupMaximumDrafts    = 15;
-inline constexpr std::uint32_t kMtpLookupMaximumWidth     = kMtpLookupMaximumDrafts + 1;
 inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
@@ -24,7 +22,8 @@ struct RoundStateSpec {
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
-    SpeculativeBackend backend   = SpeculativeBackend::None;
+    bool enable_mtp              = false;
+    bool enable_dflash           = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -34,8 +33,7 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -44,26 +42,24 @@ struct OrdinaryDecodeEgress {
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
-// product domain; each decode frame binds its exact verification width and the configured
-// seven-token-or-smaller learned proposal width.
+// product domain; RoundState binds only the configured [K,C] and [K+1,C] prefixes.
 struct MtpDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpLookupMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpLookupMaximumWidth> target_rope_positions{};
+    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> current_drafts{};
+    std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpLookupMaximumWidth> licensed_tokens{};
+    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
@@ -79,16 +75,9 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> proposal_valid_columns{};
-    // DFlash uses logical positions for its own attention. Target verification carries a separate
-    // continuation RoPE position so multimodal rows retain their per-sequence rope_delta.
-    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth>
-        target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -141,9 +130,6 @@ struct DFlashDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion proposal_ids;
     TensorRegion proposal_positions;
-    TensorRegion verify_positions;
-    std::optional<TensorRegion> candidate_ids;
-    std::optional<TensorRegion> proposal_q;
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
@@ -167,7 +153,6 @@ struct RoundStateLayout {
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
-    std::optional<MtpDecodeStateLayout> mtp_lookup_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
     bool complete = false;
 };
@@ -179,8 +164,7 @@ struct OrdinaryDecodeState {
     Tensor cache_positions;
     Tensor rope_positions;
     Tensor text_kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -228,8 +212,7 @@ struct MtpDecodeState {
     Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor mtp_kv_table_rows;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
@@ -254,8 +237,7 @@ struct MtpDecodeState {
 
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
-                   std::uint32_t batch_capacity, std::uint32_t verify_window,
-                   std::uint32_t proposal_window);
+                   std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
 struct DFlashDecodeState {
@@ -266,22 +248,15 @@ struct DFlashDecodeState {
     Tensor context_frontiers;
     Tensor proposal_extents;
     Tensor target_valid_columns;
-    Tensor proposal_valid_columns;
-    Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
-    Tensor active_lanes;
-    Tensor state_source_slots;
-    Tensor state_destination_slots;
+    Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor proposal_ids;
     Tensor proposal_positions;
-    Tensor verify_positions;
-    Tensor candidate_ids;
-    Tensor proposal_q;
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;
@@ -308,7 +283,6 @@ struct RoundState {
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
-    std::optional<MtpDecodeState> mtp_lookup_decode;
     std::optional<DFlashDecodeState> dflash_decode;
 
     RoundState() = default;

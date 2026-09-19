@@ -49,21 +49,12 @@ const auto& launchers() {
 void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kNvfp4FirstSmallT);
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
-    case Nvfp4Problem::AttnInput:
-        launchers<Nvfp4AttnInputGeometry>()[index](x, weight, out, stream);
+#define NINFER_NVFP4_SMALL_T_CASE(name, geometry)                                                  \
+    case Nvfp4Problem::name:                                                                       \
+        launchers<geometry>()[index](x, weight, out, stream);                                      \
         return;
-    case Nvfp4Problem::GdnInput:
-        launchers<Nvfp4GdnInputGeometry>()[index](x, weight, out, stream);
-        return;
-    case Nvfp4Problem::MlpGateUp:
-        launchers<Nvfp4MlpGateUpGeometry>()[index](x, weight, out, stream);
-        return;
-    case Nvfp4Problem::Residual6144:
-        launchers<Nvfp4Residual6144Geometry>()[index](x, weight, out, stream);
-        return;
-    case Nvfp4Problem::Residual17408:
-        launchers<Nvfp4Residual17408Geometry>()[index](x, weight, out, stream);
-        return;
+        NINFER_NVFP4_LINEAR_PROBLEMS(NINFER_NVFP4_SMALL_T_CASE)
+#undef NINFER_NVFP4_SMALL_T_CASE
     }
 }
 

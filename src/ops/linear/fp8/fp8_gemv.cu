@@ -54,6 +54,23 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     case Fp8Problem::Residual17408:
         launch_exact<Fp8Residual17408Geometry>(x, weight, out, stream);
         return;
+    // linear_add's tp2 row shards, wired here so linear_add_row_parallel's plain
+    // (residual-free) rank -- issued through ops::linear's own dispatch_linear -- can reach them.
+    case Fp8Problem::Residual6144Tp2Row:
+        launch_exact<Fp8Residual6144Tp2RowGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launch_exact<Fp8Residual17408Tp2RowGeometry>(x, weight, out, stream);
+        return;
+    // gdn_input_proj's tp2 column shard, wired here so ops::linear itself can serve it
+    // end to end (gdn_input_proj's own registry never routes through here in production).
+    case Fp8Problem::GdnInputTp2Column:
+        launch_exact<Fp8GdnInputTp2ColumnGeometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
+        break;
     }
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }

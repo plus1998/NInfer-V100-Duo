@@ -8,7 +8,7 @@
 // buffer is row-major-by-n (k-contiguous per row), so splitting by output is just a pointer
 // offset into one shared dequant pass per weight -- no extra dequant work for the second
 // output. Compute-bound prefill shapes only; decode/small-T stays on the existing SIMT
-// gemv/split4/rowsplit paths. See docs/v100.md.
+// gemv/split4/rowsplit paths. See the V100 performance summary.
 
 #include "core/arena.h"
 #include "core/tensor.h"

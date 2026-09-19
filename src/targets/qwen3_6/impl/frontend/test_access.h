@@ -10,8 +10,6 @@ class FrontendTestAccess {
 public:
     [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
                                                    bool vision_enabled = true);
-    [[nodiscard]] static Frontend create_component(const FrontendResources& resources,
-                                                   FrontendOptions options);
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 

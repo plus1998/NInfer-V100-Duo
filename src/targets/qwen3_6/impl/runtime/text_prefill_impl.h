@@ -21,22 +21,26 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
+            Tensor lane  = frame.lanes.slice(0, 0, 1);
             Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
-            (void)rewrite_checkpoint;
+            if (rewrite_checkpoint) {
+                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->lanes[0],
+                                                      state.execution.device.stream);
+            }
         });
 }
 
 } // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
-                         const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
-                         std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
+                         const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
+                         std::int32_t rewrite_checkpoint_state_slot,
+                         std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
-    card.set_linear_state_slots(state_source_slot, state_destination_slot);
+    card.set_linear_state_slots(current_state_slot, rewrite_checkpoint_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     if (execution.proposal_head == ProposalHead::Full) {
@@ -49,19 +53,32 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     }
 }
 
-PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
-                                      std::uint32_t nominal_length,
-                                      std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end) {
+PrefillChunkResult prefill_text_chunk(
+    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end) {
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) {
+        // The per-sequence MTP KV window is request state, so it comes from the PrefillContext
+        // rather than from the process-lifetime peer core: the MTP prefill appends and reads
+        // through the execution view, unlike the text prefill, which drives the batch cache.
+        tp->mtp_kv = state.mtp_kv_peer;
+        if (tp->mtp_kv.valid() != state.mtp_kv.valid()) {
+            throw std::logic_error("tensor-parallel MTP KV windows disagree between ranks");
+        }
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.rope_frequency, state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                     tp ? &*tp : nullptr);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
-                                                   : -1);
+    card.set_prefill_rewrite_checkpoint_frontier(
+        rewrite_checkpoint_capture_frontier
+            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
+            : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -71,25 +88,26 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
-PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
-                                            VisionPrefillSession& vision,
-                                            std::uint32_t nominal_length,
-                                            std::optional<std::uint32_t> split_frontier,
-                                            bool finalize_at_end) {
+PrefillChunkResult
+prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+                         VisionPrefillSession& vision, std::uint32_t nominal_length,
+                         std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
+                         bool finalize_at_end) {
+    if (state.dflash != nullptr) {
+        throw std::logic_error("DFlash staged multimodal prefill is unavailable");
+    }
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.execution.rope_frequency, state.text_kv,
+                     state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
-    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
+                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
-                                                   : -1);
-    if (state.dflash != nullptr) {
-        DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
-                                  finalize_at_end, sink);
-    }
+    card.set_prefill_rewrite_checkpoint_frontier(
+        rewrite_checkpoint_capture_frontier
+            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
+            : -1);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
@@ -130,15 +148,46 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
                            bridge.rope_position, false, composed_embedding);
 }
 
-void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose) {
+std::array<Tensor, 2> resume_hidden(ExecutionCore& execution, const Tensor& hidden) {
     if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
-        throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
+        throw std::invalid_argument("prefix resume requires BF16 [hidden,1]");
     }
+    std::array<Tensor, 2> result{hidden, {}};
+    if (execution.peer == nullptr) { return result; }
+    const auto& peer = *execution.peer;
+    result[1] = peer.prefill_hidden->slice(1, 0, 1);
+    const CurrentDevice restore;
+    CUDA_CHECK(cudaSetDevice(execution.device.device));
+    CUDA_CHECK(cudaEventRecord(peer.events->inputs_ready(0), execution.device.stream));
+    CUDA_CHECK(cudaSetDevice(peer.device->device));
+    CUDA_CHECK(cudaStreamWaitEvent(peer.device->stream, peer.events->inputs_ready(0), 0));
+    CUDA_CHECK(cudaMemcpyAsync(result[1].data, hidden.data, hidden.bytes(),
+                               cudaMemcpyDeviceToDevice, peer.device->stream));
+    CUDA_CHECK(cudaEventRecord(peer.events->pull_done(1), peer.device->stream));
+    CUDA_CHECK(cudaSetDevice(execution.device.device));
+    CUDA_CHECK(cudaStreamWaitEvent(execution.device.stream, peer.events->pull_done(1), 0));
+    return result;
+}
+
+void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
+                        std::int32_t purpose) {
+    const auto restored = resume_hidden(state.execution, hidden);
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    ops::linear(hidden, state.execution.model.output_head, logits, state.execution.device.stream);
+    std::optional<TpExecution> tp = tp_execution(state.execution);
+    if (tp) {
+        tp->work->reset();
+        TextContext card(state.execution.device, state.execution.model, state.execution.work,
+                         state.execution.rope_frequency, state.text_kv,
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk,
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache, &*tp);
+        card.target_logits(restored, {logits, tp->io->logits.slice(1, 0, 1)});
+    } else {
+        ops::linear(hidden, state.execution.model.output_head, logits,
+                     state.execution.device.stream);
+    }
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -146,6 +195,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     state.execution.work.reset();
+    if (tp) { tp->work->reset(); }
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

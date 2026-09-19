@@ -96,10 +96,28 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
     }
 }
 
+// The override substitutes the frequency table of one specific mode. Admitting it anywhere else
+// would either silently ignore it (Vision/DFlash carry their own tables) or read past the end of
+// a 32-entry buffer, so the domain is checked rather than assumed.
+void require_frequency_override(const RopeFrequencyOverride& frequency, int axes, int rotary_dim,
+                                std::int32_t head_dim) {
+    if (frequency.inv_frequency == nullptr) { return; }
+    if (axes != 1 && axes != 3) {
+        throw std::invalid_argument("rope: frequency override requires 1-D or 3-D Text positions");
+    }
+    if (head_dim != kTextHeadDim || rotary_dim != 64) {
+        throw std::invalid_argument("rope: frequency override requires Text head_dim=256 "
+                                    "rotary_dim=64");
+    }
+    if (!std::isfinite(frequency.mscale) || !(frequency.mscale > 0.0f)) {
+        throw std::invalid_argument("rope: frequency override mscale must be positive and finite");
+    }
+}
+
 } // namespace
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          cudaStream_t stream) {
+          const RopeFrequencyOverride& frequency, cudaStream_t stream) {
     require_common(positions, rotary_dim, theta);
     if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
         throw std::invalid_argument("rope: q/k must be BF16");
@@ -113,6 +131,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t k_heads  = k.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
+    require_frequency_override(frequency, axes, rotary_dim, head_dim);
     require_tensor_layout(q, "q", head_dim, q_heads, tokens);
     require_tensor_layout(k, "k", head_dim, k_heads, tokens);
     if (q_numel == 0) { return; }
@@ -120,10 +139,11 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
-    detail::rope_launch(positions, rotary_dim, theta, q, k, stream);
+    detail::rope_launch(positions, rotary_dim, theta, q, k, frequency, stream);
 }
 
-void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream) {
+void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+          const RopeFrequencyOverride& frequency, cudaStream_t stream) {
     require_common(positions, rotary_dim, theta);
     if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
     (void)numel_allow_zero(positions, "positions");
@@ -133,11 +153,21 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
     const std::int32_t heads    = x.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
+    require_frequency_override(frequency, axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);
     if (x_numel == 0) { return; }
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
-    detail::rope_single_launch(positions, rotary_dim, theta, x, stream);
+    detail::rope_single_launch(positions, rotary_dim, theta, x, frequency, stream);
+}
+
+void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+          cudaStream_t stream) {
+    rope(positions, rotary_dim, theta, q, k, RopeFrequencyOverride{}, stream);
+}
+
+void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream) {
+    rope(positions, rotary_dim, theta, x, RopeFrequencyOverride{}, stream);
 }
 
 } // namespace ninfer::ops

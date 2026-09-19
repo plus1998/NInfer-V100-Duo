@@ -312,6 +312,58 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
+
+    // TP2 shard support. `row_origin`/`column_origin` place this tensor's logical (0,0) at
+    // (row_origin, column_origin) of a larger parent matrix. Every code and every scale the
+    // generator emits is a pure function of the GLOBAL coordinate, so
+    //
+    //   make_patterned_weight(qtype, rc, k,  seed, {.row_origin = r0})                 and
+    //   make_patterned_weight(qtype, n,  cc, seed, {.column_origin = c0})
+    //
+    // are standalone tensors whose logical values equal the parent's rows [r0, r0+rc) and columns
+    // [c0, c0+cc) respectively -- which is exactly what the TP2 loader materializes into each
+    // device's arena (a shard is a tensor of the same layout with one axis narrowed, never a
+    // pointer offset into the parent payload; NVFP4's swizzled scale plane and every row-split
+    // plane are re-based per shard). `tests/ops/test_linear_split.cpp` asserts that logical
+    // equality through logical_weight_fp64() rather than assuming it.
+    //
+    // Both default to 0, which reproduces every pre-existing payload byte for byte.
+    //
+    // Constraints mirror the production shard-boundary rules so an origin the loader would reject
+    // cannot be fabricated here: NVFP4 needs `row_origin % 128 == 0` (the 128-row scale tile) and
+    // `column_origin % 64 == 0` (the 64-column scale tile); row-split needs
+    // `column_origin % 128 == 0` (the layout's K-alignment unit, a multiple of both group sizes).
+    // RowSplitCodePattern::Hashed keys on the flat group index rather than the logical coordinate
+    // and is therefore not translation invariant; it rejects a non-zero origin.
+    std::int32_t row_origin    = 0;
+    std::int32_t column_origin = 0;
+
+    // Removes the periodicity of the affine code/scale patterns on BOTH axes. The NVFP4 rules are
+    // affine in row and column (`code = row*13 + column*7 + seed`, `scale = row*5 + group*3 +
+    // seed`) with moduli 16 and 8, and the FP8 code rule is affine with modulus 16, so two blocks
+    // separated by a stride s carry IDENTICAL codes whenever the relevant multiple of s vanishes
+    // under those moduli. EVERY tp2 shard boundary in this model is such an s, on both axes:
+    //
+    //   rows    7168, 8192, 17408:  13s = 0 (mod 16)  and  5s = 0 (mod 8)
+    //   columns 3072, 8704:          7s = 0 (mod 16)  and  3*(s/16) = 0 (mod 8)
+    //
+    // A suite that compares one shard against the other -- which is what BOTH split axes do -- was
+    // therefore comparing two byte-identical tensors, and would pass even if a rank had computed
+    // the wrong half. This is the single most dangerous failure mode of a shard test, because it
+    // is invisible: everything reports zero error.
+    //
+    // With this set both coordinates are hashed before they enter the pattern. The generator stays
+    // a pure function of the GLOBAL coordinate, so shard translation invariance is untouched; only
+    // the accidental periodicity goes away. The row-split codec's own `row ^ (row>>8) ^ (row>>16)`
+    // row mix and its `group*29` column term are already non-degenerate at these strides; the
+    // option is applied uniformly anyway so one flag means one thing in every format.
+    //
+    // `tests/ops/test_linear_split.cpp` does not trust this: it asserts that the two shard
+    // PAYLOADS actually differ, on both axes, in every case. That assertion is what caught the
+    // defect this option exists to fix -- twice, once per axis.
+    //
+    // Defaults to false, which reproduces every pre-existing payload byte for byte.
+    bool decorrelate_coordinates = false;
 };
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
@@ -321,6 +373,28 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     if (n <= 0 || k <= 0) {
         throw std::invalid_argument("quantized-weight fixture: shape must be positive");
     }
+    if (options.row_origin < 0 || options.column_origin < 0) {
+        throw std::invalid_argument("quantized-weight fixture: shard origin must not be negative");
+    }
+    const std::int32_t row_origin    = options.row_origin;
+    const std::int32_t column_origin = options.column_origin;
+    // The values every pattern keys on: the global coordinate, optionally hashed to remove the
+    // affine patterns' periodicity (see PatternedWeightOptions::decorrelate_coordinates). Each
+    // axis gets its own salt so that hashing cannot make the row and column terms agree.
+    const auto decorrelate = [&](std::uint64_t absolute, std::uint64_t salt) -> std::uint64_t {
+        return options.decorrelate_coordinates ? (detail::mix64(absolute + salt) >> 24) : absolute;
+    };
+    const auto pattern_row = [&](std::int64_t local_row) -> std::uint64_t {
+        return decorrelate(static_cast<std::uint64_t>(local_row + row_origin), 0x9e37U);
+    };
+    // Per-element column index (NVFP4 codes, FP8 codes).
+    const auto pattern_column = [&](std::int64_t local_column) -> std::uint64_t {
+        return decorrelate(static_cast<std::uint64_t>(local_column + column_origin), 0x85ebU);
+    };
+    // Per-group column index; `shift` is the shard's own group origin, in that format's groups.
+    const auto pattern_group = [&](std::int64_t local_group, std::uint64_t shift) -> std::uint64_t {
+        return decorrelate(static_cast<std::uint64_t>(local_group) + shift, 0xc2b2U);
+    };
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
             throw std::invalid_argument(
@@ -339,20 +413,46 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             0x00U, 0x80U, 0x01U, 0x81U, 0x07U, 0x87U, 0x08U, 0x88U,
             0x18U, 0x98U, 0x38U, 0xb8U, 0x44U, 0xc4U, 0x7eU, 0xfeU,
         };
+        // This XOR-shift is what makes a ROW-origin shard boundary non-periodic
+        // at most strides even with decorrelate_coordinates=false (verified against
+        // tests/ops/test_linear_swiglu_split.cpp's and test_attn_input_proj_split.cpp's own
+        // negative controls, which do NOT fire at their row strides -- 8704/17408 and
+        // 3072/512/6144/7168 respectively -- while tests/ops/test_linear_split.cpp's DOES fire at
+        // 8192). This is provable, not incidental, so state the exact boundary rather than leave it
+        // an empirical accident future maintainers could silently rely on at the wrong stride:
+        //
+        // `pattern & 15` only ever reads `row_mix mod 16`, i.e. bits[3:0] of `row ^ (row>>7)`,
+        // which equals bits[3:0](row) XOR bits[10:7](row) -- a function of bits[10:0](row) alone.
+        // Adding a row-origin shift S changes those 11 bits (and therefore the code plane) UNLESS
+        // S is an exact multiple of 2048 (2^11), in which case (row+S) mod 2048 == row mod 2048 for
+        // EVERY row and the code plane is exactly periodic at stride S -- annihilating without
+        // decorrelate_coordinates, the same failure mode NVFP4's purely-affine pattern has at every
+        // stride. (The scale plane below is periodic at any stride that is merely a multiple of 4,
+        // `kScales[(pattern_row(row)+seed) & 3]` with no XOR mix at all -- but the much larger code
+        // plane's mod-2048 condition is what actually gates whole-payload distinctness.)
+        //
+        // COLUMN-origin shifts have no such protection: `pattern_column` feeds the code pattern
+        // through a plain linear `*7` term with no mixing step, so it annihilates at ANY stride that
+        // is a multiple of 16 (7 is invertible mod 16, so `7*(col+C) mod 16 == 7*col mod 16` iff
+        // `C mod 16 == 0`) -- confirmed by both test_linear_split.cpp's and
+        // test_linear_add_split.cpp's own negative controls firing at their 3072/8704 column
+        // strides. Do not assume a "large" stride is automatically safe on either axis: check it
+        // against the modulus for the axis actually being shifted, or just leave
+        // decorrelate_coordinates=true (every split suite in this repository already does).
         for (std::int32_t row = 0; row < n; ++row) {
-            const std::uint32_t row_mix =
-                static_cast<std::uint32_t>(row) ^ (static_cast<std::uint32_t>(row) >> 7);
+            const auto global_row       = static_cast<std::uint32_t>(pattern_row(row));
+            const std::uint32_t row_mix = global_row ^ (global_row >> 7);
             for (std::int32_t column = 0; column < k; ++column) {
                 const std::uint32_t pattern =
-                    row_mix * 13U + static_cast<std::uint32_t>(column) * 7U + seed;
+                    row_mix * 13U + static_cast<std::uint32_t>(pattern_column(column)) * 7U + seed;
                 packed.payload[static_cast<std::size_t>(row) * k + column] = kCodes[pattern & 15U];
             }
         }
         constexpr std::uint16_t kScales[]{0x3b00U, 0x3b40U, 0x3b80U, 0x3bc0U};
         for (std::int32_t row = 0; row < n; ++row) {
-            detail::store_u16_le(packed.payload,
-                                 packed.scale_plane_offset + static_cast<std::size_t>(row) * 2,
-                                 kScales[(static_cast<std::uint32_t>(row) + seed) & 3U]);
+            detail::store_u16_le(
+                packed.payload, packed.scale_plane_offset + static_cast<std::size_t>(row) * 2,
+                kScales[(static_cast<std::uint32_t>(pattern_row(row)) + seed) & 3U]);
         }
 
         packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
@@ -402,6 +502,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             throw std::invalid_argument(
                 "quantized-weight fixture: NVFP4 divisors must be finite and positive");
         }
+        if ((row_origin % 128) != 0 || (column_origin % 64) != 0) {
+            throw std::invalid_argument("quantized-weight fixture: NVFP4 shard origin must align "
+                                        "to 128 rows and 64 columns");
+        }
 
         PackedWeight packed;
         packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k / 2;
@@ -415,8 +519,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             for (std::int32_t column = 0; column < k; column += 2) {
                 const auto code = [&](std::int32_t logical_column) {
                     return static_cast<std::uint8_t>(
-                        (static_cast<std::uint32_t>(row) * 13U +
-                         static_cast<std::uint32_t>(logical_column) * 7U + seed) &
+                        (static_cast<std::uint32_t>(pattern_row(row)) * 13U +
+                         static_cast<std::uint32_t>(pattern_column(logical_column)) * 7U + seed) &
                         0x0fU);
                 };
                 packed.payload[static_cast<std::size_t>(row) * k / 2 +
@@ -449,9 +553,13 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                     static_cast<std::size_t>(row_inner % 32) * 16U +
                     static_cast<std::size_t>(row_inner / 32) * 4U +
                     static_cast<std::size_t>(scale_lane);
-                const std::size_t pattern = (static_cast<std::uint32_t>(row) * 5U +
-                                             static_cast<std::uint32_t>(group) * 3U + seed) &
-                                            7U;
+                const std::size_t pattern =
+                    (static_cast<std::uint32_t>(pattern_row(row)) * 5U +
+                     static_cast<std::uint32_t>(
+                         pattern_group(group, static_cast<std::uint64_t>(column_origin / 16))) *
+                         3U +
+                     seed) &
+                    7U;
                 packed.payload[stored_offset] = kScaleWords[pattern];
             }
         }
@@ -488,6 +596,15 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         throw std::invalid_argument(
             "quantized-weight fixture: divisors are defined only for NVFP4");
     }
+    if ((column_origin % 128) != 0) {
+        throw std::invalid_argument(
+            "quantized-weight fixture: row-split shard column origin must align to 128");
+    }
+    if (options.row_split_codes == RowSplitCodePattern::Hashed &&
+        (row_origin != 0 || column_origin != 0)) {
+        throw std::invalid_argument(
+            "quantized-weight fixture: hashed row-split codes are not translation invariant");
+    }
     const detail::QuantSpec spec      = detail::quant_spec(qtype);
     const std::int32_t padded_k       = detail::align_up(k, 128);
     const std::int32_t kg             = padded_k / spec.group_size;
@@ -510,16 +627,22 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
 
     const std::uint64_t code_bytes_per_group = detail::nibble_bytes_per_group(spec);
     const std::uint64_t high_bytes_per_group = detail::high_bytes_per_group(spec);
+    // Global coordinates of this tensor's origin inside its parent, in the units each pattern
+    // keys on. A shard therefore emits exactly the parent's codes and scales for its own range.
+    const auto group_shift = static_cast<std::uint64_t>(column_origin / spec.group_size);
     if (options.row_split_codes == RowSplitCodePattern::Coordinate) {
         for (std::uint64_t group_index = 0; group_index < groups; ++group_index) {
-            const std::uint64_t row   = group_index / static_cast<std::uint64_t>(kg);
+            const std::uint64_t row =
+                pattern_row(static_cast<std::int64_t>(group_index / static_cast<std::uint64_t>(kg)));
             const std::uint64_t group = group_index % static_cast<std::uint64_t>(kg);
             if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
+            const std::uint64_t global_group =
+                pattern_group(static_cast<std::int64_t>(group), group_shift);
             const std::uint32_t row_mix =
                 static_cast<std::uint32_t>(row ^ (row >> 8) ^ (row >> 16));
             for (std::uint64_t byte = 0; byte < code_bytes_per_group; ++byte) {
                 std::uint8_t code = static_cast<std::uint8_t>(
-                    (row_mix * 37u + group * 29u + byte * 17u + seed) & 0xffu);
+                    (row_mix * 37u + global_group * 29u + byte * 17u + seed) & 0xffu);
                 if (qtype == QType::W8G32_F16S && code == 0x80u) { code = 0x81u; }
                 packed
                     .payload[static_cast<std::size_t>(group_index * code_bytes_per_group + byte)] =
@@ -529,7 +652,7 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 packed.payload[static_cast<std::size_t>(
                     packed.high_plane_offset + group_index * high_bytes_per_group + byte)] =
                     static_cast<std::uint8_t>(
-                        (row_mix * 43u + group * 31u + byte * 13u + seed * 3u) & 0xffu);
+                        (row_mix * 43u + global_group * 31u + byte * 13u + seed * 3u) & 0xffu);
             }
         }
     } else {
@@ -599,13 +722,16 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         break;
     }
     for (std::uint64_t i = 0; i < groups; ++i) {
-        const std::uint64_t row   = i / static_cast<std::uint64_t>(kg);
+        const std::uint64_t row =
+            pattern_row(static_cast<std::int64_t>(i / static_cast<std::uint64_t>(kg)));
         const std::uint64_t group = i % static_cast<std::uint64_t>(kg);
         if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
         const std::uint64_t scale_index =
             options.row_split_codes == RowSplitCodePattern::Hashed
                 ? (detail::mix64(i ^ (static_cast<std::uint64_t>(seed) << 17)) >> 8) & 3U
-                : (row ^ (row >> 8) ^ group ^ seed) & 3U;
+                : (row ^ (row >> 8) ^
+                   pattern_group(static_cast<std::int64_t>(group), group_shift) ^ seed) &
+                      3U;
         detail::store_u16_le(packed.payload,
                              static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
                              scales[scale_index]);

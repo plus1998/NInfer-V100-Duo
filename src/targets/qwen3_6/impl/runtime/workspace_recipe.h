@@ -55,14 +55,18 @@ struct TextAttentionProjectionRoots {
     Tensor value;
 };
 
+// `tp` narrows every head-sharded extent to the calling device's own share. The hidden/residual
+// axis is replicated and therefore never divided. Startup layout simulation calls these with the
+// default tp == 1, which over-plans a tp2 device rather than under-planning it.
 template <class Config, class Allocator>
-TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t tokens) {
+TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t tokens,
+                                                       std::int32_t tp = 1) {
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
     };
 }
 
@@ -73,11 +77,12 @@ struct TextAttentionResultRoots {
 };
 
 template <class Config, class Allocator>
-TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t tokens) {
+TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t tokens,
+                                                std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
     };
 }
 
@@ -88,11 +93,11 @@ struct GdnControlRoots {
 };
 
 template <class Config, class Allocator>
-GdnControlRoots gdn_control(Allocator& allocator, std::int32_t tokens) {
+GdnControlRoots gdn_control(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
     return {
         matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
-        matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
+        matrix(allocator, DType::FP32, Config::gdn_value_heads / tp, tokens),
+        matrix(allocator, DType::FP32, Config::gdn_value_heads / tp, tokens),
     };
 }
 
@@ -104,28 +109,37 @@ struct GdnProjectionRoots {
 };
 
 template <class Config, class Allocator>
-GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens) {
+GdnProjectionRoots gdn_projection(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::value_dim, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim, tokens),
-        matrix(allocator, DType::BF16, Config::key_dim, tokens),
-        matrix(allocator, DType::BF16, Config::value_dim, tokens),
+        matrix(allocator, DType::BF16, Config::value_dim / tp, tokens),
+        matrix(allocator, DType::BF16, Config::key_dim / tp, tokens),
+        matrix(allocator, DType::BF16, Config::key_dim / tp, tokens),
+        matrix(allocator, DType::BF16, Config::value_dim / tp, tokens),
+    };
+}
+
+struct GdnPrefillConvRoots {
+    Tensor projected;
+    Tensor convolved;
+};
+
+template <class Config, class Allocator>
+GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, std::int32_t tokens,
+                                     std::int32_t tp = 1) {
+    return {
+        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
+        matrix(allocator, DType::BF16, Config::convolution_dim / tp, tokens),
     };
 }
 
 template <class Config, class Allocator>
-Tensor gdn_prefill_conv(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::convolution_dim, tokens);
+Tensor gdn_recurrent_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
+    return matrix(allocator, DType::BF16, Config::value_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>
-Tensor gdn_recurrent_output(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::value_dim, tokens);
-}
-
-template <class Config, class Allocator>
-Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens) {
-    return matrix(allocator, DType::BF16, Config::value_dim, tokens);
+Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
+    return matrix(allocator, DType::BF16, Config::value_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>
@@ -142,17 +156,28 @@ struct MtpStemRoots {
     Tensor attention_hidden;
 };
 
+// `packed_input` is the [2 * hidden, T] buffer ops::mtp_pack_fc_input writes. At tp == 2 nothing
+// writes or reads it: device r's fc shard contracts packed rows [hidden*r, hidden*r + hidden),
+// which ARE the normalized embedding on rank 0 and the normalized hidden on rank 1, so the tp2
+// stem hands ops::linear_row_parallel the two unpacked halves directly (the reasoning is stated
+// on the Op itself, `include/ninfer/ops/mtp_pack.h`). It is
+// therefore not allocated at tp == 2 -- a dead allocation is only wasted workspace, but the
+// capacity query is derived from this same recipe, so leaving it in would also inflate the
+// reported per-device requirement by 10240*T BF16 for nothing.
 template <class Config, class Allocator>
-MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_embedding) {
+MtpStemRoots mtp_stem(Allocator& allocator, std::int32_t tokens, bool allocate_embedding,
+                      std::int32_t tp = 1) {
     MtpStemRoots out;
     if (allocate_embedding) {
         out.embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
     }
     out.normalized_embedding = matrix(allocator, DType::BF16, Config::hidden, tokens);
     out.normalized_hidden    = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.packed_input         = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
-    out.residual             = matrix(allocator, DType::BF16, Config::hidden, tokens);
-    out.attention_hidden     = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    if (tp == 1) {
+        out.packed_input = matrix(allocator, DType::BF16, Config::mtp_input_rows, tokens);
+    }
+    out.residual         = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.attention_hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);
     return out;
 }
 
@@ -164,12 +189,13 @@ struct MtpAttentionProjectionRoots {
 };
 
 template <class Config, class Allocator>
-MtpAttentionProjectionRoots mtp_attention_projection(Allocator& allocator, std::int32_t tokens) {
+MtpAttentionProjectionRoots mtp_attention_projection(Allocator& allocator, std::int32_t tokens,
+                                                     std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
     };
 }
 
@@ -180,11 +206,12 @@ struct MtpAttentionResultRoots {
 };
 
 template <class Config, class Allocator>
-MtpAttentionResultRoots mtp_attention_results(Allocator& allocator, std::int32_t tokens) {
+MtpAttentionResultRoots mtp_attention_results(Allocator& allocator, std::int32_t tokens,
+                                              std::int32_t tp = 1) {
     return {
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size / tp, tokens),
+        matrix(allocator, DType::BF16, Config::query_size / tp, tokens),
     };
 }
 
@@ -265,18 +292,6 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::query_size, tokens),
     };
-}
-
-// Dynamic-convolution outputs remain live through the corresponding attention/MLP branch.
-struct DFlash2BranchRoots {
-    Tensor prepared;
-    Tensor finish_delta;
-};
-
-template <class Config, class Allocator>
-DFlash2BranchRoots dflash2_branch(Allocator& allocator, std::int32_t width, std::int32_t batch) {
-    return {allocator.alloc(DType::BF16, {Config::hidden, width, batch}),
-            allocator.alloc(DType::BF16, {320, 2, width, batch})};
 }
 
 struct DFlashMlpRoots {

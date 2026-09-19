@@ -5,6 +5,7 @@
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -166,6 +167,56 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     return false;
 }
 
+// --- YaRN frequency-override dispatch ---------------------------------------------------------
+// Entirely separate from the native dispatch above, which is why none of it was touched: an
+// override never reaches launch_fixed_pair/launch_fixed_single_dispatch/launch_generic, and a
+// null override never reaches anything below.
+int yarn_text_block(int heads, int tokens) {
+    int block = kSmallBlock;
+    if (tokens <= 6) {
+        block = heads * 32;
+    } else if (tokens <= kLargeBlockWaveCapacity) {
+        block = kLargeBlock;
+    } else if (tokens <= kDefaultChunkTargetTokens) {
+        block = kFullChunkBlock;
+    }
+    const int head_warps = heads * 32;
+    if (block > head_warps) { block = head_warps; }
+    if (block > 1024) { block = 1024; }
+    return block;
+}
+
+template <RopeKernelMode Mode>
+void launch_yarn_text(const Tensor& positions, Tensor* q, Tensor* k,
+                      const RopeFrequencyOverride& frequency, cudaStream_t stream) {
+    const int tokens  = positions.ne[0];
+    const int q_heads = q == nullptr ? 0 : q->ne[1];
+    const int k_heads = k == nullptr ? 0 : k->ne[1];
+    const int block   = yarn_text_block(q_heads + k_heads, tokens);
+    rope_yarn_text_kernel<Mode><<<tokens, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
+        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), q_heads, k_heads, tokens,
+        token_stride(q), token_stride(k), frequency.inv_frequency, frequency.mscale);
+}
+
+// The wrapper has already admitted the domain (Text D256/R64, 1-D or 3-D positions). Storage
+// alignment is a launcher-level property, so it is checked here: the vectorized bf16x2 rotation
+// is the only rotation this path has, and silently degrading to the native generic kernel would
+// drop the corrected frequencies without a trace.
+void launch_yarn(const Tensor& positions, Tensor* q, Tensor* k,
+                 const RopeFrequencyOverride& frequency, cudaStream_t stream) {
+    if ((q != nullptr && !bf16x2_aligned(*q)) || (k != nullptr && !bf16x2_aligned(*k))) {
+        throw std::invalid_argument(
+            "rope: a frequency override requires 4-byte aligned q/k storage");
+    }
+    if (positions.ne[1] == 3) {
+        launch_yarn_text<RopeKernelMode::TextMrope>(positions, q, k, frequency, stream);
+    } else {
+        launch_yarn_text<RopeKernelMode::Text1D>(positions, q, k, frequency, stream);
+    }
+}
+
 void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor* q, Tensor* k,
                     cudaStream_t stream) {
     constexpr int block = 128;
@@ -182,16 +233,20 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
 } // namespace
 
 void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 cudaStream_t stream) {
-    if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, stream)) {
+                 const RopeFrequencyOverride& frequency, cudaStream_t stream) {
+    if (frequency.inv_frequency != nullptr) {
+        launch_yarn(positions, &q, &k, frequency, stream);
+    } else if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, stream)) {
         launch_generic(positions, rotary_dim, theta, &q, &k, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        cudaStream_t stream) {
-    if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
+                        const RopeFrequencyOverride& frequency, cudaStream_t stream) {
+    if (frequency.inv_frequency != nullptr) {
+        launch_yarn(positions, &x, nullptr, frequency, stream);
+    } else if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
         launch_generic(positions, rotary_dim, theta, &x, nullptr, stream);
     }
     CUDA_CHECK(cudaGetLastError());

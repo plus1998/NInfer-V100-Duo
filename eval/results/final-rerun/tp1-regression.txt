@@ -1,0 +1,13 @@
+# tp1 byte-identity regression gate
+# date: 2026-08-29T00:20:38Z
+# HEAD: d6fa620
+# GPU compute-apps before start:
+#   pid, used_gpu_memory [MiB]
+# power limits:
+#   index, power.limit [W], power.default_limit [W]
+#   0, 575.00 W, 600.00 W
+#   1, 575.00 W, 575.00 W
+
+TP1-REGRESSION: PASS
+identity OK (target=qwen3_8_27b, weights=nvfp4)
+EXIT=0

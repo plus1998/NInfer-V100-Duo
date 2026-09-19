@@ -3,6 +3,7 @@
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight.h"
 
@@ -204,6 +205,15 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     require_out_shape(ids, out);
 
     switch (table.qtype) {
+    case QType::GGML_K:
+        require_weight_2d(table);
+        if (table.k != out.ne[0]) {
+            throw std::invalid_argument("embedding: GGML K table width must match output");
+        }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::ggml_k_embedding(ids, table, out, stream);
+        break;
     case QType::BF16_CTRL: {
         require_dense_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }

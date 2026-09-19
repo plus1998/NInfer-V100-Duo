@@ -75,9 +75,20 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4Problem::Residual17408:
         launch_problem<Nvfp4Residual17408Geometry>(weight, residual, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::Residual6144Tp2Row:
+        launch_problem<Nvfp4Residual6144Tp2RowGeometry>(weight, residual, workspace, tokens,
+                                                        stream);
+        return;
+    case Nvfp4Problem::Residual17408Tp2Row:
+        launch_problem<Nvfp4Residual17408Tp2RowGeometry>(weight, residual, workspace, tokens,
+                                                         stream);
+        return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
     case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::AttnInputTp2Column:
+    case Nvfp4Problem::GdnInputTp2Column:
+    case Nvfp4Problem::MlpGateUpTp2Column:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

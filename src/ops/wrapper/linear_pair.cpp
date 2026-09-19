@@ -1,6 +1,7 @@
 #include "ninfer/ops/linear_pair.h"
 
 #include "ops/linear_pair/w8/w8_pair_plan.h"
+#include "ninfer/ops/linear.h"
 
 #include <array>
 #include <cstddef>
@@ -97,6 +98,11 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_matrix(x, x.ne[0], cols, "x");
     require_matrix(first_out, 1024, cols, "first output");
     require_matrix(second_out, 1024, cols, "second output");
+    if (first_weight.qtype == QType::GGML_K && second_weight.qtype == QType::GGML_K) {
+        linear(x, first_weight, first_out, stream);
+        linear(x, second_weight, second_out, stream);
+        return;
+    }
     require_weight(first_weight, x.ne[0], "first weight");
     require_weight(second_weight, x.ne[0], "second weight");
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);

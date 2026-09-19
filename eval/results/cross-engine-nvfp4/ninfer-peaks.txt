@@ -1,0 +1,36 @@
+### ninfer-500w-250000-mtp0-ctx1048576-yarn
+# samples in window: 140  (start .. end)
+  gpu 0: 29107 MiB (28.42 GiB)  peak draw 385.2 W of 500.00 W
+  gpu 1: 28110 MiB (27.45 GiB)  peak draw 396.8 W of 500.00 W
+  process 47643@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 28070 MiB (27.41 GiB)
+  process 47643@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 28070 MiB (27.41 GiB)
+### ninfer-500w-250000-mtp3-ctx1048576-yarn
+# samples in window: 136  (start .. end)
+  gpu 0: 30526 MiB (29.81 GiB)  peak draw 380.9 W of 500.00 W
+  gpu 1: 29568 MiB (28.88 GiB)  peak draw 373.6 W of 500.00 W
+  process 48918@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 29528 MiB (28.84 GiB)
+  process 48918@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 29528 MiB (28.84 GiB)
+### ninfer-500w-653000-mtp0-ctx1048576-yarn
+# samples in window: 636  (start .. end)
+  gpu 0: 29267 MiB (28.58 GiB)  peak draw 414.1 W of 500.00 W
+  gpu 1: 28110 MiB (27.45 GiB)  peak draw 440.0 W of 500.00 W
+  process 50930@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 28070 MiB (27.41 GiB)
+  process 50930@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 28070 MiB (27.41 GiB)
+### ninfer-500w-653000-mtp3-ctx1048576-yarn
+# samples in window: 636  (start .. end)
+  gpu 0: 30752 MiB (30.03 GiB)  peak draw 475.3 W of 500.00 W
+  gpu 1: 29568 MiB (28.88 GiB)  peak draw 488.1 W of 500.00 W
+  process 55082@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 29528 MiB (28.84 GiB)
+  process 55082@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 29528 MiB (28.84 GiB)
+### ninfer-500w-700000-mtp0-ctx1048576-yarn
+# samples in window: 720  (start .. end)
+  gpu 0: 29281 MiB (28.59 GiB)  peak draw 415.2 W of 500.00 W
+  gpu 1: 28110 MiB (27.45 GiB)  peak draw 458.8 W of 500.00 W
+  process 65848@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 28070 MiB (27.41 GiB)
+  process 65848@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 28070 MiB (27.41 GiB)
+### ninfer-500w-700000-mtp3-ctx1048576-yarn
+# samples in window: 716  (start .. end)
+  gpu 0: 30679 MiB (29.96 GiB)  peak draw 465.0 W of 500.00 W
+  gpu 1: 29568 MiB (28.88 GiB)  peak draw 463.0 W of 500.00 W
+  process 70343@GPU-0d5b11cd-7599-578e-f16c-d874bc4718b0: 29528 MiB (28.84 GiB)
+  process 70343@GPU-97634319-40e2-6c38-ed72-c64d2795cbcd: 29528 MiB (28.84 GiB)

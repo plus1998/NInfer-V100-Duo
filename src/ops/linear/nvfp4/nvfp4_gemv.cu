@@ -34,21 +34,12 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
 void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
-    case Nvfp4Problem::AttnInput:
-        launch_exact<Nvfp4AttnInputGeometry>(x, weight, out, stream);
+#define NINFER_NVFP4_DECODE_CASE(name, geometry)                                                   \
+    case Nvfp4Problem::name:                                                                       \
+        launch_exact<geometry>(x, weight, out, stream);                                            \
         return;
-    case Nvfp4Problem::GdnInput:
-        launch_exact<Nvfp4GdnInputGeometry>(x, weight, out, stream);
-        return;
-    case Nvfp4Problem::MlpGateUp:
-        launch_exact<Nvfp4MlpGateUpGeometry>(x, weight, out, stream);
-        return;
-    case Nvfp4Problem::Residual6144:
-        launch_exact<Nvfp4Residual6144Geometry>(x, weight, out, stream);
-        return;
-    case Nvfp4Problem::Residual17408:
-        launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
-        return;
+        NINFER_NVFP4_LINEAR_PROBLEMS(NINFER_NVFP4_DECODE_CASE)
+#undef NINFER_NVFP4_DECODE_CASE
     }
 }
 

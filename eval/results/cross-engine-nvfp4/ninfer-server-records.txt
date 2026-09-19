@@ -1,0 +1,36 @@
+ninfer-500w-250000-mtp0-ctx1048576-yarn
+  prompt_tokens=249955  computed_prefill=249955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=92.543s  prefill=92.095s  decode=6.965s  total=99.509s
+  server prefill tok/s = 2714.1   server decode tok/s = 73.36
+  MTP: off
+
+ninfer-500w-250000-mtp3-ctx1048576-yarn
+  prompt_tokens=249955  computed_prefill=249955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=91.645s  prefill=91.308s  decode=3.268s  total=94.925s
+  server prefill tok/s = 2737.5   server decode tok/s = 156.37
+  MTP: backend=mtp rounds=189 drafted=567 accepted=322 (56.79%) per_position=[145, 105, 72] fallback=0
+
+ninfer-500w-653000-mtp0-ctx1048576-yarn
+  prompt_tokens=652955  computed_prefill=652955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=465.793s  prefill=464.964s  decode=9.012s  total=474.806s
+  server prefill tok/s = 1404.3   server decode tok/s = 56.70
+  MTP: off
+
+ninfer-500w-653000-mtp3-ctx1048576-yarn
+  prompt_tokens=652955  computed_prefill=652955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=470.979s  prefill=470.125s  decode=4.296s  total=475.283s
+  server prefill tok/s = 1388.9   server decode tok/s = 118.95
+  MTP: backend=mtp rounds=183 drafted=547 accepted=328 (59.96%) per_position=[140, 107, 81] fallback=0
+
+ninfer-500w-700000-mtp0-ctx1048576-yarn
+  prompt_tokens=699955  computed_prefill=699955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=529.235s  prefill=528.233s  decode=9.317s  total=538.553s
+  server prefill tok/s = 1325.1   server decode tok/s = 54.85
+  MTP: off
+
+ninfer-500w-700000-mtp3-ctx1048576-yarn
+  prompt_tokens=699955  computed_prefill=699955  prefix_cache_hit_tokens=0  reuse=full_reset
+  completion=512  ttft=532.387s  prefill=531.492s  decode=4.935s  total=537.328s
+  server prefill tok/s = 1317.0   server decode tok/s = 103.54
+  MTP: backend=mtp rounds=201 drafted=602 accepted=310 (51.50%) per_position=[155, 95, 60] fallback=0
+

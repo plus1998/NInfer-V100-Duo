@@ -32,7 +32,7 @@ struct RouteSpec {
 // Measured at 41% of a3b prefill on its own, so wide T goes to tensor cores; the
 // SIMT row-view split stays for the narrow range where the fixed dequant cost of
 // the whole [12288,2048] parent is not yet amortized. The seam is a placeholder
-// until swept -- see docs/v100.md.
+// until swept -- see the V100 performance summary.
 constexpr std::int32_t kCutlassFirstCols = 32;
 
 constexpr std::array<RouteSpec, 3> kRoutes{{

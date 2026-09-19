@@ -50,9 +50,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor output   = qkv.tensor();
     Tensor z_output = z.tensor();
-    const std::size_t workspace_bytes =
+    const std::size_t capacity =
         ops::q4_q5_gdn_input_proj_workspace_capacity_bytes(tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(std::max<std::size_t>(capacity, 1));
     ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, workspace,
                         nullptr);
     cuda_synchronize();
@@ -218,12 +218,10 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 2, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_case(parent, 1024, ops::LinearPolicy::AllowA4);
-#endif
     return failures;
 }
 
@@ -274,7 +272,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     failures +=
         verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
                                     activation, kHidden, tokens, criterion, sample_count);
-    if (!convenience && workspace.peak_used() != capacity) {
+    if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
     }
@@ -288,12 +286,8 @@ int run_fp8() {
     constexpr std::int32_t kRows   = 16384;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 613U));
-#ifdef NINFER_VOLTA_BUILD
-    parent.prepack_fp8();
-#endif
 
-    int failures = 0;
-#ifndef NINFER_VOLTA_BUILD
+    int failures          = 0;
     const std::size_t one = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
     const std::size_t seven = ops::gdn_input_proj_workspace_capacity_bytes(
@@ -313,15 +307,12 @@ int run_fp8() {
         std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
         ++failures;
     }
-#endif
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
-#ifndef NINFER_VOLTA_BUILD
     for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
-#endif
     return failures;
 }
 

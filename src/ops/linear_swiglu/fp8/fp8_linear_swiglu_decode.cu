@@ -13,18 +13,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Fp8MlpGateUpGeometry;
-using Schedule = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+template <class Geometry>
+void decode_launch(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule               = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
+    constexpr int kIntermediate = Geometry::kOutputRows / 2;
+    static_assert(Schedule::kRowsPerWarp == 2);
+    static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
+    using Rows = Fp8SwiGluRows<Schedule::kRowsPerWarp / 2, kIntermediate>;
 
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
-static_assert(Schedule::kRowsPerWarp == 2);
-static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
-using Rows = Fp8SwiGluRows<Schedule::kRowsPerWarp / 2, kIntermediate>;
-
-} // namespace
-
-void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                     cudaStream_t stream) {
     if (x.ne[0] != Geometry::kInputRows || x.ne[1] != 1 || out.ne[0] != kIntermediate ||
         out.ne[1] != 1 || weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
         throw std::invalid_argument("fp8 linear_swiglu decode: invalid exact problem");
@@ -38,6 +34,20 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales), output, rows);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                     cudaStream_t stream) {
+    decode_launch<Fp8MlpGateUpGeometry>(x, weight, out, stream);
+}
+
+// linear_swiglu's own tp2 column shard -- the SAME kernel template instantiated at the
+// halved N (kIntermediate halves too), exactly as NVFP4's own linear_swiglu shard is served.
+void fp8_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                           cudaStream_t stream) {
+    decode_launch<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -2,7 +2,6 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
-#include "ops/linear/fp8/fp8_prepack_sm70.h"
 
 #include <cuda_runtime.h>
 
@@ -90,13 +89,6 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
-#ifdef NINFER_VOLTA_BUILD
-    const std::array invocations{
-        Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{2, ops::LinearPolicy::A16Only},
-        Invocation{26, ops::LinearPolicy::A16Only},
-    };
-#else
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
@@ -107,7 +99,6 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{65, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
     };
-#endif
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
@@ -121,12 +112,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
     GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    Weight weight = host_weight.device_weight(device_weight.data());
-    std::vector<std::uint8_t> expected_weight = host_weight.payload;
-#ifdef NINFER_VOLTA_BUILD
-    ops::detail::fp8_prepack_qpn_sm70(weight);
-    device_weight.copy_to_host(expected_weight.data(), expected_weight.size());
-#endif
+    const Weight weight = host_weight.device_weight(device_weight.data());
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
@@ -187,9 +173,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(activation.data()),
                                       activation.size() * sizeof(std::uint16_t)),
         "FP8 linear_add activation");
-    failures += verify_preserved(device_weight, expected_weight, "FP8 linear_add weight");
+    failures += verify_preserved(device_weight, host_weight.payload, "FP8 linear_add weight");
 
-#ifndef NINFER_VOLTA_BUILD
     const std::size_t a16_interval = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, n, k, ops::LinearPolicy::A16Only, 1, 2048);
     const std::size_t pre_boundary = ops::linear_add_workspace_capacity_bytes(
@@ -208,7 +193,6 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
                   << "]: workspace interval contract mismatch\n";
         ++failures;
     }
-#endif
     return failures;
 }
 

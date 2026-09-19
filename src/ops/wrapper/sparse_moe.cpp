@@ -327,13 +327,4 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
 }
 
-// SparseMoeHints are pure L2-prefetch hints with no numeric effect (see the contract header); the
-// sm_70 kernels do not consume them, so forward to the plain overload.
-void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
-                cudaStream_t stream) {
-    (void)hints;
-    sparse_moe(x, weights, epilogue, destination, workspace, stream);
-}
-
 } // namespace ninfer::ops

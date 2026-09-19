@@ -27,7 +27,11 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 
+// `workspace` may be null when the resolved route needs none (the A16 route never allocates); a
+// W4A4 route with a null workspace throws. This mirrors ops::linear's own nvfp4_dispatch and is
+// what lets ops::linear_add_row_parallel's per-rank `WorkspaceArena*` (nullable, matching
+// linear_row_parallel's own convention) reach this dispatcher directly.
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -190,13 +190,13 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     paths = [item.get("result", {}).get("prefix_reuse_path") for item in chat_done]
     require(
         paths == [
-            "root",
-            "private_turn_closure",
-            "private_turn_closure",
-            "root",
-            "root",
-            "private_turn_closure",
-            "root",
+            "full_reset",
+            "restore_turn_checkpoint",
+            "restore_turn_checkpoint",
+            "full_reset",
+            "full_reset",
+            "restore_turn_checkpoint",
+            "full_reset",
         ],
         f"unexpected Chat reuse paths: {paths}",
     )
@@ -243,9 +243,40 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         item.get("result", {}).get("prefix_reuse_path") for item in responses_done
     ]
     require(
-        response_paths
-        == ["root", "private_response_replay", "root"],
+        response_paths[0] == "full_reset"
+        and response_paths[1] in ("append_frontier", "restore_response_checkpoint")
+        and response_paths[2] == "full_reset",
         f"unexpected Responses reuse paths: {response_paths}",
+    )
+    parent_result = responses_done[0]["result"]
+    child_result = responses_done[1]["result"]
+    parent_prompt = parent_result.get("prompt_tokens")
+    parent_outputs = parent_result.get("completion_tokens")
+    require(
+        isinstance(parent_prompt, int) and parent_prompt > 0
+        and isinstance(parent_outputs, int) and parent_outputs > 0,
+        "Responses parent did not report a complete prompt and generated output",
+    )
+    # Serialized assistant text can preserve the exact generated token prefix, in which case
+    # the planner prefers its later resident frontier. If BPE normalization changes that prefix,
+    # it restores the saved response boundary instead. Check the exact legal count for each path.
+    expected_response_reuse = (
+        parent_prompt + parent_outputs - 1
+        if response_paths[1] == "append_frontier"
+        else parent_prompt
+    )
+    response_reuse = child_result.get("prefix_cache_hit_tokens")
+    require(
+        isinstance(response_reuse, int)
+        and response_reuse > 0
+        and response_reuse == expected_response_reuse,
+        f"Responses {response_paths[1]} reused {response_reuse}, "
+        f"expected complete frontier {expected_response_reuse}",
+    )
+    require(
+        all(responses_done[index]["result"].get("prefix_cache_hit_tokens") == 0
+            for index in (0, 2)),
+        "Responses full resets unexpectedly reused prompt tokens",
     )
 
     return {
@@ -259,6 +290,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         },
         "responses_preserve_semantics": response_semantics,
         "responses_reuse_paths": response_paths,
+        "responses_reused_tokens": response_reuse,
     }
 
 
@@ -267,6 +299,9 @@ def main() -> None:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
     parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
+    parser.add_argument("--tp", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--devices", default="0,1", help="CUDA device pair used with --tp 2")
+    parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16")
     parser.add_argument(
         "--fixture",
         type=Path,
@@ -305,6 +340,10 @@ def main() -> None:
             "1024",
             "--kv-capacity",
             "1024",
+            "--tp",
+            str(args.tp),
+            "--kv-dtype",
+            args.kv_dtype,
             "--prefill-chunk",
             "128",
             "--max-concurrency",
@@ -322,6 +361,8 @@ def main() -> None:
             "--lm-head-draft",
             "--greedy",
         ]
+        if args.tp == 2:
+            command.extend(["--devices", args.devices])
         with server_log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(
                 command,
@@ -332,6 +373,8 @@ def main() -> None:
             try:
                 wait_for_server(base_url, process, args.startup_timeout)
                 result = exercise(base_url, fixture, request_log, args.backend)
+                result.update(tp=args.tp, devices=args.devices if args.tp == 2 else "0",
+                              kv_dtype=args.kv_dtype)
                 print(json.dumps(result, ensure_ascii=False, indent=2))
             except Exception as error:
                 output.flush()

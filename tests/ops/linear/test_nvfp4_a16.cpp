@@ -36,6 +36,12 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
+    failures += run_shape("NVFP4_A16 TP2 gate_up", ActivationCompute::A16, make_nvfp4_weight,
+                          {17408, 5120, 709U, Comparison::Sampled, true,
+                           new_problem_invocations});
+    failures += run_shape("NVFP4_A16 TP2 down", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 8704, 711U, Comparison::Sampled, true,
+                           new_problem_invocations});
     return failures;
 }
 

@@ -3,7 +3,7 @@
 This reference defines the current `.ninfer` version-2 framing, embedded JSON object directory,
 payload geometry, registries, and boundary between the generic reader and a registered model
 binder. Numeric formats are defined in [`tensor-formats.md`](tensor-formats.md), physical layouts
-in [`storage-layouts.md`](storage-layouts.md), and exact object inventories in the target
+in [`storage-layouts.md`](storage-layouts.md), and exact object inventories in the two target
 artifact references.
 
 ## 1. Format overview
@@ -143,7 +143,9 @@ A tensor object has all and only these seven members:
 
 The shape is the NInfer stored shape, not the Hugging Face source shape and not a padded physical
 extent. Legal rank and format/layout combinations come from the selected layout. The layout's exact
-encoded-size function for `(format, shape)` must equal `bytes`.
+encoded-size function for `(format, shape)` must equal `bytes`. For `ggml-k256-v1`, row codec tags
+also determine length: directory length must admit whole Q4_K/Q6_K rows and payload descriptor
+validation must derive exactly `bytes`.
 
 ### 3.3 Required-resource object
 
@@ -197,10 +199,10 @@ The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, `GGML_K` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1`, `ggml-k256-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.
@@ -215,15 +217,12 @@ is accepted for each role and which actual device implementation can consume it.
 `model_id` identifies exact checkpoint-native semantics, not a GPU, converter revision, one
 quantization run, physical object order, or artifact instance.
 
-`weights_id` identifies one target-owned core weight-storage contract under that model: core
+`weights_id` identifies one complete target-owned weight-storage contract under that model:
 inventory, names, fusion, format assignment, layout assignment, and associated persistent scalar
-objects. A target reference may additionally declare an all-or-none companion bundle whose
-absence leaves every core object and capability unchanged. The same `weights_id` may accept the
-previously published core-only inventory and the core plus that complete bundle; arbitrary,
-partial, or unregistered additions remain invalid. It is not a dominant tensor format, an average
-BPW, a converter recipe, an execution policy, or an artifact-instance digest. `groupwise-int`
-therefore covers the existing mixed groupwise-integer contracts without naming an artifact after
-one internal format; `nvfp4` identifies the model-scoped 27B low-precision contract, including the
+objects. It is not a dominant tensor format, an average BPW, a converter recipe, an execution
+policy, or an artifact-instance digest. `groupwise-int` therefore covers the existing mixed
+groupwise-integer contracts of both registered models without naming either artifact after one
+internal format; `nvfp4` identifies the model-scoped 27B low-precision contract, including the
 Qwen3.6 mixed NVFP4/BF16 allocation and the Qwen3.8 mixed NVFP4/row-scaled-FP8/BF16 allocation.
 
 ## 5. Payload geometry
@@ -247,7 +246,8 @@ cursor = object.offset + object.bytes
 ```
 
 For tensors, the selected layout must accept `(format, shape)` and its encoded-size result must equal
-`object.bytes`. For resources, the selected encoding supplies alignment and length semantics.
+`object.bytes`; `ggml-k256-v1` additionally validates its row descriptor table to derive that size.
+For resources, the selected encoding supplies alignment and length semantics.
 
 These rules make object spans ordered, aligned, non-overlapping, and inside the file. Gaps before or
 between objects and unreferenced trailing file bytes have no loading semantics. A normal writer
@@ -294,23 +294,21 @@ reparse JSON or perform per-layer/per-token directory lookups.
 The binder selected for an executable target validates:
 
 - exact `(model_id, weights_id)`;
-- the complete required core tensor and resource inventory;
-- every present target-declared companion bundle as an all-or-none unit;
+- the complete required tensor and resource inventory;
 - every canonical name and object kind;
 - required shape relationships and exact per-role format/layout/encoding assignments;
 - fused row partitions, tied bindings, and all model-visible logical views;
-- absence of missing required and unexpected objects;
+- absence of missing and unexpected objects;
 - availability of the exact target consumer on the actual selected device.
 
 The binder owns semantic completeness. It may generate repeated layer names and expected shapes
-with model-private loops rather than duplicating a flat JSON table in C++. A missing optional
-bundle is a target capability fact, not a malformed core artifact; selecting that capability may
-then fail at startup without affecting other routes. A partially present bundle is malformed.
+with model-private loops rather than duplicating a flat JSON table in C++.
 
-Completeness validation and device residency are separate. A registered target consumes and
-validates the required core plus every present companion bundle, then its frozen Engine startup
-features select which validated tensor groups enter the compact device materialization plan. An
-unselected group has no device address and cannot become resident later.
+Completeness validation and device residency are separate. A registered target always consumes and
+validates its complete artifact inventory, then its frozen Engine startup features select which
+validated tensor groups enter the compact device materialization plan. An omitted group has no
+device address and cannot become resident later; this does not define a partial or alternate
+artifact.
 
 When one target accepts multiple `weights_id` values, the package resolver produces one typed
 profile and passes that same value to both the exact binder and the sequence/workspace planner. The
@@ -325,8 +323,8 @@ converter. Responsibility is deliberately split across the local pipeline:
 
 - the converter and quantizer establish code, scale, direct-word, and padding invariants while the
   layout codec preserves the already selected words in the registered byte layout;
-- model-specific semantic tests cover only nontrivial source transforms that can change stored
-  interpretation;
+- the offline target verifier checks directory geometry, exact target assignments, and representative
+  source-to-artifact values;
 - the C++ reader and binder check directory geometry and the exact target storage signature, plus
   cheap target-specific value invariants that are needed during binding.
 
@@ -335,15 +333,14 @@ would duplicate work in a trusted, project-owned conversion path without improvi
 contract. The common directory parser therefore owns structural decoding only.
 
 How the Engine allocates, uploads, owns, or publishes a loaded product is outside the container ABI.
-A C++ target may materialize packed device spans after consuming the same directory and registered
-layout bytes.
+A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed device
+spans. Both consume the same directory and registered layout bytes.
 
 ## 7. Writing an artifact
 
 A writer:
 
-1. obtains the registered `(model_id, weights_id)` and the current producer's complete object
-   inventory;
+1. obtains the registered `(model_id, weights_id)` and its complete object inventory;
 2. obtains already transformed direct words or quantized codes/scales from the conversion recipe;
 3. encodes each tensor with its registered layout and each resource with its encoding;
 4. computes exact lengths and aligned payload-relative offsets;
@@ -381,12 +378,10 @@ authoritative semantic document in the same change.
 
 Changing the byte interpretation or encoded-size rule of an existing layout/encoding requires a new
 layout/encoding identity. Changing exact checkpoint-native semantics requires a new `model_id`.
-Changing the core inventory, fusion contract, or incompatible per-role storage assignment under one
-model requires a new `weights_id`. Appending a target-declared all-or-none companion bundle does not
-require a new `weights_id` when its absence leaves core decoding unchanged and the target reference
-defines both accepted inventories and selection-time capability behavior. Converter implementation,
-object order, aligned offsets, artifact values, device placement, and a conforming kernel may
-change without renaming an otherwise unchanged weight contract.
+Changing the complete inventory, fusion contract, or incompatible per-role storage assignment under
+one model requires a new `weights_id`. Converter implementation, object order, aligned offsets,
+artifact values, device placement, and a conforming kernel may change without renaming an otherwise
+unchanged weight contract.
 
 A new framing revision is required when the common accepted-file language changes: prefix, JSON
 root/object schema, payload-start calculation, offset meaning, or common range interpretation. It
@@ -416,8 +411,9 @@ correctly without carrying it.
 
 ## 11. Required implementation evidence
 
-The native implementation in `tools/artifact/`, `tools/convert/`, and `src/artifact/` satisfies
-this layer. The compact evidence retained for later changes is:
+The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
+`tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
+layer. The compact evidence retained for later changes is:
 
 - Python version-2 round trips for all nine numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
@@ -425,12 +421,11 @@ this layer. The compact evidence retained for later changes is:
   layout round trips;
 - an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
   encoded sizes, and alignment;
-- the complete registered target inventories, including the 1124-object Qwen3.6 groupwise and
-  1307-object Qwen3.6 NVFP4 forms, the 940-object 35B-A3B form, and Qwen3.8's accepted 1124-object
-  core-only and current 1190-object core-plus-DFlash2 forms;
-- inspection, representative source probes, and real converter completion for produced artifacts;
-- C++ binding and public Engine loading for registered runtime capabilities. Companion-specific
-  selection and residency remain target integration evidence rather than container evidence.
+- the complete registered target inventories, including both 1124-object 27B groupwise contracts,
+  the 1307-object Qwen3.6 NVFP4 contract with 247 validation-only input divisors, and the
+  1124-object Qwen3.8 NVFP4 contract with 112 input divisors;
+- inspection, representative source probes, Python reference inference, and public Engine loading
+  of the real converter-generated Qwen3.6-27B, Qwen3.8-27B, and 35B-A3B artifacts.
 
 This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
 fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file

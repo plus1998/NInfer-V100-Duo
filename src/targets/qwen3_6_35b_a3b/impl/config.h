@@ -6,7 +6,6 @@
 
 #include <array>
 #include <cstdint>
-#include <ninfer/types.h>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
 
@@ -70,9 +69,6 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr SpeculativeBackend backend = SpeculativeBackend::DFlash;
-    static constexpr bool coherent_selector     = false;
-    static constexpr int full_layers            = 1;
     static constexpr bool supported        = true;
     static constexpr int layers            = 6;
     static constexpr int local_layers      = 5;
@@ -97,7 +93,7 @@ struct DFlashConfig {
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 7;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 

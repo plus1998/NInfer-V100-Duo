@@ -205,8 +205,6 @@ __global__ void sparse_moe_prefill_scan_kernel(const int* __restrict__ tile_coun
         cursor += tile_counts[index];
     }
 
-    // Reuse scan only after every expert has consumed the assignment prefix.
-    __syncthreads();
     scan[expert] = (count + job_bn - 1) / job_bn;
     __syncthreads();
 #pragma unroll
@@ -251,30 +249,6 @@ sparse_moe_prefill_gather_kernel(const __nv_bfloat16* __restrict__ x, const int*
     if (threadIdx.x == 0) { packed_index[assignment] = packed; }
 }
 
-// Publishes the packed-column map without moving activations. One thread per assignment, so
-// unlike the gather it reads the tile-local rank and writes the inverse map from the same
-// thread and never has the two live in one buffer.
-template <bool Adaptive>
-__global__ void
-sparse_moe_prefill_index_kernel(const int* __restrict__ ids, const int* __restrict__ local_rank,
-                                int* __restrict__ packed_index, const int* __restrict__ tile_bases,
-                                int* __restrict__ packed_token, int assignments,
-                                const int* __restrict__ route_job_count) {
-    if constexpr (Adaptive) {
-        if (*route_job_count < 0) { return; }
-    }
-    const int assignment =
-        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
-    if (assignment >= assignments) { return; }
-    const int token  = assignment / kTopK;
-    const int expert = ids[assignment];
-    const int tile   = token / kSparseMoeRouteTileTokens;
-    const int packed =
-        tile_bases[static_cast<std::int64_t>(tile) * kExperts + expert] + local_rank[assignment];
-    packed_index[assignment] = packed;
-    packed_token[packed]     = token;
-}
-
 constexpr int kExpertBM                = 64;
 constexpr int kExpertBN                = 64;
 constexpr int kExpertBK                = 64;
@@ -287,20 +261,15 @@ constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
 template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
-    const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
-    const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
-    const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
-    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activation) {
+    const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation) {
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = kHidden / 64;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     constexpr int WarpNT        = WarpCols / 8;
-    constexpr int StageChunks   = kExpertBK / 8;
-    constexpr int StageIters    = ExpertBN * StageChunks / ExpertThreads;
     static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
-    static_assert(StageIters * ExpertThreads == ExpertBN * StageChunks,
-                  "the staging loop is unrolled, so every thread must take the same column count");
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * 32];
@@ -322,26 +291,14 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     const int total_work     = *route_job_count * row_blocks;
     for (int work = static_cast<int>(blockIdx.x); work < total_work;
          work += static_cast<int>(gridDim.x)) {
-        const int route_job   = work / row_blocks;
-        const int row_block   = work - route_job * row_blocks;
-        const int expert      = route_job_experts[route_job];
-        const int logical0    = row_block * (kExpertBM / 2);
-        const int begin       = expert_offsets[expert];
-        const int count       = expert_offsets[expert + 1] - begin;
-        const int column_base = route_job_columns[route_job];
-        const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
-        // A thread stages the same columns of all kHidden / kExpertBK tiles, so it resolves their
-        // rows once for the whole job instead of reading the map and redoing the row multiply per
-        // tile. A column past the tile is clamped onto a live one and then zero-filled.
-        // ptxas allots exactly 80 registers per thread at __launch_bounds__(256, 3) on
-        // sm_120a and this kernel now uses all of them, so widening this array spills.
-        const __nv_bfloat16* src_row[StageIters];
-#pragma unroll
-        for (int i = 0; i < StageIters; ++i) {
-            const int col = (tid + i * ExpertThreads) / StageChunks;
-            const int row = packed_token[col < cols ? begin + column_base + col : begin];
-            src_row[i]    = x + static_cast<std::int64_t>(row) * kHidden;
-        }
+        const int route_job     = work / row_blocks;
+        const int row_block     = work - route_job * row_blocks;
+        const int expert        = route_job_experts[route_job];
+        const int logical0      = row_block * (kExpertBM / 2);
+        const int begin         = expert_offsets[expert];
+        const int count         = expert_offsets[expert + 1] - begin;
+        const int column_base   = route_job_columns[route_job];
+        const int cols          = count - column_base < ExpertBN ? count - column_base : ExpertBN;
         float acc[4][WarpNT][4] = {};
 
         auto global_row = [&](int local_row) {
@@ -363,13 +320,16 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
 
         auto stage_inputs = [&](int stage, int kt) {
             const int k0 = kt * kExpertBK;
-#pragma unroll
-            for (int i = 0; i < StageIters; ++i) {
-                const int item = tid + i * ExpertThreads;
-                const int col  = item / StageChunks;
-                const int k8   = item - col * StageChunks;
-                auto* dst      = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
-                cp_async_zfill<16, Cache::cg>(dst, src_row[i] + k0 + k8 * 8, col < cols ? 16 : 0);
+            for (int item = tid; item < ExpertBN * (kExpertBK / 8); item += ExpertThreads) {
+                const int col        = item / (kExpertBK / 8);
+                const int k8         = item - col * (kExpertBK / 8);
+                const int packed_col = begin + column_base + col;
+                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                const auto* src =
+                    gathered +
+                    static_cast<std::int64_t>(col < cols ? packed_col : begin) * kHidden + k0 +
+                    k8 * 8;
+                cp_async_zfill<16, Cache::cg>(dst, src, col < cols ? 16 : 0);
             }
 
             const int group = kt;
@@ -384,18 +344,13 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         };
 
         auto decode_weight = [&](int stage) {
-            constexpr int CodeChunksPerRow = Q4RowSplitStorage::kCodeBytesPerGroup / 4;
-            static_assert(CodeChunksPerRow * 8 == kExpertBK,
-                          "a row of codes must decode to exactly the tile's k width");
-            for (int item = tid; item < kExpertBM * CodeChunksPerRow; item += ExpertThreads) {
-                const int row   = item / CodeChunksPerRow;
-                const int chunk = item - row * CodeChunksPerRow;
-                unsigned decoded[4];
-                Q4MmaDecodeAtom::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]), decoded);
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
-                          make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
-                                    static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
+            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const std::uint8_t packed = Cr[stage][row * 32 + lane];
+                const int q0              = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
+                const int q1              = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+                const __nv_bfloat162 value =
+                    __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
 
@@ -697,24 +652,24 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
 }
 
 struct Q5DownMma {
-    static constexpr int kCodeBytes    = Q5RowSplitStorage::kCodeBytesPerGroup;
-    static constexpr int kHighBytes    = Q5RowSplitStorage::kHighBytesPerGroup;
-    static constexpr int kHighPerChunk = Q5RowSplitStorage::kHighBytesPerChunk;
+    static constexpr int kHighBytes = Q5RowSplitStorage::kHighBytesPerGroup;
 
-    __device__ static __forceinline__ void
-    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
-        Q5MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
+    __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* codes,
+                                                            const std::uint8_t* high,
+                                                            const std::uint8_t* scale, int row,
+                                                            int lane) {
+        return Q5MmaDecodeAtom::decode_pair(codes, high, scale, row, lane);
     }
 };
 
 struct Q6DownMma {
-    static constexpr int kCodeBytes    = Q6RowSplitStorage::kCodeBytesPerGroup;
-    static constexpr int kHighBytes    = Q6RowSplitStorage::kHighBytesPerGroup;
-    static constexpr int kHighPerChunk = Q6RowSplitStorage::kHighBytesPerChunk;
+    static constexpr int kHighBytes = Q6RowSplitStorage::kHighBytesPerGroup;
 
-    __device__ static __forceinline__ void
-    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
-        Q6MmaDecodeAtom::decode_eight(word, high_chunk, scale, out);
+    __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* codes,
+                                                            const std::uint8_t* high,
+                                                            const std::uint8_t* scale, int row,
+                                                            int lane) {
+        return Q6MmaDecodeAtom::decode_pair(codes, high, scale, row, lane);
     }
 };
 
@@ -802,22 +757,10 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         };
 
         auto decode_weight = [&](int stage, int kt) {
-            constexpr int CodeChunksPerRow = Codec::kCodeBytes / 4;
-            constexpr int HighPerChunk     = Codec::kHighPerChunk;
-            static_assert(CodeChunksPerRow * 8 == kExpertBK,
-                          "a row of codes must decode to exactly the tile's k width");
-            for (int item = tid; item < kExpertBM * CodeChunksPerRow; item += ExpertThreads) {
-                const int row     = item / CodeChunksPerRow;
-                const int chunk   = item - row * CodeChunksPerRow;
-                const float scale = __half2float(__ushort_as_half(
-                    *reinterpret_cast<const std::uint16_t*>(&Sr[(row * GroupsPerRow + kt) * 2])));
-                unsigned decoded[4];
-                Codec::decode_eight(
-                    *reinterpret_cast<const unsigned*>(&Cr[stage][row * 32 + chunk * 4]),
-                    &Hr[stage][row * Codec::kHighBytes + chunk * HighPerChunk], scale, decoded);
-                store_vec(&As[row * kExpertBK + gemm_swz64(row, chunk * 8)],
-                          make_int4(static_cast<int>(decoded[0]), static_cast<int>(decoded[1]),
-                                    static_cast<int>(decoded[2]), static_cast<int>(decoded[3])));
+            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const __nv_bfloat162 value = Codec::decode(
+                    Cr[stage], Hr[stage], &Sr[(row * GroupsPerRow + kt) * 2], row, lane);
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
 
@@ -1730,9 +1673,6 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
     auto* scores            = static_cast<float*>(workspace.score_storage.data);
     auto* shared_activation = static_cast<__nv_bfloat16*>(workspace.shared_activation.data);
     auto* grouped_io        = static_cast<__nv_bfloat16*>(workspace.grouped_io.data);
-#ifndef NINFER_VOLTA_BUILD
-    auto* packed_token      = static_cast<int*>(workspace.packed_token.data);
-#endif
     auto* routed_activation = static_cast<__nv_bfloat16*>(workspace.routed_storage.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
 
@@ -1787,7 +1727,6 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             route_tiles, route_job_bn, tokens, adaptive);
         CUDA_CHECK(cudaGetLastError());
 
-#ifdef NINFER_VOLTA_BUILD
         if (adaptive) {
             auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
             sparse_moe_decode_launch_d3_small_t(input_slice, weights, ids, adaptive_activations,
@@ -1802,32 +1741,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
                 input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
         }
-#else
-        const bool routed_gate_up_q4 = weights.routed_gate_up.qtype == QType::Q4G64_F16S;
-        const int index_blocks       = (assignments + kExpertThreads - 1) / kExpertThreads;
-        if (adaptive) {
-            auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
-            sparse_moe_decode_launch_d3_small_t(input_slice, weights, ids, adaptive_activations,
-                                                tokens, SparseMoeSmallTD3Schedule::Paths3, stream,
-                                                route_job_count);
-            sparse_moe_decode_launch_d4_small_t(
-                weights, output_slice, ids, alpha, shared_scale, adaptive_activations, tokens,
-                SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
-            // adaptive implies a Q5/Q6 routed down, and prefill_min_tokens admits those only
-            // with a Q4 routed gate/up, so this path is always the indexed one.
-            sparse_moe_prefill_index_kernel<true><<<index_blocks, kExpertThreads, 0, stream>>>(
-                ids, local_rank, packed_index, tile_bases, packed_token, assignments,
-                route_job_count);
-        } else if (routed_gate_up_q4) {
-            sparse_moe_prefill_index_kernel<false><<<index_blocks, kExpertThreads, 0, stream>>>(
-                ids, local_rank, packed_index, tile_bases, packed_token, assignments, nullptr);
-        } else {
-            sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
-                input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
-        }
-#endif
         CUDA_CHECK(cudaGetLastError());
 
+        const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
 #ifdef NINFER_VOLTA_BUILD
         // The grouped SIMT kernels take the same device-side job list and the same
         // BN as the scan was told to use, so the column tiling matches exactly.
@@ -1848,19 +1764,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 "sparse_moe prefill: Volta supports only the Q4 routed gate/up codec");
         }
 #else
-        const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
-        // Same predicate that decided whether packed_token was written above.
-        if (routed_gate_up_q4) {
+        if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
                     <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
-                        input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                        grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32>
                     <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
-                        input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                        grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
+                        routed_gate_codes, routed_gate_scales, routed_activation);
             }
         } else if (weights.routed_gate_up.qtype == QType::W8G32_F16S) {
             sparse_moe_prefill_w8_gate_up_kernel<true>
@@ -1906,6 +1820,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 #endif // NINFER_VOLTA_BUILD
         CUDA_CHECK(cudaGetLastError());
 
+        const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
 #ifdef NINFER_VOLTA_BUILD
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
@@ -1943,7 +1858,6 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 "sparse_moe prefill: Volta supports only the Q5/Q6 routed down codecs");
         }
 #else
-        const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
             if (wide_plan) {

@@ -11,16 +11,20 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Nvfp4MlpGateUpGeometry;
 using Schedule =
     Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 2>;
 
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
 static_assert(Schedule::kRowsPerWarp == 2);
 static_assert((Schedule::kWarpsPerCta % 4) == 0);
 static_assert((128 % Schedule::kWarpsPerCta) == 0);
-static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
 
+// Templated on Geometry so the SAME kernel serves the tp1 parent (Nvfp4MlpGateUpGeometry,
+// 34816x5120) and the tp2 column shard (Nvfp4MlpGateUpTp2ColumnGeometry, 17408x5120): a shard is
+// a standalone tensor of the same layout with N halved (src/ops/linear/nvfp4/nvfp4_config.h), so
+// this kernel's own "gate rows [0,M) then up rows [M,2M)" indexing already halves correctly at
+// M = Geometry::kOutputRows / 2 -- no kernel-side change, only the host wrapper below was
+// hardcoded to one Geometry.
+template <class Geometry>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -31,6 +35,8 @@ __global__ __launch_bounds__(
                                                                     uint8_t* __restrict__ scales,
                                                                 float inverse_weight_divisor,
                                                                 __nv_bfloat16* __restrict__ out) {
+    constexpr int kIntermediate = Geometry::kOutputRows / 2;
+    static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
     const int block                               = static_cast<int>(blockIdx.x);
@@ -61,17 +67,28 @@ __global__ __launch_bounds__(
     if (lane == 0) { out[gate_row] = __float2bfloat16_rn(silu(gate) * up); }
 }
 
-} // namespace
-
-void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                       cudaStream_t stream) {
-    constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
-    const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_linear_swiglu_decode_kernel<<<kBlocks, Schedule::kThreads, 0, stream>>>(
+template <class Geometry>
+void launch_decode_impl(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    constexpr int kIntermediate = Geometry::kOutputRows / 2;
+    constexpr int kBlocks       = kIntermediate / Schedule::kWarpsPerCta;
+    const float inverse         = 1.0F / weight.weight_scale_divisor;
+    nvfp4_linear_swiglu_decode_kernel<Geometry><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse,
         static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                       cudaStream_t stream) {
+    launch_decode_impl<Nvfp4MlpGateUpGeometry>(x, weight, out, stream);
+}
+
+void nvfp4_linear_swiglu_decode_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                             cudaStream_t stream) {
+    launch_decode_impl<Nvfp4MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

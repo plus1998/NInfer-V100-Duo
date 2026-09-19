@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
@@ -78,11 +79,10 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
+        ensure_func_attr_per_device(
             fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
                            Fp8ContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
@@ -128,6 +128,15 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     case Fp8Activation17408Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
         return;
+    // linear_add's tp2 row shards halve K (6144->3072, 17408->8704), so the activation
+    // quantize kernel -- shared by every FP8 A8 consumer, not just ops::linear's own dispatch --
+    // needs its own geometry at each halved extent.
+    case Fp8Activation3072Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation3072Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation8704Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation8704Geometry>(x, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("fp8 A8 quantize: unsupported K");
     }
@@ -155,6 +164,20 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
     case Fp8Problem::Residual17408:
         launch_problem<Fp8Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    // See fp8_gemv.cu's identical addition for why these three are wired here.
+    case Fp8Problem::Residual6144Tp2Row:
+        launch_problem<Fp8Residual6144Tp2RowGeometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launch_problem<Fp8Residual17408Tp2RowGeometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::GdnInputTp2Column:
+        launch_problem<Fp8GdnInputTp2ColumnGeometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
+        break;
     }
     throw std::logic_error("FP8 vocabulary has no A8 route");
 }

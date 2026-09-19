@@ -1,0 +1,24 @@
+summary target qwen3_8_27b
+summary weights nvfp4
+summary artifact file read 18.99 GiB
+summary weight H2D 18.98 GiB
+summary pinned staging peak 256.00 MiB
+summary tensors/resources 659 / 6
+summary sampling greedy (temperature 0)
+summary finish reason stop-token
+summary prompt tokens 28677
+summary reused prompt tokens 0
+summary generated tokens 98
+summary device 0
+summary max context 32768
+summary KV capacity policy explicit
+summary KV capacity 32768
+summary KV page groups 512 / 512
+summary gpu weights used 18.98 GiB / 18.98 GiB
+summary gpu sequence used 1.33 GiB / 1.33 GiB
+summary kv cache dtype int8-group64
+summary kv cache payload 1.03 GiB
+summary gpu workspace peak 172.57 MiB / 172.57 MiB
+summary runtime reservation 1.51 GiB
+summary KV capacity headroom 0 B
+summary planned device total 20.49 GiB

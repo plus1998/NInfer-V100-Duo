@@ -1,6 +1,5 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 
-#include "core/layout.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -8,11 +7,16 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+#ifdef NINFER_VOLTA_BUILD
+inline constexpr bool kVoltaBuild = true;
+#else
+inline constexpr bool kVoltaBuild = false;
+#endif
 
 enum class Fp8LinearRoute : std::uint8_t {
     A16,
@@ -28,7 +32,7 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     if (policy == LinearPolicy::A16Only) { return Fp8LinearRoute::A16; }
     // A permissive policy does not require a lower-precision route. Vocabulary logits retain
     // BF16 activation compute for every policy, matching the existing Q6/W8 output heads.
-    if (problem == Fp8Problem::Vocabulary &&
+    if (is_fp8_vocabulary_problem(problem) &&
         (policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4)) {
         return Fp8LinearRoute::A16;
     }
@@ -41,39 +45,48 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
         return tokens >= 12 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     case Fp8Problem::GdnInput:
         return tokens >= 11 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::GdnInputTp2Column:
+        return tokens >= 11 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     case Fp8Problem::MlpGateUp:
         return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
         return Fp8LinearRoute::A16;
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
         return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    // linear_add's tp2 row shards inherit their parent's measured A8 crossover: tuning is
+    // inherited from the tp1 parent family, never re-measured for the shard.
+    case Fp8Problem::Residual6144Tp2Row:
+        return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::Residual17408Tp2Row:
+        return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    // linear_swiglu's / attn_input_proj's own tp2 column shards, appended to fp8_config.h
+    // for their own families' registries; not routed through ops::linear's generic dispatch in
+    // production, but the route/interval predicates are kept exhaustive here for the same reason
+    // GdnInputTp2Column is: this switch has no `default:`, so every registered problem must appear.
+    case Fp8Problem::MlpGateUpTp2Column:
+        return tokens == 1 || tokens >= 5 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::AttnInputTp2Column:
+        return tokens >= 12 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena* workspace,
-                cudaStream_t stream) {
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
-#ifndef NINFER_VOLTA_BUILD
-    if (problem == Fp8Problem::Vocabulary && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
-        launch_fp8_vocabulary_a16_gemm(x, weight, out, stream);
-        return;
-    }
-    const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16SmallTMmaT
-                                                                 : fp8_linear_small_t_max(problem);
-#else
+#ifdef NINFER_VOLTA_BUILD
+    // The vocabulary head's A16 MMA kernel is ldmatrix-based and traps below sm_75, so on Volta it
+    // takes the SIMT decode/small-T families like every other problem (registered in fp8_config.h).
+    //
+    // Where the quadpair route is available the chunk drops to its 8-row tile, which is a real
+    // choice rather than a fallback: two QPN passes over the weights beat one wider SIMT pass,
+    // because SIMT throughput halves again every four tokens while QPN's is flat across the tile.
     const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
     const std::int32_t chunk = qpn ? kFp8VoltaQpnMaxTokens : fp8_linear_small_t_max(problem);
-    if (!qpn) { throw std::logic_error("fp8 Volta problem has no QPN route"); }
-    std::optional<WorkspaceArena::Scope> scope;
-    DeviceSpan activation;
-    if (workspace != nullptr) {
-        scope.emplace(workspace->scope());
-        activation = workspace->alloc_bytes(
-            static_cast<std::size_t>(weight.k) * std::min(x.ne[1], chunk) * sizeof(std::uint16_t),
-            256);
-    }
+#else
+    const std::int32_t chunk = is_fp8_vocabulary_problem(problem) ? kFp8VocabularyLastA16MmaT
+                                                                 : fp8_linear_small_t_max(problem);
 #endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += chunk) {
         const std::int32_t active = std::min(chunk, x.ne[1] - token_begin);
@@ -85,27 +98,17 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
 #ifdef NINFER_VOLTA_BUILD
         if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
-            if (activation.data != nullptr) {
-                fp8_stage_bf16_activation_sm70(input_chunk, activation.data, stream);
-                launch_fp8_volta_qpn_fp16(input_chunk, weight, activation.data, output_chunk,
-                                          stream);
-            } else {
-                launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
-            }
-        } else if (active == 1) {
-            launch_fp8_decode(input_chunk, weight, output_chunk, stream);
-        } else {
-            launch_fp8_small_t(input_chunk, weight, output_chunk, stream);
-        }
-#else
-        if (problem == Fp8Problem::Vocabulary) {
-            launch_fp8_vocabulary_a16_small_t(input_chunk, weight, output_chunk, stream);
-        } else if (active == 1) {
-            launch_fp8_decode(input_chunk, weight, output_chunk, stream);
-        } else {
-            launch_fp8_small_t(input_chunk, weight, output_chunk, stream);
+            launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
+            continue;
         }
 #endif
+        if (is_fp8_vocabulary_problem(problem) && !kVoltaBuild) {
+            launch_fp8_vocabulary_a16_mma(input_chunk, weight, output_chunk, stream);
+        } else if (active == 1) {
+            launch_fp8_decode(input_chunk, weight, output_chunk, stream);
+        } else {
+            launch_fp8_small_t(input_chunk, weight, output_chunk, stream);
+        }
     }
 }
 
@@ -117,13 +120,23 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
         return max_tokens >= 12;
     case Fp8Problem::GdnInput:
         return max_tokens >= 11;
+    case Fp8Problem::GdnInputTp2Column:
+        return max_tokens >= 11;
     case Fp8Problem::MlpGateUp:
         return min_tokens == 1 || max_tokens >= 5;
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
         return false;
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
         return max_tokens >= 25;
+    case Fp8Problem::Residual6144Tp2Row:
+    case Fp8Problem::Residual17408Tp2Row:
+        return max_tokens >= 25;
+    case Fp8Problem::MlpGateUpTp2Column:
+        return min_tokens == 1 || max_tokens >= 5;
+    case Fp8Problem::AttnInputTp2Column:
+        return max_tokens >= 12;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }
@@ -139,18 +152,9 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);
-    std::size_t capacity = interval_uses_a8(problem, policy, min_tokens, max_tokens)
-                               ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows)
-                               : 0;
-#ifdef NINFER_VOLTA_BUILD
-    if (fp8_volta_qpn_supported(output_rows, input_rows,
-                                std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
-        capacity = std::max(capacity, static_cast<std::size_t>(input_rows) *
-                                          std::min(max_tokens, kFp8VoltaQpnMaxTokens) *
-                                          sizeof(std::uint16_t));
-    }
-#endif
-    return capacity;
+    return interval_uses_a8(problem, policy, min_tokens, max_tokens)
+               ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows)
+               : 0;
 }
 
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
@@ -158,7 +162,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     validate_fp8_weight(weight, "fp8 linear");
     const Fp8LinearRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Fp8LinearRoute::A16) {
-        launch_a16(x, weight, out, workspace, stream);
+        launch_a16(x, weight, out, stream);
         return;
     }
     if (workspace == nullptr) {

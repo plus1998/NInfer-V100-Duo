@@ -1,0 +1,119 @@
+[
+  {
+    "subset": "english",
+    "file": "PaulGraham_Essays.txt",
+    "corpus_chars": 6000000,
+    "corpus_tokens": 1475669,
+    "context_length_param": 8192,
+    "adapter_tiles": 1,
+    "context_chars": 32209,
+    "prompt_tokens_hf_template": 8146,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 168,
+      "2": 3,
+      "3": 1,
+      "4": 2,
+      "7": 1,
+      "9": 1,
+      "12": 5,
+      "15": 2,
+      "16": 4,
+      "17": 13
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 17,
+    "verdict": "NO TILING; max window occurrences 17 (intra-corpus repetition)"
+  },
+  {
+    "subset": "english",
+    "file": "PaulGraham_Essays.txt",
+    "corpus_chars": 6000000,
+    "corpus_tokens": 1475669,
+    "context_length_param": 653000,
+    "adapter_tiles": 1,
+    "context_chars": 2656343,
+    "prompt_tokens_hf_template": 652955,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 200
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 1,
+    "verdict": "NO TILING"
+  },
+  {
+    "subset": "english",
+    "file": "PaulGraham_Essays.txt",
+    "corpus_chars": 6000000,
+    "corpus_tokens": 1475669,
+    "context_length_param": 1046000,
+    "adapter_tiles": 1,
+    "context_chars": 4232081,
+    "prompt_tokens_hf_template": 1045954,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 200
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 1,
+    "verdict": "NO TILING"
+  },
+  {
+    "subset": "chinese",
+    "file": "Journey_to_the_West.txt",
+    "corpus_chars": 6000001,
+    "corpus_tokens": 1533583,
+    "context_length_param": 8192,
+    "adapter_tiles": 1,
+    "context_chars": 32605,
+    "prompt_tokens_hf_template": 8147,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 200
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 1,
+    "verdict": "NO TILING"
+  },
+  {
+    "subset": "chinese",
+    "file": "Journey_to_the_West.txt",
+    "corpus_chars": 6000001,
+    "corpus_tokens": 1533583,
+    "context_length_param": 653000,
+    "adapter_tiles": 1,
+    "context_chars": 2562513,
+    "prompt_tokens_hf_template": 652954,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 200
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 1,
+    "verdict": "NO TILING"
+  },
+  {
+    "subset": "chinese",
+    "file": "Journey_to_the_West.txt",
+    "corpus_chars": 6000001,
+    "corpus_tokens": 1533583,
+    "context_length_param": 1046000,
+    "adapter_tiles": 1,
+    "context_chars": 4074104,
+    "prompt_tokens_hf_template": 1045955,
+    "window_chars": 120,
+    "windows_sampled": 200,
+    "window_occurrence_histogram": {
+      "1": 200
+    },
+    "needle_occurrences": 1,
+    "max_window_occurrences": 1,
+    "verdict": "NO TILING"
+  }
+]

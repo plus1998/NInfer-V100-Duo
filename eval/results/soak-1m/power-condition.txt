@@ -1,0 +1,23 @@
+# Power condition for the 1M soak measurements
+#
+# EVIDENCED: both RTX 5090s carry a 400.00 W power limit against a 600.00 W
+# power.max_limit. The limit is a persistent driver setting, it was not changed at any
+# point during these runs, and it is the same limit the needle campaign measured under
+# (commit 58d6566). The query below was run on this host after the two 1M soak passes.
+#
+# NOT EVIDENCED, stated as an observation only: while polling the run I saw power.draw
+# sitting at 399.8-400.1 W on both cards during the decode phase of both passes, i.e.
+# decode appeared to be limit-bound rather than headroom-bound. Those readings were
+# live nvidia-smi queries during polling and were NOT retained in any artifact -- the
+# two 1M passes' sampler CSVs are four-column (memory only) and their .nvidia-smi.txt
+# files predate the power block. Do not cite the draw figures as measured evidence.
+#
+# Fixed going forward: eval/run_qwen3_8_27b_nvfp4_1m_soak.sh now writes a
+# '=== power condition before launch / after exit ===' block into every pass's
+# .nvidia-smi.txt. The first artifact carrying one is the post-edit 8k validation run,
+# eval/server-logs/qwen3_8_27b_nvfp4-1m-soak-pass-a-20260828T164140Z.nvidia-smi.txt.
+#
+$ nvidia-smi --query-gpu=index,name,power.limit,power.max_limit --format=csv
+index, name, power.limit [W], power.max_limit [W]
+0, NVIDIA GeForce RTX 5090, 400.00 W, 600.00 W
+1, NVIDIA GeForce RTX 5090, 400.00 W, 600.00 W

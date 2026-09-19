@@ -11,6 +11,6 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t);
 Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy);
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 WorkspaceArena* workspace, cudaStream_t stream);
+                 cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

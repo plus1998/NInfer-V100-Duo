@@ -4,7 +4,7 @@
 // (FP16 mma.sync.m8n8k4) template GEMM. Two-phase: dequantize the row-scaled E4M3 weights
 // (code byte * per-output-row BF16 scale) to a scratch FP16 buffer, cast bf16 activations to
 // FP16, then run CUTLASS's stock Gemm with a direct bf16 epilogue output. Mirrors
-// q4_linear_swiglu_cutlass_sm70.cu exactly -- see docs/v100.md for why groupwise's
+// q4_linear_swiglu_cutlass_sm70.cu exactly -- see the V100 performance summary for why groupwise's
 // dequant-once-then-CUTLASS route beats every fused-dequant kernel at wide T.
 
 #include "core/arena.h"

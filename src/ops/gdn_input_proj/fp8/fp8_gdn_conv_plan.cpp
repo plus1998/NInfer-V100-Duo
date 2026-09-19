@@ -42,13 +42,8 @@ void require_policy(LinearPolicy policy, const char* operation) {
 }
 
 Fp8GdnConvPlan b1_a16_plan(std::int32_t width) {
-#ifdef NINFER_VOLTA_BUILD
-    (void)width;
-    return {Fp8GdnConvScheduleId::MaterializedA16};
-#else
     const bool fused = width <= 3 || (width >= 7 && width <= 10);
     return {fused ? Fp8GdnConvScheduleId::FusedA16 : Fp8GdnConvScheduleId::MaterializedA16};
-#endif
 }
 
 bool materialized(Fp8GdnConvPlan plan) { return plan.schedule != Fp8GdnConvScheduleId::FusedA16; }
@@ -60,27 +55,13 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
     (void)allocate_projected(layout, materialized_columns);
     if (maximum_plan.schedule == Fp8GdnConvScheduleId::MaterializedA8) {
         (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8GdnInputGeometry::kInputRows);
-#ifdef NINFER_VOLTA_BUILD
-    } else {
-        (void)layout.alloc_bytes(static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) *
-                                 materialized_columns * sizeof(std::uint16_t));
-#endif
     }
     return layout.peak_bytes(1);
 }
 
 std::size_t record_capacity(Fp8GdnConvPlan plan, std::int32_t aggregate_columns) {
-    if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA8) {
-        return fp8_a8_workspace_capacity_bytes(aggregate_columns,
-                                                Fp8GdnInputGeometry::kInputRows);
-    }
-#ifdef NINFER_VOLTA_BUILD
-    if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA16) {
-        return static_cast<std::size_t>(Fp8GdnInputGeometry::kInputRows) * aggregate_columns *
-               sizeof(std::uint16_t);
-    }
-#endif
-    return 0;
+    if (plan.schedule != Fp8GdnConvScheduleId::MaterializedA8) { return 0; }
+    return fp8_a8_workspace_capacity_bytes(aggregate_columns, Fp8GdnInputGeometry::kInputRows);
 }
 
 void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected, Tensor& z,

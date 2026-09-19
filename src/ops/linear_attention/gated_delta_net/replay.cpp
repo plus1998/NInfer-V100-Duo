@@ -104,7 +104,17 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    // Registered head geometries. The launcher is entirely runtime-dimensioned in the head
+    // counts (`launch_recurrent_record_fixed` takes grid.x = v.ne[1] and builds its value->qk map
+    // with `head_map::of(q.ne[1], v.ne[1])` at run time), so a geometry is registered by being
+    // QUALIFIED, not by adding a kernel. `8|24` is the tp == 2 shard of `16|48`: both the qk-head
+    // and the value-head counts halve, the group size 48/16 == 24/8 == 3 is preserved, and the
+    // split is group-aligned so no group of three value heads is ever cut. It is the geometry the
+    // MTP/speculative verify round records on each device at tp == 2, and it is the exact partner
+    // of FoldGeometry48x24Tp2 in `is_registered_fold_geometry` below -- a record written at this
+    // geometry is folded at that one, so the two entries must exist together.
+    const bool registered_heads = (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
+                                  (qk_heads == 8 && value_heads == 24);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -151,12 +161,23 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
 }
 
+// Host-side mirror of NINFER_GDN_FOLD_GEOMETRIES in
+// src/ops/linear_attention/gated_delta_net/recurrent.cuh. This TU is plain C++ and this repository
+// keeps `.cuh` device-side (included only from `.cu`), so the literals are duplicated here the same
+// way `kv_heads_for_q_heads` mirrors the GQA registry in src/ops/wrapper/gqa_attention.cpp. The
+// failure mode is safe in one direction only: a MISSING entry makes the Op reject a geometry the
+// launcher would have run, while an entry here with no launcher arm would reach
+// `launch_replay_fold`'s trailing throw. Keep the two lists edited together.
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
                              spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    // FoldGeometry48x24Tp2: device r's half of geometry_48 at tp == 2. Both the qk-head and the
+    // value-head counts halve, together with the conv channel count.
+    const bool geometry_48_tp2 = spec.layers == 48 && spec.qk_heads == 8 &&
+                                 spec.value_heads == 24 && spec.conv_channels == 5120;
+    return geometry_48 || geometry_30 || geometry_48_tp2;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {
@@ -266,25 +287,19 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     }
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};
     for (std::size_t row = 0; row < rows.size(); ++row) {
-        if (rows[row].source_state_slot < 0 ||
-            rows[row].source_state_slot >= states.spec.slot_count ||
-            rows[row].destination_state_slot < 0 ||
-            rows[row].destination_state_slot >= states.spec.slot_count) {
+        if (rows[row].linear_state_slot < 0 ||
+            rows[row].linear_state_slot >= states.spec.slot_count) {
             throw std::invalid_argument("gdn_replay_fold: linear state slot is out of range");
         }
         if (rows[row].commit_columns < 0 || rows[row].commit_columns > records.spec.width) {
             throw std::invalid_argument("gdn_replay_fold: commit extent is out of range");
         }
         for (std::size_t previous = 0; previous < row; ++previous) {
-            if (rows[previous].destination_state_slot == rows[row].destination_state_slot ||
-                rows[previous].destination_state_slot == rows[row].source_state_slot ||
-                rows[row].destination_state_slot == rows[previous].source_state_slot) {
-                throw std::invalid_argument(
-                    "gdn_replay_fold: active state source/destination bindings overlap");
+            if (rows[previous].linear_state_slot == rows[row].linear_state_slot) {
+                throw std::invalid_argument("gdn_replay_fold: active state slots must be distinct");
             }
         }
-        packed.row[row] = {rows[row].source_state_slot, rows[row].destination_state_slot,
-                           rows[row].commit_columns, 0};
+        packed.row[row] = {rows[row].linear_state_slot, rows[row].commit_columns};
     }
     return packed;
 }
@@ -304,18 +319,14 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                                      value_record, gate_record, out, stream);
 }
 
-GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
-                                     LinearAttentionStateAllLayersView states)
-    : records_(records), states_(states) {
-    validate_fold_records(records_);
-    validate_fold_states(records_, states_);
-    require_records_disjoint_from_states(records_, states_);
-}
-
-void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const {
+void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                     std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
+    validate_fold_records(records);
+    validate_fold_states(records, states);
+    require_records_disjoint_from_states(records, states);
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
-        validate_fold_rows(records_, states_, rows);
-    detail::gated_delta_net::launch_replay_fold(records_, states_, packed,
+        validate_fold_rows(records, states, rows);
+    detail::gated_delta_net::launch_replay_fold(records, states, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }
 

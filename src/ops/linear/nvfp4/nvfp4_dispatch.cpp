@@ -27,7 +27,11 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
 
-    switch (resolve_nvfp4_problem(output_rows, input_rows)) {
+    // A tp2 shard resolves through its tp1 parent: halving N or K shifts the measured A16/W4A4
+    // crossover somewhat, but inheriting keeps the split path's route a pure function of the
+    // family, so a tp2 run cannot silently take a different numerical path than its tp1 twin.
+    // Re-measuring the shard crossovers is a separate, benchmarked change.
+    switch (nvfp4_parent_problem(resolve_nvfp4_problem(output_rows, input_rows))) {
     case Nvfp4Problem::AttnInput:
         return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
@@ -37,6 +41,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::AttnInputTp2Column:
+    case Nvfp4Problem::GdnInputTp2Column:
+    case Nvfp4Problem::MlpGateUpTp2Column:
+    case Nvfp4Problem::Residual6144Tp2Row:
+    case Nvfp4Problem::Residual17408Tp2Row:
+        break; // nvfp4_parent_problem never returns a shard problem
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
@@ -55,8 +65,9 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
     // 64-chunk QPN2 path at T=2048 on the gate_up shape: 45.5ms -> 31.3ms, 1.45x. Needs a real
     // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
     // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
-    // fault if a caller genuinely has none. See docs/v100.md.
-    if (workspace != nullptr && total_t > kNvfp4VoltaQpnMaxTokens &&
+    // fault if a caller genuinely has none. See the V100 performance summary.
+    if (weight.layout != QuantLayout::VoltaQpnPrepacked && workspace != nullptr &&
+        total_t > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
         const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);
         if (need == 0 || workspace->capacity() - workspace->used() >= need) {

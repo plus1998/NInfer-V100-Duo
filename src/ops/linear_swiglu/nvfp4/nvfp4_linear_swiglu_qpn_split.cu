@@ -13,9 +13,6 @@ namespace ninfer::ops::detail {
 #ifdef NINFER_VOLTA_BUILD
 
 namespace {
-constexpr std::int32_t kIntermediate = 17408; // Nvfp4MlpGateUpGeometry::kOutputRows / 2
-constexpr std::int32_t kMTileOffset  = kIntermediate / 128; // 136, exact
-
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
                                     half* __restrict__ output, std::int64_t count) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -23,8 +20,9 @@ __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ input,
 }
 } // namespace
 
-bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept {
-    return nvfp4_volta_qpn_supported(kIntermediate, k, t);
+bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
+                                              std::int32_t t) noexcept {
+    return n > 0 && (n % 256) == 0 && nvfp4_volta_qpn_supported(n / 2, k, t);
 }
 
 void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -33,6 +31,8 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream) {
     const std::int32_t k = x.ne[0];
     const std::int32_t t = x.ne[1];
+    const std::int32_t kIntermediate = weight.n / 2;
+    const std::int32_t kMTileOffset  = kIntermediate / 128;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     auto* x_fp16 = static_cast<half*>(activation_scratch);
     const std::int64_t activation_count = static_cast<std::int64_t>(k) * t;
@@ -47,7 +47,9 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     up_weight.qdata   = static_cast<const std::uint8_t*>(weight.qdata) +
                        static_cast<std::int64_t>(kIntermediate) * (k / 2);
     up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
-                       static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512;
+        (weight.layout == QuantLayout::VoltaQpnPrepacked
+             ? static_cast<std::int64_t>(kIntermediate) * (k / 16)
+             : static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512);
 
     launch_nvfp4_volta_qpn_with_fp16_activation(
         x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},

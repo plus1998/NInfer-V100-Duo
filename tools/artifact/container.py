@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence, TypeAlias
 
-from .layouts import align_up, encoded_size, get_layout
+from .layouts import align_up, encoded_size, get_layout, validate_ggml_k_payload
 
 
 MAGIC = b"NINFER\x00\x02"
+_V1_MAGIC = b"NINFER\x00\x01"
 PREFIX = struct.Struct("<8sQ")
 PREFIX_BYTES = PREFIX.size
 PAYLOAD_ALIGNMENT = 4096
@@ -42,6 +43,7 @@ class TensorSpec:
     shape: tuple[int, ...]
     format: str
     layout: str
+    encoded_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +156,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
         if isinstance(spec, TensorSpec):
             shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
             layout = get_layout(_require_string(spec.layout, "tensor layout"))
-            payload_bytes = encoded_size(layout, spec.format, shape)
+            payload_bytes = encoded_size(layout, spec.format, shape, stored_bytes=spec.encoded_bytes)
             offset = align_up(cursor, layout.alignment)
             obj: ArtifactObject = TensorObject(
                 name=name,
@@ -216,7 +218,7 @@ def _parse_object(value: object) -> ArtifactObject:
         offset = _require_integer(value["offset"], "tensor offset")
         payload_bytes = _require_integer(value["bytes"], "tensor bytes", positive=True)
         try:
-            expected = encoded_size(layout_name, format_name, shape)
+            expected = encoded_size(layout_name, format_name, shape, stored_bytes=payload_bytes)
         except (KeyError, TypeError, ValueError) as exc:
             raise ArtifactError(str(exc)) from exc
         if payload_bytes != expected:
@@ -303,6 +305,11 @@ class Artifact:
                 raise ArtifactError("artifact is shorter than the v2 prefix")
             prefix = self._file.read(PREFIX_BYTES)
             magic, json_bytes = PREFIX.unpack(prefix)
+            if magic == _V1_MAGIC:
+                raise ArtifactError(
+                    "NInfer artifact v1 is no longer supported; migrate it with: "
+                    "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>"
+                )
             if magic != MAGIC:
                 raise ArtifactError("artifact magic is not NInfer v2")
             if json_bytes == 0:
@@ -318,6 +325,13 @@ class Artifact:
             payload_bytes = self.file_bytes - self.payload_offset
             self._index = _validate_ranges(self.objects, payload_bytes)
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            for obj in self.objects:
+                if isinstance(obj, TensorObject) and obj.format == "GGML_K":
+                    payload = self.payload(obj)
+                    try:
+                        validate_ggml_k_payload(obj.shape, payload)
+                    finally:
+                        payload.release()
         except BaseException:
             if self._mapping is not None:
                 self._mapping.close()

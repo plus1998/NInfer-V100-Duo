@@ -1,17 +1,16 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+Start with the [project README](../README.md) for the CUDA 12.8 V100 Duo build, conversion of the
+local LM Studio Q4_K_M model, and the 262K-token INT8-KV/MTP3 launcher. It also retains the
+published-artifact CLI and HTTP examples for other profiles.
 
 ## User guides
 
 | Document | Purpose |
 |---|---|
-| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
-| [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
-| [V100 port](v100.md) | sm_70 build, supported surface, qualification, and preferred-SXM2 launch policy |
-| [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
+| [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
+| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
+| [Performance](performance.md) | V100 Duo performance measurements; inherited RTX 5090 single-request, concurrent-decode, MTP/DFlash and 1M-context results |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
@@ -24,6 +23,7 @@ The executable `--help` output is the exact source for command-line option spell
 | Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
 | Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
 | Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
+| Qwen3.8-27B | `gguf-q4-k-m` (local V100 profile) | generated locally as `qwen3_8_27b_q4_k_m.ninfer` | Text/MTP only; embedded Vision objects are validation-only |
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [model card](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) |
 
 ## Repository-local guides
@@ -41,18 +41,12 @@ API documentation.
 
 Runtime and Op references:
 
-- [Engine architecture, execution ownership, scheduling, and request lifecycles](maintainer/engine-architecture.md)
-- [Resource scheduling, continuation/checkpoint, and Device/Host context-cache contracts](maintainer/resource-scheduling-and-context-cache.md)
+- [Small-scale concurrent inference architecture](maintainer/concurrent-inference-architecture.md)
 - [Paged KV context storage, ownership, and capacity model](maintainer/paged-kv-cache.md)
-- [Operational logging channels, ownership, format, levels, and data policy](maintainer/logging.md)
 - [Op admission, contracts, ownership, qualification, and performance rules](maintainer/op-development.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
+- [Dual-GPU (TP2) execution and YaRN 1M context](maintainer/tp2-yarn-1m.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
-
-`engine-architecture.md` is the sole top-level Engine architecture reference.
-`resource-scheduling-and-context-cache.md` is its narrower authority for resource selection,
-materialization, checkpoint ownership, and replica policy. The remaining files define physical
-storage, model, artifact, Op, or measurement contracts rather than parallel architecture variants.
 
 Artifact and model references:
 
@@ -64,3 +58,9 @@ Artifact and model references:
 - [Qwen3.8-27B artifact contracts, including the NVFP4 target](maintainer/qwen3.8-27b-artifact.md)
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
+
+Pending implementation work:
+
+- [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
+  single target state for an unfinished source and public-contract cutover; it is not the current
+  implementation map.

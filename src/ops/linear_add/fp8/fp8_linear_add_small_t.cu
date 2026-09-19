@@ -16,18 +16,61 @@ namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-// SIMT column extent controls the accumulator register count; retain exact small extents,
-// with common register/load profiles and no per-shape cache hints or isolated token exceptions.
 template <class Geometry, int ActiveTokens>
-struct Fp8LinearAddSmallTProductionSchedule {
+struct Fp8LinearAddSmallTProductionSchedule;
+
+// LinearAdd's residual read and fused epilogue shift the register/occupancy crossovers relative to
+// contiguous Linear. These are the measured RTX 5090 ranges for [5120,6144].
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens <= 19 ? 8 : 4;
-    static constexpr int kRowsPerWarp = ActiveTokens <= 5 ? 1 : 2;
-    static constexpr int kValuesPerLane = ActiveTokens <= 19 ? 16 : 8;
-    using Type = Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
-        Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
-        Fp8SmallTBlockOrder::RowsContiguous, 1>;
+    static constexpr int kWarpsPerCta =
+        (ActiveTokens >= 15 && ActiveTokens <= 19) || ActiveTokens == 22 ? 4 : 8;
+    static constexpr int kRowsPerWarp   = ActiveTokens <= 5 ? 1 : 2;
+    static constexpr int kValuesPerLane = ActiveTokens >= 20 && ActiveTokens <= 23 ? 8 : 16;
+    static constexpr int kTokenTile     = ActiveTokens == 24 ? 12 : ActiveTokens;
+    static constexpr auto kCodeCache =
+        (ActiveTokens >= 12 && ActiveTokens <= 14) || ActiveTokens == 23 ? Fp8CodeCache::Streaming
+                                                                         : Fp8CodeCache::Default;
+    static constexpr auto kBlockOrder = ActiveTokens == 24
+                                            ? Fp8SmallTBlockOrder::TokenTilesContiguous
+                                            : Fp8SmallTBlockOrder::RowsContiguous;
+    using Type =
+        Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, kTokenTile, 1,
+                          Fp8SmallTActivationAccess::TokenPacked, kCodeCache, 1, kBlockOrder, 1>;
 };
+
+// The longer K of [5120,17408] favors streaming code loads around its two register crossovers;
+// keeping the default v16 schedule at T=9..16 avoids an isolated fast point followed by a cliff.
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
+    static constexpr int kWarpsPerCta   = ActiveTokens >= 21 && ActiveTokens <= 22 ? 4 : 8;
+    static constexpr int kRowsPerWarp   = ActiveTokens <= 5 ? 1 : 2;
+    static constexpr int kValuesPerLane = ActiveTokens >= 20 && ActiveTokens <= 23 ? 8 : 16;
+    static constexpr int kTokenTile     = ActiveTokens == 24 ? 12 : ActiveTokens;
+    static constexpr auto kCodeCache    = (ActiveTokens >= 6 && ActiveTokens <= 8) ||
+                                               (ActiveTokens >= 17 && ActiveTokens <= 20) ||
+                                               ActiveTokens == 23
+                                              ? Fp8CodeCache::Streaming
+                                              : Fp8CodeCache::Default;
+    static constexpr auto kBlockOrder   = ActiveTokens == 24
+                                              ? Fp8SmallTBlockOrder::TokenTilesContiguous
+                                              : Fp8SmallTBlockOrder::RowsContiguous;
+    using Type =
+        Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, kTokenTile, 1,
+                          Fp8SmallTActivationAccess::TokenPacked, kCodeCache, 1, kBlockOrder, 1>;
+};
+
+// linear_add's tp2 row shards inherit their parent's measured small-T schedule: tuning is
+// inherited from the tp1 parent family, never re-measured for the shard.
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Tp2RowGeometry, ActiveTokens>
+    : Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens> {};
 
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -73,10 +116,20 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     case Fp8Problem::Residual17408:
         launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, stream);
         return;
+    case Fp8Problem::Residual6144Tp2Row:
+        launchers<Fp8Residual6144Tp2RowGeometry>()[index](x, weight, residual, stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launchers<Fp8Residual17408Tp2RowGeometry>()[index](x, weight, residual, stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::GdnInputTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");

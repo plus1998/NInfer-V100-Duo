@@ -32,11 +32,6 @@ void launch_q4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Workspac
 // reduce in shared memory, so this fits a plain launcher signature.
 void launch_q4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                          std::int32_t weight_row_offset = 0);
-// DFlash2 optimized-head route: QPN writes one sorted top-16 key list per 32-row CTA instead of
-// materializing the dense BF16 logits. The caller merges producer lists into final candidates.
-void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
-                              const Tensor& row_to_global_ids, std::uint64_t* partial_keys,
-                              std::int32_t producer_groups, cudaStream_t stream);
 [[nodiscard]] bool q4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
 
@@ -62,7 +57,6 @@ void launch_q4_volta_qpn_topk(const Tensor& x, const Weight& w,
 constexpr std::int32_t kVoltaQpnMinT    = 5;
 constexpr std::int32_t kVoltaQpnMaxT    = 8;
 constexpr std::int32_t kVoltaQpnMinRows = 4096;
-constexpr std::int32_t kVoltaQpnRowsPerTopKProducer = 32;
 
 [[nodiscard]] inline bool q4_uses_volta_qpn(std::int32_t n, std::int32_t k,
                                             std::int32_t t) noexcept {

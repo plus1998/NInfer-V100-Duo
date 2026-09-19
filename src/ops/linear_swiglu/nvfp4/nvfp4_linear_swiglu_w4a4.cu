@@ -15,12 +15,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Geometry = Nvfp4MlpGateUpGeometry;
-using M48N64   = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 2>;
+using M48N64 = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 2>;
 
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
-
+// Templated on Geometry (see nvfp4_linear_swiglu_decode.cu for why): kIntermediate scales with
+// Geometry::kOutputRows, so the SAME row-policy/output-epilogue types serve the tp1 parent
+// (34816x5120, kIntermediate=17408) and the tp2 column shard (17408x5120, kIntermediate=8704).
+template <class Geometry>
 struct Nvfp4SwiGluRows {
+    static constexpr int kIntermediate  = Geometry::kOutputRows / 2;
     static constexpr bool kContiguous   = false;
     static constexpr int kRowsPerBranch = M48N64::kBlockN / 2;
 
@@ -35,7 +37,10 @@ union Nvfp4SwiGluBf16Pair {
     __nv_bfloat162 values;
 };
 
+template <class Geometry>
 struct Nvfp4SwiGluOutput {
+    static constexpr int kIntermediate = Geometry::kOutputRows / 2;
+
     __nv_bfloat16* data;
 
     __device__ __forceinline__ unsigned combine(unsigned gate_bits, unsigned up_bits) const {
@@ -57,40 +62,46 @@ struct Nvfp4SwiGluOutput {
     }
 };
 
-template <class Schedule>
+template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
                  std::int32_t tokens, cudaStream_t stream) {
-    constexpr int kPairRows = Schedule::kBlockN / 2;
-    static_assert(kPairRows == Nvfp4SwiGluRows::kRowsPerBranch);
+    constexpr int kIntermediate = Geometry::kOutputRows / 2;
+    constexpr int kPairRows     = Schedule::kBlockN / 2;
+    static_assert(kPairRows == Nvfp4SwiGluRows<Geometry>::kRowsPerBranch);
     const dim3 grid(kIntermediate / kPairRows,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
-    const Nvfp4SwiGluRows row_policy{};
-    const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
+    const Nvfp4SwiGluRows<Geometry> row_policy{};
+    const Nvfp4SwiGluOutput<Geometry> output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads, 0, stream>>>(
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput<Geometry>,
+                          Nvfp4SwiGluRows<Geometry>, true><<<grid, Schedule::kThreads, 0, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         output, row_policy);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Schedule>
+template <class Geometry, class Schedule>
 void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
             cudaStream_t stream) {
     auto scope = workspace.scope();
     const Nvfp4W4a4Workspace scratch =
         allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
-    launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
+    launch_gemm<Geometry, Schedule>(weight, out, scratch, x.ne[1], stream);
 }
 
 } // namespace
 
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
-    launch<M48N64>(x, weight, out, workspace, stream);
+    launch<Nvfp4MlpGateUpGeometry, M48N64>(x, weight, out, workspace, stream);
+}
+
+void nvfp4_linear_swiglu_w4a4_launch_shard(const Tensor& x, const Weight& weight, Tensor& out,
+                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    launch<Nvfp4MlpGateUpTp2ColumnGeometry, M48N64>(x, weight, out, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

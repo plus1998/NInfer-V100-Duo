@@ -46,6 +46,11 @@ constexpr auto make_launchers() {
 
 constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4Residual6144Geometry>();
 constexpr auto kResidual17408Launchers = make_launchers<Nvfp4Residual17408Geometry>();
+// The shard geometries inherit Nvfp4LinearSmallTProductionSchedule from their parent (see
+// nvfp4_config.h), so this is the same qualified compute body at the halved K -- not a
+// re-instantiation with a different tuning.
+constexpr auto kResidual6144Tp2RowLaunchers  = make_launchers<Nvfp4Residual6144Tp2RowGeometry>();
+constexpr auto kResidual17408Tp2RowLaunchers = make_launchers<Nvfp4Residual17408Tp2RowGeometry>();
 
 } // namespace
 
@@ -59,9 +64,18 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
     case Nvfp4Problem::Residual17408:
         kResidual17408Launchers[index](x, weight, residual, stream);
         return;
+    case Nvfp4Problem::Residual6144Tp2Row:
+        kResidual6144Tp2RowLaunchers[index](x, weight, residual, stream);
+        return;
+    case Nvfp4Problem::Residual17408Tp2Row:
+        kResidual17408Tp2RowLaunchers[index](x, weight, residual, stream);
+        return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:
     case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::AttnInputTp2Column:
+    case Nvfp4Problem::GdnInputTp2Column:
+    case Nvfp4Problem::MlpGateUpTp2Column:
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");

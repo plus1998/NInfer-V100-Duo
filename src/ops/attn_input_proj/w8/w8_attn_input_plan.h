@@ -20,7 +20,6 @@ enum class W8AttnInputScheduleId {
     MmaR64C128,
     MmaR128C64,
     MmaR128C80,
-    Dflash2SimtSplit, // DFlash2 draft QKV W8 [6144,5120] direct split output (sm_70)
 };
 
 struct W8AttnInputProblem {

@@ -11,6 +11,7 @@ namespace ninfer::ops::detail {
 
 enum class W8PairScheduleId {
     TwoSimtR8C4,
+    TwoSimtR8C8,
     DualDecodeR4,
     DualDecodeR8,
     DualDecodeR16,
@@ -28,6 +29,9 @@ enum class W8PairScheduleId {
     DualSplitKMediumC224,
     DualSplitKMediumC256,
     DualMmaR32C64,
+    DualMmaR32C80,
+    DualMmaR32C96,
+    DualMmaR32C112,
     DualMmaR32C128,
     ConcatMmaR32C64,
     ConcatMmaR32C80,

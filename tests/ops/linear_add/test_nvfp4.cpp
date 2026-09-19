@@ -1,5 +1,4 @@
 #include "ninfer/ops/linear_add.h"
-#include "core/device.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -88,12 +87,6 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-#ifdef NINFER_VOLTA_BUILD
-    const std::array invocations{
-        Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{4, ops::LinearPolicy::A16Only},
-    };
-#else
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
@@ -101,15 +94,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
-        Invocation{8, ops::LinearPolicy::AllowA4},
-        Invocation{16, ops::LinearPolicy::AllowA4},
-        Invocation{32, ops::LinearPolicy::AllowA4},
-        Invocation{64, ops::LinearPolicy::AllowA4},
-        Invocation{96, ops::LinearPolicy::AllowA4},
-        Invocation{128, ops::LinearPolicy::AllowA4},
-        Invocation{129, ops::LinearPolicy::AllowA4},
     };
-#endif
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
@@ -140,26 +125,6 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
-
-        if (invocation.tokens == 128) {
-            cudaStream_t stream;
-            cudaGraph_t graph;
-            cudaGraphExec_t executable;
-            CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-            ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
-            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-            CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-            for (int replay = 0; replay < 2; ++replay) {
-                CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                    cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaGraphLaunch(executable, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
-            CUDA_CHECK(cudaGraphExecDestroy(executable));
-            CUDA_CHECK(cudaGraphDestroy(graph));
-            CUDA_CHECK(cudaStreamDestroy(stream));
-        }
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +

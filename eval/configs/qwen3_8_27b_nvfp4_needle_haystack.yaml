@@ -1,0 +1,337 @@
+schema_version: 1
+
+# Needle-in-a-Haystack for the Qwen3.8-27B NVFP4 artifact served by `ninfer-serve`.
+#
+# This configuration is the TP2 (dual RTX 5090) long-context acceptance suite. It is a peer
+# of `qwen3_6_35b_needle_haystack.yaml` and keeps the same contracts: EvalScope's
+# `needle_haystack` benchmark, deterministic rule scoring (no LLM judge), thinking disabled
+# so the observable answer is the retrieved needle, and a single in-flight request against
+# the engine.
+#
+# Local machine paths (this checkout's host):
+#   corpus     /home/pc/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+#              populated with
+#                  from modelscope import dataset_snapshot_download
+#                  dataset_snapshot_download(
+#                      'AI-ModelScope/Needle-in-a-Haystack-Corpus',
+#                      allow_file_pattern=['PaulGraham_Essays.txt', 'Journey_to_the_West.txt'])
+#   tokenizer  /home/pc/models/ninfer-38/unsloth-nvfp4
+#              the Qwen3.8-27B HF tokenizer. Its `tokenizer.json` is byte-identical to the
+#              huihui-abliterated source of the served artifact except for the unused
+#              `truncation` field, so token counts (and therefore every generated context
+#              length) match what the engine will actually tokenize.
+#
+# Context budget. EvalScope's adapter treats `context_lengths_*` as the haystack token count
+# (it subtracts a fixed 150-token buffer before inserting the needle) and then wraps it in
+# the prompt template, the system prompt, and the chat template. The `native_*` tiers
+# therefore state a haystack length, not a prompt length. The 262k tier uses 260,000 so that
+# the framing plus the bounded 512-token answer still fit inside the server's 262,144-token
+# context window -- the same >2K reserve the 35B `native_long` profile uses.
+#
+# Depths are 10/30/50/70/90 %: EvalScope builds them with
+# `numpy.linspace(min, max, num=intervals, endpoint=True)`, so min=10, max=90, intervals=5
+# lands exactly on those five percentages. With both corpora (english + chinese) each
+# `native_*` tier is 5 depths x 2 languages = 10 needles.
+#
+# Scoring. `judge_strategy: rule` makes EvalScope compare the answer to the inserted needle
+# with `exact_match(normalize_answer(...))` -- a strict string equality after lowercasing,
+# punctuation stripping, and article removal. EvalScope's stock prompt ("Don't give
+# information outside the document or repeat your findings") asks for a *paraphrase*, which
+# that strict comparison scores 0 even when the needle was retrieved verbatim (observed here:
+# the model answered "Eat a sandwich and sit in Dolores Park on a sunny day." and scored 0
+# against the full needle sentence). The benchmark's own default is an LLM judge, which this
+# repository does not run for a hardware acceptance gate. So the prompt is overridden to ask
+# for the source sentence copied word for word, which makes the rule metric a faithful,
+# judge-free measurement of retrieval. The needle text, retrieval question, corpora, and
+# insertion algorithm are EvalScope's unmodified defaults.
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 1
+    request:
+      # A 260k-token prefill takes minutes; never let the client give up first.
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  smoke:
+    jobs:
+      - id: needle_haystack_smoke
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 1
+        generation: &retrieval_generation
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: &corpus_path /home/pc/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            system_prompt: &needle_system_prompt >-
+              You are a helpful AI bot that answers questions for a user. Keep your response
+              short and direct.
+            prompt_template: &needle_prompt_template |-
+              Please read the following text and answer the question below.
+
+              <text>
+              {context}
+              </text>
+
+              <question>
+              {question}
+              </question>
+
+              Answer with the single sentence from the text that answers the question, copied
+              word for word. Output only that sentence and nothing else.
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 8192
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: &tokenizer_path /home/pc/models/ninfer-38/unsloth-nvfp4
+              show_score: true
+
+  # The three tiers below are also selectable individually so that one long tier can be run,
+  # inspected, and resumed without re-running the shorter ones.
+  native_64k:
+    jobs:
+      - id: &id_64k needle_haystack_64k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: &args_64k
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 65536
+              context_lengths_max: 65536
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 5
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  native_128k:
+    jobs:
+      - id: &id_128k needle_haystack_128k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: &args_128k
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 131072
+              context_lengths_max: 131072
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 5
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  native_262k:
+    jobs:
+      - id: &id_262k needle_haystack_262k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: &args_262k
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 260000
+              context_lengths_max: 260000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 5
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  # The full 64k -> 128k -> 262k ladder in one resumable run.
+  native_long:
+    jobs:
+      - id: *id_64k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: *args_64k
+
+      - id: *id_128k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: *args_128k
+
+      - id: *id_262k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args: *args_262k
+
+  # ---------------------------------------------------------------------------------------
+  # Retrieval-vs-memorization controls at 262k.
+  #
+  # EvalScope's stock needle -- "The best thing to do in San Francisco is eat a sandwich and
+  # sit in Dolores Park on a sunny day." -- is the single most republished Needle-in-a-Haystack
+  # string in existence, so a model reproducing it is not by itself proof that it read the
+  # haystack. These two suites substitute a needle the model cannot have memorized (an invented
+  # town, an invented activity) with a matching retrieval question, keeping everything else --
+  # corpus, depth, context length, insertion algorithm, scoring -- identical to `native_262k`.
+  #
+  #   control_262k_novel_needle: the novel needle IS present. A score of 1 means the answer was
+  #       read out of the 260k-token context, not recalled. This is the real control.
+  #   control_262k_absent_needle: the same novel needle is inserted, but the question asks about
+  #       a second invented place that appears nowhere in the prompt. EvalScope scores this 0 by
+  #       construction (the gold string is still the inserted needle); the observable is the
+  #       response text, which should decline rather than invent an answer. Read it from
+  #       <run>/backends/<job>/predictions/qwen3.8-27b/needle_haystack_english.jsonl.
+  # ---------------------------------------------------------------------------------------
+  control_262k_novel_needle:
+    jobs:
+      - id: needle_haystack_262k_novel
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              needles: &novel_needles
+                - "\nThe best thing to do in Kvernholt is ride the amber funicular up to the lantern orchard at dusk.\n"
+              retrieval_question: "What is the best thing to do in Kvernholt?"
+              context_lengths_min: &control_context 260000
+              context_lengths_max: *control_context
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  control_262k_absent_needle:
+    jobs:
+      - id: needle_haystack_262k_absent
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              needles: *novel_needles
+              retrieval_question: "What is the best thing to do in Marrowfen?"
+              context_lengths_min: *control_context
+              context_lengths_max: *control_context
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+
+  # The strict prompt above tells the model to output one sentence from the text and nothing
+  # else, which leaves it no way to say "not in the text". This third suite is the same absent
+  # question with an explicit opt-out clause added, so the two together separate "the model
+  # cannot tell the entity is absent" from "the prompt forbade it from saying so".
+  control_262k_absent_needle_optout:
+    jobs:
+      - id: needle_haystack_262k_absent_optout
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: |-
+              Please read the following text and answer the question below.
+
+              <text>
+              {context}
+              </text>
+
+              <question>
+              {question}
+              </question>
+
+              Answer with the single sentence from the text that answers the question, copied
+              word for word. If the text does not answer the question, reply exactly: NOT FOUND.
+              Output only that sentence or NOT FOUND, and nothing else.
+            extra_params:
+              needles: *novel_needles
+              retrieval_question: "What is the best thing to do in Marrowfen?"
+              context_lengths_min: *control_context
+              context_lengths_max: *control_context
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

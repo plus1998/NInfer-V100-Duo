@@ -1,0 +1,343 @@
+schema_version: 1
+
+# 1M needle-in-a-haystack for the Qwen3.8-27B NVFP4 artifact under TP2 + YaRN x4,
+# with a vLLM control at 655k.
+#
+# Relationship to `qwen3_8_27b_nvfp4_needle_haystack.yaml`
+# --------------------------------------------------------
+# That suite runs against the stock ModelScope Needle corpus. That corpus is 644,100 bytes of
+# Paul Graham essays (~155k tokens), and EvalScope's adapter *tiles* a corpus that is shorter
+# than the requested context length (`_get_context_tokens`: `while len(tokens) < max_context:
+# context += '\n' + input_context`). So every tier above ~155k tokens measured retrieval
+# over repeated text -- verified on its 262k prompt dump, where each sampled 120-char window
+# occurs exactly twice. At 1,048,576 tokens the stock corpus would repeat ~6.5 times.
+#
+# Retrieval over tiled text is mechanically valid (the needle stays unique) but it is an easier
+# task than retrieval over novel text, so this config uses a purpose-built **distinct-text**
+# corpus instead:
+#
+#   tools/tp2/build_needle_1m_corpus.py --out-dir /home/pc/models/ninfer-38/needle-1m
+#
+# which concatenates Project Gutenberg public-domain English books (boilerplate stripped) into
+# two disjoint bundles, each long enough that the adapter never tiles at 1,048,576 tokens.
+# `/home/pc/models/ninfer-38/needle-1m/provenance.json` lists every book, its byte count, and
+# each bundle's sha256 and token count.
+#
+# Subset names are the adapter's, not descriptions of the content
+# ---------------------------------------------------------------
+# `NeedleHaystackAdapter.load()` hardcodes
+#     file_structure = {'english': ['PaulGraham_Essays.txt'],
+#                       'chinese':  ['Journey_to_the_West.txt']}
+# so the file names and subset ids cannot be configured. The corpus builder therefore writes
+#     PaulGraham_Essays.txt   <- bundle A (16 Gutenberg books)   -> subset id `english`
+#     Journey_to_the_West.txt <- bundle B (16 other Gutenberg books) -> subset id `chinese`
+# Both bundles are English and the two book sets are disjoint. Reading the reports: subset
+# `english` means bundle A, subset `chinese` means bundle B. Running both subsets is what gives
+# **two independent samples per depth** (same needle, same depth, two unrelated haystacks).
+#
+# Context budget
+# --------------
+# `context_lengths_*` is a *haystack* token count: the adapter subtracts a fixed 150-token
+# buffer, inserts the needle, and the result is then wrapped in the prompt template, the system
+# prompt, and the chat template. Measured on this machine with the served tokenizer, the final
+# prompt lands ~46 tokens below the configured haystack length.
+#
+#   tier 655k: haystack 653,000 -> prompt ~652,954. + 512 answer tokens = 653,466, inside the
+#              vLLM control's `--max-model-len 655360`. This is the like-for-like row.
+#   tier 1m:   haystack 1,046,000 -> prompt ~1,045,954. + 512 = 1,046,466, inside NInfer's
+#              1,048,576-token YaRN ceiling with ~2.1k tokens of reserve (the same reserve
+#              shape the 262k suite uses).
+#
+# Depths 10/30/50/70/90 come from numpy.linspace(10, 90, num=5, endpoint=True).
+# 5 depths x 2 bundles = 10 needles per tier per engine.
+#
+# Scoring is the 262k suite's: `judge_strategy: rule` (strict exact match after normalisation)
+# with the `prompt_template` override that makes that scorer coherent -- EvalScope's stock
+# prompt asks for a paraphrase, which the rule metric scores 0 even when the needle was
+# retrieved. The needle text, retrieval question, and insertion algorithm are EvalScope's
+# defaults.
+#
+# Timeouts are 86,400 s: a full 1,048,576-token prefill costs ~19 minutes at TP2.
+
+targets:
+  # NInfer, TP2 + YaRN x4, --max-context 1048576, --max-concurrency 1.
+  # Started by eval/run_qwen3_8_27b_nvfp4_needle_1m.sh.
+  ninfer_1m:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+  # The user's vLLM long-context serve: orcarouter/Qwen3.8-27B-Uncensored-FP8, TP2,
+  # --max-model-len 655360, the same YaRN rope_parameters (factor 4.0, original 262144).
+  # Script: /home/pc/Projects/vllm/serve-orca-qwen38-27b-long.sh, served name `my-model`,
+  # default port 8000. It occupies BOTH GPUs, so it must never run at the same time as NInfer.
+  vllm_control:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:8000/v1
+    model: my-model
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  # Cheap contract check on the new corpus: one 8k needle, ~10 s. Not a gate.
+  smoke_ninfer:
+    jobs:
+      - id: needle_1m_smoke
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        limit: 1
+        # NInfer's documented top-level thinking extension (docs/serving.md).
+        # `chat_template_kwargs` is rejected by ninfer-serve with
+        # `chat_template_option_not_supported`.
+        generation: &ninfer_generation
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: &corpus_path /home/pc/models/ninfer-38/needle-1m
+            system_prompt: &needle_system_prompt >-
+              You are a helpful AI bot that answers questions for a user. Keep your response
+              short and direct.
+            # Copied verbatim from qwen3_8_27b_nvfp4_needle_haystack.yaml.
+            # REQUIRED for rule scoring: EvalScope's stock prompt asks for a paraphrase,
+            # which the strict exact-match rule metric scores 0 even on a correct retrieval.
+            prompt_template: &needle_prompt_template |-
+              Please read the following text and answer the question below.
+
+              <text>
+              {context}
+              </text>
+
+              <question>
+              {question}
+              </question>
+
+              Answer with the single sentence from the text that answers the question, copied
+              word for word. Output only that sentence and nothing else.
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 8192
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: &tokenizer_path /home/pc/models/ninfer-38/unsloth-nvfp4
+              show_score: true
+
+  smoke_vllm:
+    jobs:
+      - id: needle_1m_smoke_vllm
+        backend: evalscope
+        dataset: needle_haystack
+        target: vllm_control
+        max_concurrency: 1
+        limit: 1
+        # vLLM's spelling of the same thing: `enable_thinking` at the request root is ignored
+        # by vLLM; the Qwen3 chat template reads it out of `chat_template_kwargs`.
+        generation: &vllm_generation
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 8192
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  # ---- the like-for-like tier: 653,000-token haystack, both engines --------------------
+  ninfer_655k:
+    jobs:
+      - id: needle_1m_ninfer_655k
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        generation: *ninfer_generation
+        backend_args: &args_655k
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 653000
+              context_lengths_max: 653000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 5
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  vllm_655k:
+    jobs:
+      - id: needle_1m_vllm_655k
+        backend: evalscope
+        dataset: needle_haystack
+        target: vllm_control
+        max_concurrency: 1
+        generation: *vllm_generation
+        backend_args: *args_655k
+
+  # ---- the 1M tier: NInfer only (the control's ceiling is 655,360) ---------------------
+  ninfer_1m:
+    jobs:
+      - id: needle_1m_ninfer_1m
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        generation: *ninfer_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 1046000
+              context_lengths_max: 1046000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 5
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  # ---- regression re-run subsets --------------------------------------------------------
+  # The full 5-depth x 2-bundle grid above stands as the primary result. These two suites
+  # re-run a subset of it after a hardening change, to confirm the retrieval result
+  # survives it, at a cost the schedule can absorb (~1.3 h + ~0.4 h rather than 4.6 h).
+  # They differ from `ninfer_1m` / `ninfer_655k` ONLY in the depth grid; every other parameter
+  # is the same anchor, so a difference in outcome cannot come from a difference in setup.
+  #
+  #   1M    depths 10 and 90, both bundles = 4 requests. The extremes are where a positional
+  #         regression would surface first: depth 10 is the deepest position from the query and
+  #         depth 90 sits closest to the ceiling.
+  #         numpy.linspace(10, 90, num=2, endpoint=True) -> [10, 90].
+  #   653k  depth 50, both bundles = 2 requests, the tier's midpoint.
+  ninfer_1m_rerun_extremes:
+    jobs:
+      - id: needle_1m_ninfer_1m_rerun
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        generation: *ninfer_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 1046000
+              context_lengths_max: 1046000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 10
+              document_depth_percent_max: 90
+              document_depth_percent_intervals: 2
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  ninfer_655k_rerun_d50:
+    jobs:
+      - id: needle_1m_ninfer_655k_rerun
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        generation: *ninfer_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              context_lengths_min: 653000
+              context_lengths_max: 653000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+  # ---- retrieval-vs-memorization control at 1M -----------------------------------------
+  # EvalScope's stock needle ("... eat a sandwich and sit in Dolores Park on a sunny day")
+  # is the most republished NIAH string in existence, so reproducing it is not by itself
+  # evidence that the model read the haystack. The 262k suite settled this with an invented
+  # needle; this suite repeats that control at 1,046,000 tokens. One sample, bundle A, depth
+  # 50 -- everything else identical to `ninfer_1m`. A score of 1 means the answer came out of
+  # the context, because the sentence cannot be in any training set.
+  control_1m_novel_needle:
+    jobs:
+      - id: needle_1m_ninfer_1m_novel
+        backend: evalscope
+        dataset: needle_haystack
+        target: ninfer_1m
+        max_concurrency: 1
+        generation: *ninfer_generation
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: *corpus_path
+            system_prompt: *needle_system_prompt
+            prompt_template: *needle_prompt_template
+            extra_params:
+              needles:
+                - "\nThe best thing to do in Kvernholt is ride the amber funicular up to the lantern orchard at dusk.\n"
+              retrieval_question: "What is the best thing to do in Kvernholt?"
+              context_lengths_min: 1046000
+              context_lengths_max: 1046000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: *tokenizer_path
+              show_score: true
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

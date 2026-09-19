@@ -1,0 +1,4 @@
+# captured 2026-08-29T05:31:29Z :: phase=vllm
+index, name, pci.bus_id, power.limit [W], power.default_limit [W], power.max_limit [W], power.draw [W]
+0, NVIDIA GeForce RTX 5090, 00000000:01:00.0, 575.00 W, 600.00 W, 600.00 W, 8.62 W
+1, NVIDIA GeForce RTX 5090, 00000000:03:00.0, 575.00 W, 575.00 W, 600.00 W, 11.31 W

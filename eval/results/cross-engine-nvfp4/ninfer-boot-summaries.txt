@@ -1,0 +1,25 @@
+NInfer boot capacity summaries for the six 500 W cross-engine servers, extracted verbatim
+from each run's ninfer-500w-*.server.log (the .log files themselves are held locally and are
+not tracked, per the repository-wide *.log ignore rule).
+
+### ninfer-500w-250000-mtp0-ctx1048576-yarn
+  [2026-08-29 08:57:11.492] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=16.85 GiB free-after-weights=19.86 GiB free-after-startup=3.02 GiB headroom=1.00 GiB slack=3.01 GiB graphs=3.44 MiB/20.00 MiB graph-peer=2.00 MiB graph-nodes=1888
+
+### ninfer-500w-250000-mtp3-ctx1048576-yarn
+  [2026-08-29 08:59:10.157] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=17.96 GiB free-after-weights=19.42 GiB free-after-startup=1.53 GiB headroom=1.00 GiB slack=1.45 GiB graphs=0.75 MiB/82.00 MiB graph-peer=2.00 MiB graph-nodes=2194
+
+### ninfer-500w-653000-mtp0-ctx1048576-yarn
+  [2026-08-29 09:01:04.908] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=16.85 GiB free-after-weights=19.84 GiB free-after-startup=3.01 GiB headroom=1.00 GiB slack=2.99 GiB graphs=2.00 MiB/20.00 MiB graph-peer=2.00 MiB graph-nodes=1888
+
+### ninfer-500w-653000-mtp3-ctx1048576-yarn
+  [2026-08-29 09:09:22.518] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=17.96 GiB free-after-weights=19.38 GiB free-after-startup=1.50 GiB headroom=1.00 GiB slack=1.42 GiB graphs=2.00 MiB/82.00 MiB graph-peer=2.00 MiB graph-nodes=2194
+
+### ninfer-500w-700000-mtp0-ctx1048576-yarn
+  [2026-08-29 09:37:17.977] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=16.85 GiB free-after-weights=19.61 GiB free-after-startup=2.77 GiB headroom=1.00 GiB slack=2.75 GiB graphs=2.00 MiB/20.00 MiB graph-peer=2.00 MiB graph-nodes=1888
+
+### ninfer-500w-700000-mtp3-ctx1048576-yarn
+  [2026-08-29 09:46:39.577] [info] ninfer-serve: KV capacity auto resolved=1048576 tokens pages=16384/16384 runtime=17.96 GiB free-after-weights=19.40 GiB free-after-startup=1.51 GiB headroom=1.00 GiB slack=1.44 GiB graphs=2.00 MiB/82.00 MiB graph-peer=2.00 MiB graph-nodes=2194
+
+### ninfer-500w-700000-mtp0, first attempt: transient CUDA Graph allowance failure
+  [2026-08-29 09:17:40.775] [error] ninfer-serve: CUDA Graph preparation consumed 44433408 bytes on device 0, exceeding the planned per-device allowance of 20971520 bytes
+  (full log: ninfer-500w-700000-mtp0-cudagraph-allowance-failure.txt)

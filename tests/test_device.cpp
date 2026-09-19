@@ -31,12 +31,12 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
         std::cerr << label << " compute stream is null\n";
         ++failures;
     }
-    if (ctx.transfer_stream == nullptr) {
+    if (ctx.load_stream == nullptr) {
         std::cerr << label << " load stream is null\n";
         ++failures;
     }
-    if (ctx.compute_capability() <= 0) {
-        std::cerr << label << " compute capability is not positive\n";
+    if (ctx.sm() <= 0) {
+        std::cerr << label << " sm is not positive\n";
         ++failures;
     }
     if (ctx.total_vram() == 0) {
@@ -47,6 +47,49 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
 }
 
 } // namespace
+
+// ExecutionContext's own contract: distinct ids only, tp follows the list, and rank 0 is left
+// current. The duplicate-id rejection is the one that has to be a regression test rather than a
+// one-off manual check -- it guards a SILENT failure (two contexts on one GPU halve nothing and
+// make the peer copies alias their own source), so nothing downstream would notice its removal.
+int check_execution_context(int device_count) {
+    int failures = 0;
+
+    try {
+        ninfer::ExecutionContext duplicate({0, 0});
+        std::cerr << "ExecutionContext({0, 0}) did not reject the duplicate device id\n";
+        ++failures;
+    } catch (const std::runtime_error&) {}
+
+    try {
+        ninfer::ExecutionContext empty({});
+        std::cerr << "ExecutionContext({}) did not reject an empty device list\n";
+        ++failures;
+    } catch (const std::runtime_error&) {}
+
+    ninfer::ExecutionContext single({0});
+    if (single.tp != 1 || !single.dev[0].has_value() || single.dev[1].has_value() ||
+        single.primary().device != 0) {
+        std::cerr << "ExecutionContext({0}) did not describe one device on rank 0\n";
+        ++failures;
+    }
+
+    if (device_count >= 2) {
+        ninfer::ExecutionContext pair({0, 1});
+        if (pair.tp != 2 || !pair.dev[0].has_value() || !pair.dev[1].has_value() ||
+            pair.dev[0]->device != 0 || pair.dev[1]->device != 1) {
+            std::cerr << "ExecutionContext({0, 1}) did not describe two distinct devices\n";
+            ++failures;
+        }
+        int current = -1;
+        if (cudaGetDevice(&current) != cudaSuccess || current != pair.dev[0]->device) {
+            std::cerr << "ExecutionContext construction did not leave rank 0 current (current="
+                      << current << ")\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
 
 int main() {
     int count                   = 0;
@@ -76,7 +119,7 @@ int main() {
 
     const cudaStream_t original_stream = ctx.stream;
     ninfer::DeviceContext moved(std::move(ctx));
-    if (ctx.stream != nullptr || ctx.transfer_stream != nullptr) {
+    if (ctx.stream != nullptr || ctx.load_stream != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
     }
@@ -87,6 +130,7 @@ int main() {
     failures += check_context(moved, "moved");
 
     failures += expect_throws_device(count);
+    failures += check_execution_context(count);
 
     ninfer::CudaEventTimer timer(moved);
     timer.start();

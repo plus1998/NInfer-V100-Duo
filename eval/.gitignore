@@ -2,4 +2,5 @@
 runs/
 __pycache__/
 *.pyc
-server-logs/*.requests.jsonl
+# Local server logs, request logs, and measurement samples from eval runs.
+server-logs/

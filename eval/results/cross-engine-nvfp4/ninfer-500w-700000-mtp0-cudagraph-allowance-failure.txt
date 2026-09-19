@@ -1,0 +1,30 @@
+[2026-08-29 09:17:28.244] [info] ninfer-serve: loading model...
+[2026-08-29 09:17:28.708] [info] ninfer-serve: load        weights                      0.00%           0 B /      20.16 GiB     0.000 s
+[2026-08-29 09:17:38.739] [info] ninfer-serve: load        weights                     92.99%     18.75 GiB /      20.16 GiB    10.031 s
+[2026-08-29 09:17:39.517] [info] ninfer-serve: load        weights                    100.00%     20.16 GiB /      20.16 GiB    10.810 s
+[2026-08-29 09:17:40.775] [error] ninfer-serve: CUDA Graph preparation consumed 44433408 bytes on device 0, exceeding the planned per-device allowance of 20971520 bytes
+usage: /home/pc/Projects/ninfer-1m/build/apps/ninfer-serve <model.ninfer> [--host H] [--port N] [--api-key KEY] [--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] [--rope native|yarn] [--yarn-factor F] [--yarn-origin O] [--max-pending-requests N] [--pending-timeout-ms N] [--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] [--devices N,N] [--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] [--media-preprocess-threads N] [--request-log-jsonl FILE] [--response-store-max-records N] [--response-store-max-mib N] [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] [--default-max-tokens N] [--vision] [--no-cuda-graph] [--no-prefix-reuse] [--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] [--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]
+       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints
+       --default-max-tokens defaults to 8192 when omitted
+       --max-request-mib defaults to 384 and is enforced before JSON parsing
+       --media-cache-mib defaults to 1024; 0 disables retained media reuse
+       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads
+       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)
+       --request-log-jsonl appends full-precision server/request records
+       --model-id overrides the artifact identity.model_id reported by the server
+       Responses state is process-local and bounded to 1024 records / 256 MiB by default
+       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs
+       --vision enables media and loads the fixed Vision GPU allocations
+       --kv-capacity auto leaves 1024 MiB of sizing headroom
+       --no-prefix-reuse disables compatible-prefix caching (enabled by default).
+       Prefix reuse is unavailable at --tp 2 with --spec mtp: the MTP bridge
+       resumes from a retained target hidden that only the primary device
+       holds, so such requests are prefilled again instead of resumed. The
+       answer is unchanged; only the saving is lost.
+       --preserve-thinking retains closed-turn assistant reasoning in later prompts
+       sampler defaults come from the loaded model and resolved thinking mode; server flags and request fields override individual values.
+       --greedy forces temperature 0 (exact argmax).
+       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across two GPUs and requires --devices; it supports --spec mtp but not --spec dflash, and not --vision.
+       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or --devices 0,1 for --tp 2. When given together with --device they must agree on the primary device.
+       --rope selects the rotary regime (default native: the checkpoint's own RoPE and its registered 262144-position ceiling). --rope yarn applies YaRN frequency correction and raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most 1048576); --yarn-origin must equal the artifact's registered native capacity (262144) and defaults to it, --yarn-factor defaults to 4.0. YaRN works at either --tp width and is rejected with --vision or --spec dflash.
+       --no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream forward pass with cross-device event synchronization, in place of one captured cross-device graph; it is the escape hatch if capture ever misbehaves, and it produces the same tokens.

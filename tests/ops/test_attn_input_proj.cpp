@@ -65,9 +65,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    const std::size_t workspace_bytes =
+    const std::size_t capacity =
         ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens);
-    WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    DeviceArena workspace(std::max<std::size_t>(capacity, 1));
     ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, workspace, nullptr);
     cuda_synchronize();
 
@@ -308,11 +308,9 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
-#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
-#endif
     return failures;
 }
 
@@ -373,12 +371,8 @@ int run_fp8_target() {
     constexpr std::int32_t kRows   = 14336;
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 349U));
-#ifdef NINFER_VOLTA_BUILD
-    parent.prepack_fp8();
-#endif
 
-    int failures = 0;
-#ifndef NINFER_VOLTA_BUILD
+    int failures          = 0;
     const std::size_t one = ops::attn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
     const std::size_t ten = ops::attn_input_proj_workspace_capacity_bytes(
@@ -398,14 +392,11 @@ int run_fp8_target() {
         std::cerr << "FP8 attention input workspace interval contract mismatch\n";
         ++failures;
     }
-#endif
     failures += run_fp8_target_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_fp8_target_case(parent, 2, ops::LinearPolicy::A16Only);
-#ifndef NINFER_VOLTA_BUILD
     for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024}) {
         failures += run_fp8_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
-#endif
     return failures;
 }
 

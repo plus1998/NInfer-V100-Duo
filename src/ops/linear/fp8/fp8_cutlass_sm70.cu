@@ -3,7 +3,6 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
-#include "ops/linear/fp8/fp8_prepack_sm70.cuh"
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
@@ -19,19 +18,12 @@ namespace ninfer::ops::detail {
 namespace {
 
 __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
-                                        bool prepacked,
                                         cutlass::half_t* __restrict__ out) {
     const int row      = static_cast<int>(blockIdx.y);
     const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= n || pair_idx >= k / 2) { return; }
-    const int k0 = pair_idx * 2;
-    const std::uint8_t* source = nullptr;
-    if (prepacked) {
-        source = codes + fp8_qpn_prepacked_offset(row, k0, k);
-    } else {
-        source = codes + static_cast<std::int64_t>(row) * k + k0;
-    }
-    const std::uint16_t packed = *reinterpret_cast<const std::uint16_t*>(source);
+    const std::uint16_t packed = *reinterpret_cast<const std::uint16_t*>(
+        codes + static_cast<std::int64_t>(row) * k + pair_idx * 2);
     const float2 weight = decode_fp8_e4m3x2(packed);
     cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
     out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
@@ -112,8 +104,7 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     const dim3 block(256);
     const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256), static_cast<unsigned>(n), 1u);
     dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), n, k,
-        w.layout == QuantLayout::VoltaQpnPrepacked, weight);
+        static_cast<const std::uint8_t*>(w.qdata), n, k, weight);
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
     bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(

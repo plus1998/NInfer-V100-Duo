@@ -185,7 +185,7 @@ Options parse_options(int argc, char** argv) {
 std::vector<Profile> selected_profiles(ProfileSelection selection) {
     std::vector<Profile> profiles;
     if (selection == ProfileSelection::Qwen27B || selection == ProfileSelection::All) {
-        profiles.push_back({"27b", 48, 48, 10240, {2, 8, 16}});
+        profiles.push_back({"27b", 48, 48, 10240, {2, 3, 4, 5, 6}});
     }
     if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
         profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
@@ -195,6 +195,10 @@ std::vector<Profile> selected_profiles(ProfileSelection selection) {
 
 std::vector<std::int32_t> selected_widths(const Profile& profile, std::int32_t exact_width) {
     if (exact_width == 0) return profile.widths;
+    if (std::find(profile.widths.begin(), profile.widths.end(), exact_width) ==
+        profile.widths.end()) {
+        throw std::invalid_argument("exact width is not in the selected profile workload");
+    }
     return {exact_width};
 }
 
@@ -253,7 +257,7 @@ std::vector<ops::GdnReplayFoldRow> make_rows(std::int32_t batch, std::int32_t wi
             constexpr std::int32_t kMixed[kRecordCapacity] = {0, 1, 2, 3, 16, 7, 12, 5};
             commit                                         = std::min(width, kMixed[row]);
         }
-        rows[static_cast<std::size_t>(row)] = {kSlots[row], kSlots[row], commit};
+        rows[static_cast<std::size_t>(row)] = {kSlots[row], commit};
     }
     return rows;
 }
@@ -294,7 +298,11 @@ public:
         state_storage_.fill(0);
     }
 
-    [[nodiscard]] const ops::GdnReplayFoldPlan& fold_plan() const { return fold_plan_; }
+    [[nodiscard]] const GdnReplayRecords& records() const { return records_; }
+
+    [[nodiscard]] LinearAttentionStateAllLayersView states() const {
+        return states_.all_layers_view();
+    }
 
 private:
     static GdnReplayRecordLayout make_record_layout(const Profile& profile, std::int32_t width,
@@ -344,7 +352,6 @@ private:
     GdnReplayRecords records_;
     DeviceBuffer state_storage_;
     LinearAttentionStatePool states_;
-    ops::GdnReplayFoldPlan fold_plan_{records_, states_.all_layers_view()};
 };
 
 DeviceBuffer make_i32(const std::vector<std::int32_t>& values) {
@@ -368,17 +375,39 @@ public:
           q_(bench::make_bf16(qk_elements())), k_(bench::make_bf16(qk_elements())),
           v_(bench::make_bf16(value_elements())), g_(make_f32(gate_elements(), -0.7F)),
           beta_(make_f32(gate_elements(), 0.5F)),
+          snapshot_states_(snapshot_state_elements() * sizeof(float)),
           record_states_(record_state_elements() * sizeof(float)),
-          record_initial_(make_i32(record_initial_slots())), valid_(make_valid()),
+          snapshot_initial_(make_i32(snapshot_initial_slots())),
+          record_initial_(make_i32(record_initial_slots())),
+          snapshot_bases_(make_i32(snapshot_base_slots())), valid_(make_valid()),
+          snapshot_out_(value_elements() * sizeof(std::uint16_t)),
           record_out_(value_elements() * sizeof(std::uint16_t)),
           key_record_(qk_elements() * sizeof(std::uint16_t)),
           value_record_(value_elements() * sizeof(std::uint16_t)),
           gate_record_(gate_elements() * 2 * sizeof(float)) {
+        snapshot_states_.fill(0);
         record_states_.fill(0);
+        snapshot_out_.fill(0);
         record_out_.fill(0);
         key_record_.fill(0);
         value_record_.fill(0);
         gate_record_.fill(0);
+    }
+
+    void launch_snapshot(cudaStream_t stream) {
+        Tensor q(q_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor k(k_.p, DType::BF16, {kStateDim, kQkHeads, width_, batch_});
+        Tensor v(v_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        Tensor g(g_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor beta(beta_.p, DType::FP32, {profile_.value_heads, width_, batch_});
+        Tensor states(snapshot_states_.p, DType::FP32,
+                      {kStateDim, kStateDim, profile_.value_heads, batch_ * width_ + batch_});
+        Tensor valid = valid_tensor();
+        Tensor initial(snapshot_initial_.p, DType::I32, {batch_});
+        Tensor bases(snapshot_bases_.p, DType::I32, {batch_});
+        Tensor out(snapshot_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        ops::gated_delta_net_snapshot(q, k, v, g, beta, scale(), true, states, valid, initial,
+                                      bases, out, stream);
     }
 
     void launch_record(cudaStream_t stream) {
@@ -419,13 +448,29 @@ private:
         return static_cast<std::size_t>(kStateDim) * kStateDim * profile_.value_heads;
     }
 
+    [[nodiscard]] std::size_t snapshot_state_elements() const {
+        return state_slot_elements() * static_cast<std::size_t>(batch_ * width_ + batch_);
+    }
+
     [[nodiscard]] std::size_t record_state_elements() const {
         return state_slot_elements() * static_cast<std::size_t>(batch_);
+    }
+
+    [[nodiscard]] std::vector<std::int32_t> snapshot_initial_slots() const {
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(batch_));
+        for (std::int32_t row = 0; row < batch_; ++row) { slots[row] = batch_ * width_ + row; }
+        return slots;
     }
 
     [[nodiscard]] std::vector<std::int32_t> record_initial_slots() const {
         std::vector<std::int32_t> slots(static_cast<std::size_t>(batch_));
         for (std::int32_t row = 0; row < batch_; ++row) { slots[row] = row; }
+        return slots;
+    }
+
+    [[nodiscard]] std::vector<std::int32_t> snapshot_base_slots() const {
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(batch_));
+        for (std::int32_t row = 0; row < batch_; ++row) { slots[row] = row * width_; }
         return slots;
     }
 
@@ -452,9 +497,13 @@ private:
     DeviceBuffer v_;
     DeviceBuffer g_;
     DeviceBuffer beta_;
+    DeviceBuffer snapshot_states_;
     DeviceBuffer record_states_;
+    DeviceBuffer snapshot_initial_;
     DeviceBuffer record_initial_;
+    DeviceBuffer snapshot_bases_;
     DeviceBuffer valid_;
+    DeviceBuffer snapshot_out_;
     DeviceBuffer record_out_;
     DeviceBuffer key_record_;
     DeviceBuffer value_record_;
@@ -466,7 +515,7 @@ Measurement measure_fold(const FoldResources& resources,
                          int warmup, int repeat) {
     cudaStream_t stream = nullptr;
     const auto launch   = [&](cudaStream_t launch_stream) {
-        resources.fold_plan().execute(rows, launch_stream);
+        ops::gdn_replay_fold(resources.records(), resources.states(), rows, launch_stream);
     };
     Measurement result;
     result.warm           = bench::measure_launch(launch, stream, warmup, repeat);
@@ -497,9 +546,13 @@ void print_recurrent_result(const Profile& profile, std::int32_t width, std::int
 void run_recurrent_point(const Profile& profile, std::int32_t width, std::int32_t batch,
                          ValidSelection valid, DeviceBuffer& flush, const Options& options) {
     RecurrentResources resources(profile, width, batch, valid);
+    const Measurement snapshot =
+        measure_component([&](cudaStream_t stream) { resources.launch_snapshot(stream); }, flush,
+                          options.warmup, options.repeat);
     const Measurement record =
         measure_component([&](cudaStream_t stream) { resources.launch_record(stream); }, flush,
                           options.warmup, options.repeat);
+    print_recurrent_result(profile, width, batch, valid, "snapshot", snapshot);
     print_recurrent_result(profile, width, batch, valid, "record", record);
 }
 

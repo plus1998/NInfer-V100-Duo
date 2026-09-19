@@ -51,11 +51,6 @@ static_assert(catalog_is_closed(kTargetRoutes),
 static_assert(catalog_is_closed(kCompanionRoutes),
               "W8 companion attention input routes must be exact and closed");
 
-bool is_dflash2_shape(const W8AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
-           problem.parent_rows == 6144 && problem.padded_k == 5120;
-}
-
 bool is_companion_shape(const W8AttnInputProblem& problem) noexcept {
     return problem.input_rows == 2048 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
            problem.parent_rows == 6144 && problem.padded_k == 2048;
@@ -64,7 +59,6 @@ bool is_companion_shape(const W8AttnInputProblem& problem) noexcept {
 bool supported_shape(const W8AttnInputProblem& problem) noexcept {
     const bool target_qkgv =
         problem.query_rows == 4096 && problem.kv_rows == 512 && problem.parent_rows == 9216;
-    if (is_dflash2_shape(problem)) { return true; }
     return problem.input_rows == 2048 && problem.padded_k == 2048 &&
            (target_qkgv || is_companion_shape(problem));
 }
@@ -93,8 +87,6 @@ const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.w8.mma.r128.c64";
     case W8AttnInputScheduleId::MmaR128C80:
         return "attn_input_proj.w8.mma.r128.c80";
-    case W8AttnInputScheduleId::Dflash2SimtSplit:
-        return "attn_input_proj.w8.dflash2.simt.split.k5120";
     }
     return "attn_input_proj.w8.unknown";
 }
@@ -109,7 +101,6 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
             "W8 attention input: exact problem or column count is not admitted");
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (is_dflash2_shape(problem)) { return {W8AttnInputScheduleId::Dflash2SimtSplit}; }
     // Same shape as the w8 linear_add override: every schedule in these tables
     // except SimtR8C4 and DecodeR8Direct reaches the trap-stubbed mma/split-K
     // kernels below sm_80, and SimtR8C4's grid derives its token extent from
@@ -164,8 +155,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     case W8AttnInputScheduleId::MmaR64C96:
     case W8AttnInputScheduleId::MmaR128C64:
     case W8AttnInputScheduleId::MmaR128C80:
-    case W8AttnInputScheduleId::Dflash2SimtSplit:
-        throw std::logic_error("W8 attention input: schedule not valid for this output form");
+        throw std::logic_error("W8 attention input: companion schedule in four-output plan");
     }
     throw std::logic_error("W8 attention input: unknown schedule");
 }
@@ -189,9 +179,6 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
             "W8 attention input: plan does not match exact three-output problem");
     }
     switch (plan.schedule) {
-    case W8AttnInputScheduleId::Dflash2SimtSplit:
-        w8_dflash2_attn_input_volta_launch(x, weight, q, k, v, stream);
-        return;
     case W8AttnInputScheduleId::DecodeR8Direct:
         w8_attn_input_decode_launch(x, weight, q, k, v, stream);
         return;

@@ -1,13 +1,33 @@
 #include "ops/linear/w8/w8_dispatch.h"
-#include "ops/linear/w8/w8_feature.h"
 
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
 
-W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the rules; in particular W8's
+// small-T table is a set of compile-time exact geometries (attention/GDN/MTP), so a shard uses the
+// generic SIMT/MMA launchers instead. Returns nullptr when (n, k) is not a registered shard
+// extent.
+W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard = k == 5120 && (n == 512 ||     // 1024   / 2
+                                            n == 3072 ||    // 6144   / 2
+                                            n == 7168 ||    // 14336  / 2 (attention input)
+                                            n == 17408 ||   // 34816  / 2 (mlp/gate_up)
+                                            n == 124160);   // 248320 / 2 (output_head)
+    const bool row_shard    = n == 5120 && (k == 3072 ||    // 6144   / 2 (attention/gdn output)
+                                            k == 5120 ||    // 10240  / 2 (mtp/input_projection)
+                                            k == 8704);     // 17408  / 2 (mlp/down)
+    if (!column_shard && !row_shard) { return nullptr; }
+    if (t <= 4) { return launch_w8_simt_r8_c4; }
+    if (t <= 16) { return launch_w8_simt_r8_c8; }
+    return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
+}
 
+// The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
+// can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
+// both registered here and listed as a shard extent keeps its tuned tp1 launcher.
+W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 10240:
         if (n == 5120) {
@@ -22,10 +42,8 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r32_c128;
         case 6144:
-            // Exact-T schedules own the DFlash2 decode interval. R32/C64 is the single bridge;
-            // R64/C128 is the measured T=1024 prefill winner.
-            if (t <= 53) { return launch_w8_small_t; }
-            if (t <= 192) { return launch_w8_mma_r32_c64; }
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
         case 14336:
             if (t <= 48) { return launch_w8_small_t; }
@@ -33,14 +51,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 34816:
             if (t <= 40) { return launch_w8_small_t; }
             if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
-            if (t <= 52) { return launch_w8_small_t; }
-            if (t <= 64) { return launch_w8_mma_r128_c64; }
             return launch_w8_mma_r64_c128;
         case 248320:
             if (t <= 33) { return launch_w8_small_t; }
             if (t <= 48) { return launch_w8_mma_r64x16_c48_k128_a1; }
-            if (t <= 64) { return launch_w8_mma_r64x32_c64_k128_a1; }
-            if (t <= 96) { return launch_w8_mma_r64_c96; }
+            if (t <= 64) { return launch_w8_mma_r32_c64; }
             return launch_w8_mma_r64_c128;
         default:
             break;
@@ -58,26 +73,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         }
         break;
-    case 25600:
-        if (n == 5120) {
-            if (t <= 56) { return launch_w8_feature_small_t; }
-            if (t <= 64) { return launch_w8_feature_r16_c64; }
-            if (t <= 128) { return launch_w8_feature_r32_c64; }
-            return launch_w8_mma_r64_c128;
-        }
-        break;
     case 4096:
         if (n == 2048) {
             if (t <= 48) { return launch_w8_small_t; }
             if (t <= 56) { return launch_w8_simt_r8_c4; }
             if (t <= 895) { return launch_w8_mma_r32_c128; }
-            return launch_w8_mma_r64_c128;
-        }
-        if (n == 5120) {
-            // DFlash2 draft attention-output projection. On Volta every route below is
-            // redirected to the general SIMT kernel, so the exact table entry only needs to
-            // resolve without throwing.
-            if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
         break;
@@ -162,6 +162,19 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
+    return nullptr;
+}
+
+} // namespace
+
+W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
+    if (const W8Launch tp1 = select_w8_a16_registered(n, k, t); tp1 != nullptr) {
+        return tp1;
+    }
+    if (const W8Launch shard = select_w8_tp2_shard_launch(n, k, t); shard != nullptr) {
+        return shard;
+    }
     throw std::invalid_argument("w8 linear: unsupported shape or T");
 }
 

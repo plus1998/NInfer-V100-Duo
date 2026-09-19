@@ -47,51 +47,6 @@ void launch_w8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_w8_volta_qpn_dynamic_conv_add(const Tensor& x, const Weight& w, const Tensor& base,
-                                          const Tensor& finish_delta, Tensor& residual,
-                                          std::int32_t width, cudaStream_t stream) {
-    const std::int32_t n = residual.ne[0];
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
-    const std::int32_t padded_groups = w.padded_shape[1] / W8RowSplitStorage::kGroupK;
-    const dim3 grid(static_cast<unsigned>((n + S::kColsPerCta - 1) / S::kColsPerCta));
-    w8_volta_qpn_gemm_kernel<1, 4, true><<<grid, S::kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<const __nv_bfloat16*>(x.data), nullptr, n, k, t, padded_groups, 0,
-        static_cast<const __nv_bfloat16*>(finish_delta.data),
-        static_cast<const __nv_bfloat16*>(base.data),
-        static_cast<__nv_bfloat16*>(residual.data), width);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void w8_linear_swiglu_volta_qpn_split_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                              cudaStream_t stream) {
-    constexpr std::int32_t kIntermediate = 17408;
-    const std::int32_t k = x.ne[0];
-    const std::int32_t t = x.ne[1];
-    const std::int32_t padded_groups = w.padded_shape[1] / W8RowSplitStorage::kGroupK;
-    const std::int64_t row_bytes = static_cast<std::int64_t>(padded_groups) *
-                                   W8RowSplitStorage::kCodeBytesPerGroup;
-    const std::int64_t row_scale_bytes = static_cast<std::int64_t>(padded_groups) *
-                                         W8RowSplitStorage::kScaleBytesPerGroup;
-    const auto* gate_codes = static_cast<const std::uint8_t*>(w.qdata);
-    const auto* gate_scales = static_cast<const std::uint8_t*>(w.scales);
-    const auto* up_codes = gate_codes + static_cast<std::int64_t>(kIntermediate) * row_bytes;
-    const auto* up_scales = gate_scales + static_cast<std::int64_t>(kIntermediate) * row_scale_bytes;
-    auto* output = static_cast<__nv_bfloat16*>(out.data);
-    const dim3 grid(static_cast<unsigned>((kIntermediate + S::kColsPerCta - 1) /
-                                         S::kColsPerCta));
-
-    w8_volta_qpn_gemm_kernel<1, 4><<<grid, S::kThreads, 0, stream>>>(
-        gate_codes, gate_scales, static_cast<const __nv_bfloat16*>(x.data), output,
-        kIntermediate, k, t, padded_groups, kIntermediate);
-    CUDA_CHECK(cudaGetLastError());
-    w8_volta_qpn_gemm_kernel<1, 4, false, true><<<grid, S::kThreads, 0, stream>>>(
-        up_codes, up_scales, static_cast<const __nv_bfloat16*>(x.data), output,
-        kIntermediate, k, t, padded_groups, kIntermediate);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

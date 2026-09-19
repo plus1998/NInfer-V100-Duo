@@ -37,6 +37,7 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    GGML_K               = 9,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -44,7 +45,8 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
-    VoltaQpnPrepacked   = 4,
+    VoltaQpnPrepacked    = 4,
+    GgmlK256            = 5,
 };
 
 struct Weight {
@@ -69,6 +71,12 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+
+    // GGML_K rows may mix Q4_K and Q6_K. A nonnegative first_q6 plus a
+    // type_change in [0,n] describes either one uniform run (type_change=n)
+    // or exactly two runs. Other layouts leave both fields at -1.
+    std::int32_t ggml_k_first_q6   = -1;
+    std::int32_t ggml_k_type_change = -1;
 };
 
 } // namespace ninfer

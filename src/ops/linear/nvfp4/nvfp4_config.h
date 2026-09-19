@@ -10,7 +10,7 @@ namespace ninfer::ops::detail {
 // Several NVFP4 plans drive a sub-projection internally and choose the policy themselves rather
 // than taking the caller's, so a target that asks for A16 cannot reach them. On Volta the A4
 // route is a __trap() -- cvt.e2m1x2 is Blackwell hardware and always will be -- so those internal
-// choices have to collapse to A16 here. See docs/v100.md.
+// choices have to collapse to A16 here. See the V100 performance summary.
 #ifdef NINFER_VOLTA_BUILD
 inline constexpr LinearPolicy kNvfp4InternalPolicy = LinearPolicy::A16Only;
 #else
@@ -123,9 +123,35 @@ using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
+// --- TP2 shard geometries ---------------------------------------------------------------------
+//
+// One per registered geometry, on the axis the tp2 ShardPlan
+// (src/targets/qwen3_6_27b/impl/load/bindings.h) splits that family on:
+//
+//   column-parallel (output/ROW split, N/2):  attention/query_key_gate_value 14336 -> 7168
+//                                             gdn/query_key_value_z          16384 -> 8192
+//                                             mlp/gate_up                    34816 -> 17408
+//   row-parallel    (input/COLUMN split, K/2): attention/output, gdn/output    6144 ->  3072
+//                                              mlp/down                       17408 ->  8704
+//
+// These are not new kernels. Each is the SAME kernel template instantiated at the shard's N or K,
+// so a column shard's grid is exactly half the parent's along the output axis and a row shard's
+// K loop is exactly half as long. Every value stays inside Nvfp4GemvGeometry's own asserts
+// (N % 128 == 0, K % 64 == 0), which is the same 128-row / 64-column scale-tile arithmetic the
+// loader's shard-boundary validators derive from -- an unsplittable boundary could not have
+// produced a shard tensor in the first place.
+using Nvfp4AttnInputTp2ColumnGeometry     = Nvfp4GemvGeometry<7168, 5120>;
+using Nvfp4GdnInputTp2ColumnGeometry      = Nvfp4GemvGeometry<8192, 5120>;
+using Nvfp4MlpGateUpTp2ColumnGeometry     = Nvfp4GemvGeometry<17408, 5120>;
+using Nvfp4Residual6144Tp2RowGeometry     = Nvfp4GemvGeometry<5120, 3072>;
+using Nvfp4Residual17408Tp2RowGeometry    = Nvfp4GemvGeometry<5120, 8704>;
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+// Row-parallel activation halves: a rank quantizes only its own K block.
+using Nvfp4Activation3072Geometry = Nvfp4ActivationGeometry<3072>;
+using Nvfp4Activation8704Geometry = Nvfp4ActivationGeometry<8704>;
 
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,
@@ -133,42 +159,106 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    // TP2 shards. Appended so the existing values keep their encodings. Families that do not yet
+    // implement a split form (linear_add, linear_swiglu, attn_input_proj, gdn_input_proj) switch
+    // over this enum without a `default:` and therefore fall through to their own "unsupported
+    // problem" throw for these values, which is exactly the right behaviour until their own task
+    // lands the split path.
+    AttnInputTp2Column,
+    GdnInputTp2Column,
+    MlpGateUpTp2Column,
+    Residual6144Tp2Row,
+    Residual17408Tp2Row,
 };
 
+// The parent geometry a shard problem was split from, and the axis it was split on. Route
+// selection and schedule choice are INHERITED from the parent rather than re-measured: halving N
+// or K moves the measured crossovers somewhat, but inheriting keeps the split path's behaviour a
+// pure function of the family it belongs to, and any re-tuning is a separate, measurable change.
+inline constexpr Nvfp4Problem nvfp4_parent_problem(Nvfp4Problem problem) {
+    switch (problem) {
+    case Nvfp4Problem::AttnInputTp2Column:
+        return Nvfp4Problem::AttnInput;
+    case Nvfp4Problem::GdnInputTp2Column:
+        return Nvfp4Problem::GdnInput;
+    case Nvfp4Problem::MlpGateUpTp2Column:
+        return Nvfp4Problem::MlpGateUp;
+    case Nvfp4Problem::Residual6144Tp2Row:
+        return Nvfp4Problem::Residual6144;
+    case Nvfp4Problem::Residual17408Tp2Row:
+        return Nvfp4Problem::Residual17408;
+    case Nvfp4Problem::AttnInput:
+    case Nvfp4Problem::GdnInput:
+    case Nvfp4Problem::MlpGateUp:
+    case Nvfp4Problem::Residual6144:
+    case Nvfp4Problem::Residual17408:
+        break;
+    }
+    return problem;
+}
+
+// Compile-time form of nvfp4_parent_problem, for the schedule predicates inside the W4A4
+// launchers. A shard geometry answers with the geometry it was split from; a tp1 geometry answers
+// with itself, so every existing `is_same_v<Geometry, ...>` predicate keeps its exact meaning.
+template <class Geometry>
+struct Nvfp4ParentGeometry {
+    using Type = Geometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4AttnInputTp2ColumnGeometry> {
+    using Type = Nvfp4AttnInputGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4GdnInputTp2ColumnGeometry> {
+    using Type = Nvfp4GdnInputGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4MlpGateUpTp2ColumnGeometry> {
+    using Type = Nvfp4MlpGateUpGeometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4Residual6144Tp2RowGeometry> {
+    using Type = Nvfp4Residual6144Geometry;
+};
+template <>
+struct Nvfp4ParentGeometry<Nvfp4Residual17408Tp2RowGeometry> {
+    using Type = Nvfp4Residual17408Geometry;
+};
+
+template <class Geometry>
+using Nvfp4ParentGeometryType = typename Nvfp4ParentGeometry<Geometry>::Type;
+
+// X-macro over the whole registry: every switch that must name each geometry uses it, so adding a
+// problem cannot leave one launcher behind. Order is tp1 first, then the tp2 shards.
+#define NINFER_NVFP4_LINEAR_PROBLEMS(X)                                                            \
+    X(AttnInput, Nvfp4AttnInputGeometry)                                                           \
+    X(GdnInput, Nvfp4GdnInputGeometry)                                                             \
+    X(MlpGateUp, Nvfp4MlpGateUpGeometry)                                                           \
+    X(Residual6144, Nvfp4Residual6144Geometry)                                                     \
+    X(Residual17408, Nvfp4Residual17408Geometry)                                                   \
+    X(AttnInputTp2Column, Nvfp4AttnInputTp2ColumnGeometry)                                         \
+    X(GdnInputTp2Column, Nvfp4GdnInputTp2ColumnGeometry)                                           \
+    X(MlpGateUpTp2Column, Nvfp4MlpGateUpTp2ColumnGeometry)                                         \
+    X(Residual6144Tp2Row, Nvfp4Residual6144Tp2RowGeometry)                                         \
+    X(Residual17408Tp2Row, Nvfp4Residual17408Tp2RowGeometry)
+
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
-            input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
-           (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
-            input_rows == Nvfp4GdnInputGeometry::kInputRows) ||
-           (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
-            input_rows == Nvfp4MlpGateUpGeometry::kInputRows) ||
-           (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
-           (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+#define NINFER_NVFP4_MATCH(name, geometry)                                                         \
+    if (output_rows == geometry::kOutputRows && input_rows == geometry::kInputRows) {              \
+        return true;                                                                               \
+    }
+    NINFER_NVFP4_LINEAR_PROBLEMS(NINFER_NVFP4_MATCH)
+#undef NINFER_NVFP4_MATCH
+    return false;
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    if (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
-        input_rows == Nvfp4AttnInputGeometry::kInputRows) {
-        return Nvfp4Problem::AttnInput;
+#define NINFER_NVFP4_RESOLVE(name, geometry)                                                       \
+    if (output_rows == geometry::kOutputRows && input_rows == geometry::kInputRows) {              \
+        return Nvfp4Problem::name;                                                                 \
     }
-    if (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
-        input_rows == Nvfp4GdnInputGeometry::kInputRows) {
-        return Nvfp4Problem::GdnInput;
-    }
-    if (output_rows == Nvfp4MlpGateUpGeometry::kOutputRows &&
-        input_rows == Nvfp4MlpGateUpGeometry::kInputRows) {
-        return Nvfp4Problem::MlpGateUp;
-    }
-    if (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
-        input_rows == Nvfp4Residual6144Geometry::kInputRows) {
-        return Nvfp4Problem::Residual6144;
-    }
-    if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-        input_rows == Nvfp4Residual17408Geometry::kInputRows) {
-        return Nvfp4Problem::Residual17408;
-    }
+    NINFER_NVFP4_LINEAR_PROBLEMS(NINFER_NVFP4_RESOLVE)
+#undef NINFER_NVFP4_RESOLVE
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
@@ -183,8 +273,11 @@ inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 
 #ifdef NINFER_VOLTA_BUILD
-// Qualified Volta schedule shared by all five registered geometries. Their common performance
-// envelope does not justify per-geometry specializations.
+// Volta (sm_70) cold winners, measured on all five registered geometries with a private
+// schedule sweep -- the reference card's schedules collapse here: 17.8 GB/s at T=16 against
+// 93.7 for the entry below, and 7.1 against 48.7 at T=24. One schedule covers every geometry
+// because all five agreed on the same envelope within a few percent, so there is nothing for
+// per-geometry specializations to say.
 //
 // The whole envelope is per-thread register footprint. Values-per-lane 8 rather than 16 is
 // worth 2.1x at T=13 and 4.3x at T=32; with 16 values a 16-warp CTA cannot be resident at all
@@ -273,5 +366,21 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
 };
 
 #endif // NINFER_VOLTA_BUILD
+// A tp2 shard inherits its parent's measured schedule. Attention-input and MLP gate-up shards need
+// no entry because their parents use the generic template above, which the shard geometry also
+// selects. The three below have a per-geometry specialization to inherit; without these the shard
+// would silently fall back to the generic schedule, which is a different kernel from the one the
+// family was tuned to.
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputTp2ColumnGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4GdnInputGeometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Tp2RowGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {};
+
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Tp2RowGeometry, ActiveTokens>
+    : Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {};
 
 } // namespace ninfer::ops::detail

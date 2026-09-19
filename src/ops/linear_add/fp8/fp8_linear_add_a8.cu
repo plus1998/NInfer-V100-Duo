@@ -1,6 +1,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
@@ -28,11 +29,10 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
+        ensure_func_attr_per_device(
             fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8AddResidualEpilogue,
                            Fp8ContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
@@ -66,10 +66,20 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     case Fp8Problem::Residual17408:
         launch_problem<Fp8Residual17408Geometry>(weight, residual, scratch, x.ne[1], stream);
         return;
+    case Fp8Problem::Residual6144Tp2Row:
+        launch_problem<Fp8Residual6144Tp2RowGeometry>(weight, residual, scratch, x.ne[1], stream);
+        return;
+    case Fp8Problem::Residual17408Tp2Row:
+        launch_problem<Fp8Residual17408Tp2RowGeometry>(weight, residual, scratch, x.ne[1], stream);
+        return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:
     case Fp8Problem::MlpGateUp:
     case Fp8Problem::Vocabulary:
+    case Fp8Problem::VocabularyTp2Column:
+    case Fp8Problem::GdnInputTp2Column:
+    case Fp8Problem::MlpGateUpTp2Column:
+    case Fp8Problem::AttnInputTp2Column:
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");

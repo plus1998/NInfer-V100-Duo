@@ -10,19 +10,16 @@ namespace ninfer::ops::detail {
 
 #ifdef NINFER_VOLTA_BUILD
 
-constexpr std::int32_t kIntermediate = 17408; // Fp8MlpGateUpGeometry::kOutputRows / 2
-
-bool fp8_linear_swiglu_qpn_split_supported(std::int32_t k, std::int32_t t) noexcept {
-    return fp8_volta_qpn_supported(kIntermediate, k, t);
+bool fp8_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
+                                            std::int32_t t) noexcept {
+    return n > 0 && (n % 2) == 0 && fp8_volta_qpn_supported(n / 2, k, t);
 }
 
 void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         float* gate_scratch, float* up_scratch,
-                                        void* activation_scratch,
                                         cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    auto* x_fp16 = static_cast<half*>(activation_scratch);
-    fp8_stage_bf16_activation_sm70(x, x_fp16, stream);
+    const std::int32_t kIntermediate = weight.n / 2;
 
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;
@@ -33,12 +30,11 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
                        static_cast<std::int64_t>(kIntermediate) * weight.k;
     up_weight.scales = static_cast<const __nv_bfloat16*>(weight.scales) + kIntermediate;
 
-    launch_fp8_volta_qpn_with_fp16_activation(
-        x, gate_weight, x_fp16, Fp8Fp32ContiguousOutput{gate_scratch, kIntermediate},
-        kIntermediate, stream);
-    launch_fp8_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16, Fp8Fp32ContiguousOutput{up_scratch, kIntermediate},
-        kIntermediate, stream);
+    launch_fp8_volta_qpn_with_output(x, gate_weight,
+                                     Fp8Fp32ContiguousOutput{gate_scratch, kIntermediate},
+                                     kIntermediate, stream);
+    launch_fp8_volta_qpn_with_output(x, up_weight, Fp8Fp32ContiguousOutput{up_scratch, kIntermediate},
+                                     kIntermediate, stream);
 
     const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
     const int threads           = 256;

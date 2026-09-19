@@ -74,7 +74,7 @@ void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor&
 // stubbed on sm_70): q5_rowsplit_gemm_simt_kernel already takes cols as a runtime grid
 // parameter (unlike split2's compile-time Cols switch above), so a single instantiation covers
 // any T. AddResidual reuses the exact accumulate-before-store pattern split2 already validated.
-// See docs/v100.md.
+// See the V100 performance summary.
 void q5_linear_add_simt_wide_t_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                       cudaStream_t stream) {
     constexpr int kColsPerTile  = 8;

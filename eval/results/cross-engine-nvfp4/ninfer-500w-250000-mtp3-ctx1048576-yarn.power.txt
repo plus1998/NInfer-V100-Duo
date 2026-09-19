@@ -1,0 +1,4 @@
+# captured 2026-08-29T06:58:59Z :: ninfer-500w-250000-mtp3-ctx1048576-yarn
+index, name, power.limit [W], power.default_limit [W], power.max_limit [W]
+0, NVIDIA GeForce RTX 5090, 500.00 W, 600.00 W, 600.00 W
+1, NVIDIA GeForce RTX 5090, 500.00 W, 575.00 W, 600.00 W

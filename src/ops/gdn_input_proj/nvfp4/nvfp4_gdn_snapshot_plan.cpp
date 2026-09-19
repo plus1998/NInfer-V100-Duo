@@ -19,8 +19,7 @@ template <class Allocator>
 Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
     Nvfp4GdnProjectedWorkspace out;
     out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
-    // Floored for the same reason as the linear_swiglu baseline: the A16 sub-projection declares
-    // no transient, and an arena allocation must be nonzero.
+    // Small-T projections need no transient; an arena allocation must still be nonzero.
     const std::size_t projection_bytes = std::max<std::size_t>(
         nvfp4_gdn_input_workspace_capacity_bytes(kNvfp4InternalPolicy, tokens, tokens), 256);
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
@@ -42,8 +41,7 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         // Same reasoning as the A4 branch below: past the fused registration, materialize the
-        // projection and post-process. The sub-projection inherits kNvfp4InternalPolicy, which is
-        // A16 on Volta and chunks internally, so this covers prefill width.
+        // projection and post-process. On Volta its A16 sub-projection uses CUTLASS at wide T.
         return {Nvfp4GdnConvScheduleId::Materialized};
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }

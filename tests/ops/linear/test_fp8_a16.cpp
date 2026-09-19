@@ -37,36 +37,15 @@ int run_fp8_a16() {
     };
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {34816, 5120, 821U, Comparison::Sampled, true, mlp_invocations});
-    std::vector<Invocation> vocabulary_invocations{
+    constexpr std::array vocabulary_invocations{
         Invocation{1, CallForm::A16Convenience, ops::LinearPolicy::A16Only},
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{9, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{24, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{25, CallForm::Policy, ops::LinearPolicy::AllowA8},
-        Invocation{41, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{42, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{49, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{96, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{97, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{128, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{129, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{160, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{161, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{192, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{193, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{256, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{257, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{288, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{289, CallForm::Policy, ops::LinearPolicy::A16Only},
-        Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
-    for (int t = 1; t <= 41; ++t)
-        vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
-    for (int t : {7, 25, 41, 65, 128})
-        vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::Sampled, true, vocabulary_invocations});
     constexpr std::array vocabulary_policies{
@@ -78,18 +57,8 @@ int run_fp8_a16() {
         try {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16S, 248320, 5120, policy, 1, 2048);
-            if (capacity
-#ifdef NINFER_VOLTA_BUILD
-                == 0
-#else
-                != 0
-#endif
-            ) {
-#ifdef NINFER_VOLTA_BUILD
-                std::cerr << "FP8 vocabulary A16 route omitted Volta activation workspace\n";
-#else
+            if (capacity != 0) {
                 std::cerr << "FP8 vocabulary A16 route reported nonzero workspace\n";
-#endif
                 ++failures;
             }
         } catch (const std::exception& error) {

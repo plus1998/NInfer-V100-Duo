@@ -81,16 +81,14 @@ int test_cli_contract() {
         "128",
         "--kv-dtype",
         "int8",
-        "--spec",
-        "mtp",
-        "--draft-tokens",
-        // [1,7] on every build now that the sm_70 width-6+ verify regression is fixed.
+        "--mtp-draft-tokens",
         "5",
         "--lm-head-draft",
         "--device",
         "1",
         "--no-cuda-graph",
         "--profile-measured",
+        "--capture-generation",
         "--output",
         "json",
         "--output-file",
@@ -106,12 +104,14 @@ int test_cli_contract() {
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
     failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
-    failures += expect(parsed.speculative.backend == ninfer::SpeculativeBackend::Mtp, "spec backend");
-    failures += expect(parsed.speculative.draft_tokens == 5, "MTP window");
-    failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
-                       "optimized proposal head");
+    failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
+    failures +=
+        expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
+    failures += expect(parsed.tp == 1 && parsed.devices == std::vector<int>{1},
+                       "single-device selection resolves rank list");
     failures += expect(parsed.profile_measured, "profile-measured flag");
+    failures += expect(parsed.capture_generation, "capture-generation flag");
     failures +=
         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
                "output settings");
@@ -124,56 +124,63 @@ int test_cli_contract() {
                        "help names native artifact");
     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
 
+    const auto tp2 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--devices",
+                                    "1,0", "--tp", "2", "--device", "1"});
+    failures += expect(tp2.tp == 2 && tp2.device == 1 && tp2.devices == std::vector<int>({1, 0}),
+                       "TP2 preserves rank order and primary device");
+    const auto selected = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--devices", "2"});
+    failures += expect(selected.tp == 1 && selected.device == 2 &&
+                           selected.devices == std::vector<int>{2},
+                       "single explicit rank resolves primary device");
+    for (const std::vector<std::string>& flags :
+         std::vector<std::vector<std::string>>{{"--tp", "2"},
+                                               {"--tp", "3"},
+                                               {"--devices", "0,1"},
+                                               {"--tp", "2", "--devices", "0"},
+                                               {"--tp", "2", "--devices", "0,0"},
+                                               {"--tp", "2", "--devices", "0,"},
+                                               {"--tp", "2", "--devices", "0,-1"},
+                                               {"--tp", "2", "--devices", "0,1,2"},
+                                               {"--tp", "2", "--devices", "1,0", "--device", "0"}}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                std::vector<std::string> args{"ninfer_bench", "--weights", "model.ninfer"};
+                args.insert(args.end(), flags.begin(), flags.end());
+                (void)parse_for_test(std::move(args));
+            },
+            "invalid tensor-parallel device selection");
+    }
+
     failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"ninfer_bench"}); },
                                                      "missing artifact");
     failures += expect_throws<std::invalid_argument>(
         [] {
-            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--capture-generation"});
         },
-        "optimized head without draft tokens");
+        "generation capture needs a JSON report");
     failures += expect_throws<std::invalid_argument>(
         [] {
-            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                                  "--draft-tokens", "8"});
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
         },
-        "unsupported MTP window");
+        "optimized head without MTP");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--spec", "bogus"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
         },
-        "unknown speculative backend");
-    const qb::BenchOptions dflash2 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
-                                                     "--spec", "dflash2", "--draft-tokens", "10",
-                                                     "--lm-head-draft"});
-    failures += expect(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2,
-                       "dflash2 backend selected");
-    failures += expect(dflash2.speculative.draft_tokens == 10, "dflash2 draft window");
+        "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
                 {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
         },
         "misaligned prefill chunk");
-    const qb::BenchOptions fp8 =
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
-    failures += expect(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
-    const qb::BenchOptions nvfp4 =
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"});
-    failures += expect(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16, "NVFP4 KV");
-    const qb::BenchOptions k8v4 =
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "k8v4"});
-    failures += expect(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value, "K8V4 KV");
-    failures += expect(qb::usage_text("ninfer_bench").find("nvfp4|k8v4") != std::string::npos,
-                       "benchmark help omits new KV modes");
-    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Nvfp4Group16), "nvfp4",
-                              "NVFP4 report name");
-    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Fp8KeyNvfp4Value), "k8v4",
-                              "K8V4 report name");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp4"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
         },
         "unsupported KV storage");
     return failures;
@@ -212,6 +219,7 @@ int test_measurement_contract() {
 
 ninfer::GenerationTimings timings(double prepare, double prefill, double decode, double total) {
     return {.prepare_seconds = prepare,
+            .first_token_seconds = prepare + prefill,
             .vision_seconds  = 0.0,
             .prefill_seconds = prefill,
             .decode_seconds  = decode,
@@ -242,6 +250,8 @@ std::vector<qb::TestResult> sample_results() {
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
+    tg.reps[0].generation = qb::CapturedGeneration{
+        {123, 248044, 248044, 42}, "code: \"x\"\n<|im_end|><|im_end|>", ""};
     tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
     tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
@@ -249,46 +259,38 @@ std::vector<qb::TestResult> sample_results() {
 
 qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                 = "RTX 5090";
-    env.cuda_runtime_version     = "13.1";
-    env.cuda_driver_version      = "590.1";
-    env.device_id                = 0;
-    env.artifact_path            = "model.ninfer";
-    env.artifact_file_size_bytes = 17500000000ULL;
-    env.load                     = {.target               = "qwen3_6_27b",
-                                    .weights_id           = "groupwise-int",
-                                    .load_seconds         = 2.5,
-                                    .upload_seconds       = 2.0,
-                                    .artifact_bytes_read  = 17500000000ULL,
-                                    .host_to_device_bytes = 17400000000ULL,
-                                    .peak_staging_bytes   = 134217728ULL,
-                                    .tensor_count         = 1118,
-                                    .resource_count       = 6};
-    env.memory.device            = 0;
-    env.memory.max_context       = 4096;
-    env.memory.kv_capacity       = 8192;
-    env.memory.kv_cache          = ninfer::KvCacheStorage::Int8Group64;
-    env.memory.weights           = {17400000000ULL, 17400000000ULL, 17400000000ULL};
-    env.memory.sequence          = {2000000000ULL, 1900000000ULL, 1900000000ULL};
-    env.memory.workspace         = {100000000ULL, 0, 0};
-    env.memory.vision_workspace  = ninfer::VisionWorkspaceMemorySummary{
-         .aggregate_prompt_tokens = 4096,
-         .max_item_tokens         = 4096,
-         .general_capacity_bytes  = 75000000ULL,
-         .encode_peak_bytes       = 90000000ULL,
-         .handoff_offset_bytes    = 75000000ULL,
-         .handoff_capacity_bytes  = 25000000ULL,
-         .handoff_active_bytes    = 0,
-         .handoff_peak_bytes      = 20000000ULL,
-    };
+    env.gpu_name                          = "RTX 5090";
+    env.cuda_runtime_version              = "13.1";
+    env.cuda_driver_version               = "590.1";
+    env.device_id                         = 1;
+    env.tp                                = 2;
+    env.devices                           = {1, 0};
+    env.artifact_path                     = "model.ninfer";
+    env.artifact_file_size_bytes          = 17500000000ULL;
+    env.load                              = {.target               = "qwen3_6_27b",
+                                             .weights_id           = "groupwise-int",
+                                             .load_seconds         = 2.5,
+                                             .upload_seconds       = 2.0,
+                                             .artifact_bytes_read  = 17500000000ULL,
+                                             .host_to_device_bytes = 17400000000ULL,
+                                             .peak_staging_bytes   = 134217728ULL,
+                                             .tensor_count         = 1118,
+                                             .resource_count       = 6};
+    env.memory.device                     = 0;
+    env.memory.max_context                = 4096;
+    env.memory.kv_capacity                = 8192;
+    env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+    env.memory.workspace                  = {100000000ULL, 0, 0};
+    env.memory.request_transient          = {50000000ULL, 0, 40000000ULL};
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
     env.memory.kv_payload_bytes           = 123456ULL;
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
-    env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
-    env.speculative.draft_tokens          = 5;
-    env.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
+    env.mtp_draft_tokens                  = 5;
+    env.proposal_head                     = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
     env.decode_graph_prime_output_tokens  = 13;
@@ -306,13 +308,18 @@ int test_report_contract() {
     Json report;
     try {
         report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --spec mtp --draft-tokens 5", results));
+            env, "ninfer_bench --weights model.ninfer --mtp-draft-tokens 5", results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 14, "report schema v14");
+    failures += expect(report.at("schema_version") == 12, "report schema v12");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
+    failures += expect(report.at("environment").at("tp") == 2, "report actual TP width");
+    failures += expect(report.at("environment").at("devices") == Json({1, 0}),
+                       "report ordered CUDA devices");
+    failures += expect(report.at("environment").at("device_id") == 1,
+                       "report primary CUDA device");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
     failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
@@ -322,17 +329,13 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
-    failures += expect(
-        report.at("memory").at("vision_workspace").at("general_capacity_bytes") == 75000000ULL &&
-            report.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 25000000ULL,
-        "Vision workspace layout");
+    failures +=
+        expect(report.at("memory").at("request_transient").at("capacity_bytes") == 50000000ULL,
+               "request transient capacity");
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
-    failures += expect(report.at("config").at("speculative_backend") == "mtp", "spec backend");
-    failures += expect(report.at("config").at("draft_tokens") == 5, "spec draft tokens");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
-    failures += expect(report.at("config").at("decode_path") == "mtp_cuda_graph", "decode path");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
 
@@ -364,8 +367,22 @@ int test_report_contract() {
     failures += expect(tg.at("reps").at(0).at("decode_engine_tokens") == 6, "rep engine tokens");
     failures += expect_near(tg.at("reps").at(0).at("timings").at("decode_seconds").get<double>(),
                             0.5, "rep GenerationTimings");
+    failures += expect_near(
+        tg.at("reps").at(0).at("timings").at("first_token_seconds").get<double>(),
+        0.11, "first-token latency retained for decode wall-time comparisons");
     failures += expect(tg.at("reps").at(0).at("speculative").at("drafted_tokens") == 5,
                        "rep SpeculativeStats");
+    const Json& generation = tg.at("reps").at(0).at("generation");
+    failures += expect(generation.at("token_ids") == Json({123, 248044, 248044, 42}),
+                       "captured output preserves repeated special-token IDs");
+    failures += expect(generation.at("content") == "code: \"x\"\n<|im_end|><|im_end|>" &&
+                           generation.at("reasoning") == "",
+                       "captured output text round-trips JSON escaping");
+    failures += expect(generation.at("finish_reason") == "output_limit" &&
+                           generation.at("model_stops_enabled") == false,
+                       "fixed-length generation explicitly identifies disabled model stops");
+    failures += expect(!tg.at("reps").at(1).contains("generation"),
+                       "uncaptured repetition omits generation payload");
     return failures;
 }
 
@@ -377,8 +394,8 @@ int test_human_and_csv_reports() {
     failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
     failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
     failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
-    failures += expect(table.find("spec=mtp") != std::string::npos, "table spec backend");
-    failures += expect(table.find("draft_k=5") != std::string::npos, "table draft window");
+    failures += expect(table.find("tp=2 devices=1,0") != std::string::npos,
+                       "table identifies both devices");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
     failures +=
@@ -388,13 +405,15 @@ int test_human_and_csv_reports() {
     const std::string csv = qb::format_csv(env, results);
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target,weights_id"),
                        "CSV identity columns");
+    failures += expect(csv.find("weights_id,tp,devices,") != std::string::npos,
+                       "CSV tensor-parallel columns");
+    failures += expect(csv.find(",2,\"1,0\",") != std::string::npos,
+                       "CSV device list remains one quoted field");
     for (const std::string_view field :
-         {"speculative_backend", "draft_tokens", "proposal_head", "kv_payload_bytes",
-          "load_host_to_device_bytes",
-          "workspace_general_capacity_bytes", "vision_handoff_capacity_bytes",
-          "cuda_graph_allowance_bytes", "workspace_peak_bytes", "workspace_allocator_peak_bytes",
-          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
-          "total_seconds_mean"}) {
+         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
+          "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
+          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
+          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

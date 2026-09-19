@@ -45,14 +45,58 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+RopeMode parse_rope_mode(const char* text) {
+    const std::string value(text);
+    if (value == "native") { return RopeMode::Native; }
+    if (value == "yarn") { return RopeMode::Yarn; }
+    throw std::invalid_argument("invalid rope: " + value + " (expected native|yarn)");
+}
+
+// Mirrors apps/cli/options.cpp's parser, ERANGE check included: the two front ends must accept and
+// reject exactly the same strings, or a command line that works against the CLI fails against the
+// server for reasons that have nothing to do with the engine.
+double parse_yarn_factor(const char* text) {
+    errno              = 0;
+    char* end          = nullptr;
+    const double value = std::strtod(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !(value >= 1.0) || !(value <= 64.0)) {
+        throw std::invalid_argument(std::string("invalid yarn-factor: ") + text);
+    }
+    return value;
+}
+
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
+}
+
+int parse_tp(const char* text) {
+    const int value = parse_nonnegative_int(text, "tp");
+    if (value != 1 && value != 2) {
+        throw std::invalid_argument(std::string("invalid tp: ") + text + " (must be 1 or 2)");
+    }
+    return value;
+}
+
+std::vector<int> parse_devices(const char* text) {
+    std::vector<int> result;
+    const std::string_view view(text);
+    std::size_t start = 0;
+    while (start <= view.size()) {
+        const std::size_t comma = view.find(',', start);
+        const std::string_view token =
+            comma == std::string_view::npos ? view.substr(start) : view.substr(start, comma - start);
+        if (token.empty()) { throw std::invalid_argument(std::string("invalid devices: ") + text); }
+        result.push_back(parse_nonnegative_int(std::string(token).c_str(), "devices"));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (result.empty() || result.size() > 2) {
+        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    }
+    return result;
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -68,23 +112,20 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--context-cost-presets FILE] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
+           "[--devices N,N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
-           "[--max-private-continuations N] [--max-shared-prefixes N] "
-           "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -102,17 +143,30 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
-           "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
-           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
-           "--host-kv-mib uses MiB\n"
-           "       --default-thinking-budget caps model-origin thinking for enabled requests; "
-           "control tokens count toward the request output limit\n"
+           "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
+           "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
+           "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
+           "       an arbitrary matching token prefix is not a reusable checkpoint.\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --tp selects the tensor-parallel degree (default 1); --tp 2 splits the model "
+           "across two GPUs and requires --devices; it supports --spec mtp but not --spec "
+           "dflash, and not --vision.\n"
+           "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+           "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
+           "primary device.\n"
+           "       --rope selects the rotary regime (default native: the checkpoint\'s own RoPE and "
+           "its registered 262144-position ceiling). --rope yarn applies YaRN frequency correction "
+           "and raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most "
+           "1048576); --yarn-origin must equal the artifact\'s registered native capacity (262144) "
+           "and defaults to it, --yarn-factor defaults to 4.0. YaRN works at either --tp width and "
+           "is rejected with --vision or --spec dflash.\n"
+           "       --no-cuda-graph runs decode eagerly. At --tp 2 that is the same two-stream "
+           "forward pass with cross-device event synchronization, in place of one captured "
+           "cross-device graph; it is the escape hatch if capture ever misbehaves, and it "
+           "produces the same tokens.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -130,7 +184,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
-    bool context_capacity_explicit   = false;
+    bool device_explicit             = false;
+    bool devices_explicit            = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -157,6 +212,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
+        } else if (arg == "--rope") {
+            options.rope_mode = parse_rope_mode(require_value("--rope"));
+        } else if (arg == "--yarn-factor") {
+            options.yarn_factor = parse_yarn_factor(require_value("--yarn-factor"));
+        } else if (arg == "--yarn-origin") {
+            options.yarn_origin = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--yarn-origin"), "yarn-origin"));
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
@@ -172,11 +234,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
-        } else if (arg == "--context-cost-presets") {
-            options.context_cost_presets = require_value("--context-cost-presets");
-            if (options.context_cost_presets.empty()) {
-                throw std::invalid_argument("--context-cost-presets must not be empty");
-            }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -208,36 +265,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
-        } else if (arg == "--device-state-slots") {
-            options.context_cache.device_state_slots = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
-            context_capacity_explicit = true;
-        } else if (arg == "--host-state-slots") {
-            options.context_cache.host_state_slots = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
-            context_capacity_explicit = true;
-        } else if (arg == "--host-kv-mib") {
-            const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
-            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("--host-kv-mib is out of range");
-            }
-            options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
-            context_capacity_explicit                    = true;
-        } else if (arg == "--max-private-continuations") {
-            options.context_cache.max_private_continuations =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--max-private-continuations"), "max-private-continuations"));
-            context_capacity_explicit = true;
-        } else if (arg == "--max-shared-prefixes") {
-            options.context_cache.max_shared_prefixes =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--max-shared-prefixes"), "max-shared-prefixes"));
-            context_capacity_explicit = true;
-        } else if (arg == "--max-long-anchors-per-continuation") {
-            options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
-                                      "max-long-anchors-per-continuation"));
-            context_capacity_explicit = true;
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -258,7 +285,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
-            options.device = parse_nonnegative_int(require_value("--device"), "device");
+            options.device  = parse_nonnegative_int(require_value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = parse_tp(require_value("--tp"));
+        } else if (arg == "--devices") {
+            options.devices  = parse_devices(require_value("--devices"));
+            devices_explicit = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -271,13 +304,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
-        } else if (arg == "--default-thinking-budget") {
-            const std::uint64_t budget =
-                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
-            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::invalid_argument("--default-thinking-budget is out of range");
-            }
-            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
@@ -299,9 +325,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.top_p =
                 parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
         } else if (arg == "--top-k") {
-            const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
-            options.sampling_overrides.top_k = top_k;
+            options.sampling_overrides.top_k =
+                parse_nonnegative_int(require_value("--top-k"), "top-k");
         } else if (arg == "--min-p") {
             options.sampling_overrides.min_p =
                 parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
@@ -315,8 +340,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
-        } else if (arg == "--log-level") {
-            options.log_level = product::parse_log_level(require_value("--log-level"));
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
@@ -324,14 +347,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
-    if (!options.allow_prefix_reuse) {
-        if (context_capacity_explicit) {
-            throw std::invalid_argument(
-                "--no-prefix-reuse cannot be combined with context-cache capacity options");
+    if (devices_explicit) {
+        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+            throw std::invalid_argument("--devices must list exactly --tp device ids");
         }
-        options.context_cache.enabled                = false;
-        options.context_cache.host_state_slots       = 0;
-        options.context_cache.host_kv_capacity_bytes = 0;
+        if (device_explicit && options.devices.front() != options.device) {
+            throw std::invalid_argument("--device and --devices disagree on the primary device");
+        }
+        options.device = options.devices.front();
+    } else if (options.tp == 1) {
+        options.devices = {options.device};
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
@@ -357,6 +382,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
+        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

@@ -1,0 +1,68 @@
+NInfer
+======
+
+This product includes software developed as the NInfer project.
+
+Original work
+-------------
+Copyright the Neroued/ninfer contributors.
+Source: https://github.com/Neroued/ninfer
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Modifications
+-------------
+Copyright 2026 Wael Mansour.
+Source: https://github.com/wamansou/ninfer-tp2-1m
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This tree is a fork of Neroued/ninfer at commit feaf4dd. The modifications add
+tensor-parallel execution across two GPUs and YaRN positional scaling for
+1,048,576-token contexts to the 27B execution package. They touch, in summary:
+
+  * src/core           two-device ExecutionContext; per-device arenas, streams
+                       and graph objects; per-device memoization of kernel
+                       attribute opt-ins
+  * src/ops            allreduce_sum and allgather collectives; column- and
+                       row-parallel split forms of the nine Op families that
+                       carry sharded weights; a 12-Q-head/2-KV-head GQA
+                       geometry; a YaRN frequency-buffer rope kernel; a
+                       1,048,576-key visible-key domain and the shared-memory
+                       accounting that goes with it
+  * src/artifact       sharded weight and shard plans, and the materialization
+                       that binds a shard of a tensor to one device
+  * src/targets        two-rank Program wiring: split prefill, decode, MTP and
+                       output-head schedules; cross-device graph capture and
+                       replay; peer state publication
+  * src/runtime,       --tp / --devices / --rope / --yarn-* plumbing through the
+    src/serve, apps    public Engine, the CLI and the server
+  * eval/, tools/tp2/  1M needle, soak and power runners; P2P, capture and
+                       transport probes; the tp1-to-tp2 parity harness; the
+                       vLLM YaRN reference dumper
+  * tests/, scripts/   split-Op oracles, dual-device integration and graph
+                       tests, the YaRN drift guard, and the tp1 golden-token
+                       identity gate against upstream feaf4dd
+
+That upstream TP2 revision preserved single-GPU (--tp 1) behaviour from
+feaf4dd; see tests/data/tp1-golden/MANIFEST.md for its token-level comparison.
+Those measurements do not qualify the later Volta execution paths below.
+
+Volta and V100 Duo modifications
+-----------------------------
+This fork incorporates Volta CUDA kernels and build support from
+https://github.com/geoffwatts/ninfer-v100, distributed under the Apache
+License, Version 2.0.
+
+The V100 Duo integration at https://github.com/tuxKOH/ninfer-V100-Duo combines
+that work with the RTX 3060 TP2 branch. It adds preserved GGUF Q4_K/Q6_K
+artifact conversion and execution, Volta long-context INT8 attention,
+verified two-device transport, and the corresponding validation and tools.
+The integration is distributed under the Apache License, Version 2.0.
+
+Model artifacts
+---------------
+The published artifacts are derived from Qwen/Qwen3.6-27B, Qwen/Qwen3.8-27B and
+Qwen/Qwen3.6-35B-A3B, and from the packed-weight repackagings named in the
+README's License section. Those source repositories are distributed under the
+Apache License, Version 2.0.
+
+Vendored dependencies retain their own license files under third_party/.

@@ -27,17 +27,33 @@ void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden
     });
 }
 
-void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
-                              cudaStream_t stream) {
+namespace {
+
+template <int AttnRows, int QRows, int KvRows>
+void launch_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
+                          cudaStream_t stream) {
     constexpr int kBlock = 256;
-    const std::int64_t n = static_cast<std::int64_t>(attn_in.ne[0]) * attn_in.ne[1];
+    const std::int64_t n = static_cast<std::int64_t>(AttnRows) * attn_in.ne[1];
     const int grid =
         static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
-    mtp_split_attn_in_kernel<<<grid, kBlock, 0, stream>>>(
+    mtp_split_attn_in_kernel<AttnRows, QRows, KvRows><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(attn_in.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(gate.data),
         static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1]);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
+                              cudaStream_t stream) {
+    // The wrapper has already accepted exactly one of the two registered row geometries.
+    if (attn_in.ne[0] == kMtpAttnRowsTp2) {
+        launch_split_attn_in<kMtpAttnRowsTp2, kMtpQRowsTp2, kMtpKvRowsTp2>(attn_in, q, k, gate, v,
+                                                                           stream);
+        return;
+    }
+    launch_split_attn_in<kMtpAttnRows, kMtpQRows, kMtpKvRows>(attn_in, q, k, gate, v, stream);
 }
 
 } // namespace ninfer::ops::detail

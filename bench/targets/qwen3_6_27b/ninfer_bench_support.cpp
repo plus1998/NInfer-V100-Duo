@@ -1,7 +1,5 @@
 #include "ninfer_bench_support.h"
 
-#include "product/speculative_options.h"
-
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -53,10 +51,7 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
+    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -71,6 +66,35 @@ std::vector<int> parse_int_list(std::string_view value, const char* label) {
         start = comma + 1;
     }
     return out;
+}
+
+std::vector<int> parse_devices(std::string_view value) {
+    std::vector<int> devices;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t comma = value.find(',', start);
+        devices.push_back(parse_nonnegative(
+            value.substr(start, comma == std::string_view::npos ? comma : comma - start),
+            "device"));
+        if (comma == std::string_view::npos) { break; }
+        start = comma + 1;
+    }
+    if (devices.size() > 2) {
+        throw std::invalid_argument("--devices must list 1 or 2 device ids");
+    }
+    if (devices.size() == 2 && devices[0] == devices[1]) {
+        throw std::invalid_argument("--devices must list distinct device ids");
+    }
+    return devices;
+}
+
+std::string device_list(const std::vector<int>& devices) {
+    std::ostringstream out;
+    for (std::size_t rank = 0; rank < devices.size(); ++rank) {
+        if (rank != 0) { out << ','; }
+        out << devices[rank];
+    }
+    return out.str();
 }
 
 std::vector<std::pair<int, int>> parse_pair_list(std::string_view value, const char* label) {
@@ -201,26 +225,6 @@ void append_arena_json(std::ostringstream& out, std::string_view name,
     out << '\n';
 }
 
-void append_vision_workspace_json(std::ostringstream& out,
-                                  const std::optional<VisionWorkspaceMemorySummary>& vision,
-                                  std::string_view indent, bool trailing_comma) {
-    out << indent << "\"vision_workspace\": ";
-    if (!vision) {
-        out << "null";
-    } else {
-        out << "{\"aggregate_prompt_tokens\": " << vision->aggregate_prompt_tokens
-            << ", \"max_item_tokens\": " << vision->max_item_tokens
-            << ", \"general_capacity_bytes\": " << vision->general_capacity_bytes
-            << ", \"encode_peak_bytes\": " << vision->encode_peak_bytes
-            << ", \"handoff_offset_bytes\": " << vision->handoff_offset_bytes
-            << ", \"handoff_capacity_bytes\": " << vision->handoff_capacity_bytes
-            << ", \"handoff_active_bytes\": " << vision->handoff_active_bytes
-            << ", \"handoff_peak_bytes\": " << vision->handoff_peak_bytes << '}';
-    }
-    if (trailing_comma) { out << ','; }
-    out << '\n';
-}
-
 void append_speculative_json(std::ostringstream& out, const SpeculativeStats& stats,
                              std::string_view indent) {
     out << indent << "\"speculative\": {\n"
@@ -255,6 +259,7 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
 void append_timings_json(std::ostringstream& out, const GenerationTimings& timings,
                          std::string_view indent) {
     out << indent << "\"timings\": {" << "\"prepare_seconds\": " << number(timings.prepare_seconds)
+        << ", " << "\"first_token_seconds\": " << number(timings.first_token_seconds)
         << ", " << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "
@@ -268,14 +273,12 @@ std::uint32_t BenchTest::requested_output_tokens() const {
                            "requested benchmark output");
 }
 
-std::uint32_t BenchTest::required_context(std::uint32_t draft_tokens) const {
+std::uint32_t BenchTest::required_context(std::uint32_t mtp_draft_tokens) const {
     const std::uint64_t prompt =
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
-    const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
-    // Speculative decode overshoots the requested output by up to a draft window's worth of
-    // tokens before the last round is trimmed back; the margin applies to any backend.
-    const std::uint64_t margin = draft_tokens == 0 ? 0 : 2ULL * draft_tokens;
-    return checked_context(prompt + decode + margin, "benchmark context requirement");
+    const std::uint64_t decode     = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
+    const std::uint64_t mtp_margin = mtp_draft_tokens == 0 ? 0 : 2ULL * mtp_draft_tokens;
+    return checked_context(prompt + decode + mtp_margin, "benchmark context requirement");
 }
 
 std::string usage_text(std::string_view program) {
@@ -297,13 +300,15 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
-        << "  --spec <none|mtp|dflash|dflash2>  speculative backend (default: none)\n"
-        << "  --draft-tokens <n>          speculative draft window; range depends on --spec\n"
-        << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens > 0\n"
+        << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
+        << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
+        << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+        << "  --tp <1|2>                  tensor-parallel width (default: 1)\n"
+        << "  --devices <id[,id]>         one CUDA device per rank; required for --tp 2\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
+        << "  --capture-generation        retain measured output IDs/text in JSON reports\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write report to a file\n"
         << "  -h, --help                  show this help\n\n"
@@ -315,6 +320,8 @@ std::string usage_text(std::string_view program) {
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
     bool saw_artifact = false;
+    bool device_explicit = false;
+    bool devices_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto value = [&](const char* flag) -> std::string {
@@ -351,18 +358,31 @@ BenchOptions parse_args(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
-        } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value("--spec"));
-        } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens", true);
+        } else if (arg == "--mtp-draft-tokens") {
+            options.mtp_draft_tokens =
+                parse_u32(value("--mtp-draft-tokens"), "mtp-draft-tokens", true);
+            if (options.mtp_draft_tokens > kMaxMtpDraftTokens) {
+                throw std::invalid_argument("--mtp-draft-tokens must be in [0,5]");
+            }
         } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
+            options.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--tp") {
+            options.tp = parse_positive(value("--tp"), "tp");
+            if (options.tp != 1 && options.tp != 2) {
+                throw std::invalid_argument("--tp must be 1 or 2");
+            }
+        } else if (arg == "--devices") {
+            options.devices = parse_devices(value("--devices"));
+            devices_explicit = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--profile-measured") {
             options.profile_measured = true;
+        } else if (arg == "--capture-generation") {
+            options.capture_generation = true;
         } else if (arg == "-o" || arg == "--output") {
             const std::string selected = value("--output");
             if (selected == "table") {
@@ -381,14 +401,29 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
+    if (options.capture_generation && options.output != OutputFormat::Json) {
+        throw std::invalid_argument("--capture-generation requires --output json");
+    }
+    if (devices_explicit) {
+        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
+            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        }
+        if (device_explicit && options.device != options.devices.front()) {
+            throw std::invalid_argument("--device and --devices disagree on the primary device");
+        }
+        options.device = options.devices.front();
+    } else if (options.tp == 1) {
+        options.devices = {options.device};
+    } else {
+        throw std::invalid_argument("--tp 2 requires --devices");
+    }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.speculative.proposal_head == ProposalHead::Optimized &&
-        options.speculative.draft_tokens == 0) {
-        throw std::invalid_argument("--lm-head-draft requires --draft-tokens greater than zero");
+    if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
+        throw std::invalid_argument(
+            "--lm-head-draft requires --mtp-draft-tokens greater than zero");
     }
-    product::validate_speculative_cli_options(options.speculative);
     return options;
 }
 
@@ -417,15 +452,15 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options) {
 
 std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
                                   std::optional<std::uint32_t> override_max_context,
-                                  std::uint32_t draft_tokens, bool use_cuda_graph) {
-    if (draft_tokens > kMaxDraftTokens) {
-        throw std::invalid_argument("draft window must be in [0,15]");
+                                  std::uint32_t mtp_draft_tokens, bool use_cuda_graph) {
+    if (mtp_draft_tokens > kMaxMtpDraftTokens) {
+        throw std::invalid_argument("mtp draft window must be in [0,5]");
     }
     std::uint32_t required = 0;
     std::string driver;
     bool has_decode = false;
     for (const BenchTest& test : tests) {
-        const std::uint32_t candidate = test.required_context(draft_tokens);
+        const std::uint32_t candidate = test.required_context(mtp_draft_tokens);
         if (candidate > required) {
             required = candidate;
             driver   = test.label;
@@ -433,7 +468,7 @@ std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
         has_decode = has_decode || test.has_decode();
     }
     if (use_cuda_graph && has_decode) {
-        const std::uint32_t candidate = decode_graph_prime_required_context(draft_tokens);
+        const std::uint32_t candidate = decode_graph_prime_required_context(mtp_draft_tokens);
         if (candidate > required) {
             required = candidate;
             driver   = "decode graph prime";
@@ -479,22 +514,21 @@ std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prom
     return {corpus.begin(), corpus.begin() + n_prompt};
 }
 
-std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& speculative) {
-    const std::string suffix = use_cuda_graph ? "_cuda_graph" : "_eager";
-    if (speculative.backend == SpeculativeBackend::None) {
-        return use_cuda_graph ? "cuda_graph" : "eager";
+std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens) {
+    if (mtp_draft_tokens != 0) { return use_cuda_graph ? "mtp_cuda_graph" : "mtp_eager"; }
+    return use_cuda_graph ? "cuda_graph" : "eager";
+}
+
+std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens) {
+    if (mtp_draft_tokens > kMaxMtpDraftTokens) {
+        throw std::invalid_argument("mtp draft window must be in [0,5]");
     }
-    return std::string(product::speculative_backend_name(speculative.backend)) + suffix;
+    return mtp_draft_tokens == 0 ? 3 : 2 * (mtp_draft_tokens + 1) + 1;
 }
 
-std::uint32_t decode_graph_prime_output_tokens(std::uint32_t draft_tokens) {
-    if (draft_tokens > kMaxDraftTokens) { throw std::invalid_argument("draft window must be in [0,15]"); }
-    return draft_tokens == 0 ? 3 : 2 * (draft_tokens + 1) + 1;
-}
-
-std::uint32_t decode_graph_prime_required_context(std::uint32_t draft_tokens) {
-    const std::uint64_t outputs = decode_graph_prime_output_tokens(draft_tokens);
-    return checked_context(outputs + (draft_tokens == 0 ? 0 : 2ULL * draft_tokens),
+std::uint32_t decode_graph_prime_required_context(std::uint32_t mtp_draft_tokens) {
+    const std::uint64_t outputs = decode_graph_prime_output_tokens(mtp_draft_tokens);
+    return checked_context(outputs + (mtp_draft_tokens == 0 ? 0 : 2ULL * mtp_draft_tokens),
                            "decode graph prime context requirement");
 }
 
@@ -577,6 +611,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  target:     " << env.load.target << '\n'
         << "  weights:    " << env.load.weights_id << '\n'
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
+        << "  parallel:   tp=" << env.tp << " devices=" << device_list(env.devices) << '\n'
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
         << "  artifact:   " << env.artifact_path << " (" << env.artifact_file_size_bytes
@@ -587,20 +622,15 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.load.peak_staging_bytes) << '\n'
         << "  memory:     weights " << format_bytes(env.memory.weights.capacity_bytes)
         << ", sequence " << format_bytes(env.memory.sequence.capacity_bytes) << ", workspace "
-        << format_bytes(env.memory.workspace.capacity_bytes) << ", Vision handoff "
-        << (env.memory.vision_workspace
-                ? format_bytes(env.memory.vision_workspace->handoff_capacity_bytes)
-                : "disabled")
-        << " (within workspace), graph allowance "
+        << format_bytes(env.memory.workspace.capacity_bytes) << ", request transient "
+        << format_bytes(env.memory.request_transient.capacity_bytes) << ", graph allowance "
         << format_bytes(env.memory.cuda_graph_allowance_bytes) << ", KV payload "
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " kv_cache=" << kv_cache_name(env.kv_cache)
-        << " spec=" << product::speculative_backend_name(env.speculative.backend)
-        << " draft_k=" << env.speculative.draft_tokens
-        << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
-        << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << " kv_cache=" << kv_cache_name(env.kv_cache) << " mtp_k=" << env.mtp_draft_tokens
+        << " proposal_head=" << proposal_head_name(env.proposal_head)
+        << " decode_path=" << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens)
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -657,7 +687,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"environment\": {\"gpu_name\": \"" << json_escape(env.gpu_name)
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
         << "\", \"cuda_driver_version\": \"" << json_escape(env.cuda_driver_version)
-        << "\", \"device_id\": " << env.device_id << "},\n"
+        << "\", \"device_id\": " << env.device_id << ", \"tp\": " << env.tp
+        << ", \"devices\": [" << device_list(env.devices) << "]},\n"
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
         << "  \"load\": {\n"
@@ -685,7 +716,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
-    append_vision_workspace_json(out, env.memory.vision_workspace, "    ", true);
+    append_arena_json(out, "request_transient", env.memory.request_transient, "    ", true);
     out << "    \"minimum_runtime_reservation_bytes\": "
         << env.memory.minimum_runtime_reservation_bytes << ",\n"
         << "    \"kv_capacity_increment_bytes\": " << env.memory.kv_capacity_increment_bytes
@@ -698,19 +729,17 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
+        << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
-        << "    \"speculative_backend\": \""
-        << product::speculative_backend_name(env.speculative.backend) << "\",\n"
-        << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
-        << "    \"proposal_head\": \"" << proposal_head_name(env.speculative.proposal_head)
-        << "\",\n"
+        << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
+        << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
-        << "    \"decode_path\": \"" << decode_path_name(env.use_cuda_graph, env.speculative)
+        << "    \"decode_path\": \"" << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens)
         << "\",\n"
         << "    \"decode_graph_prime\": {\"primed\": "
         << (env.decode_graph_primed ? "true" : "false")
@@ -762,6 +791,18 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");
+            if (rep.generation) {
+                // run_repetition validates OutputLimit before retaining any generation. Model
+                // stops remain disabled: this is fixed-length stress output, including any EOS.
+                out << ",\n          \"generation\": {\"finish_reason\": \"output_limit\", "
+                       "\"model_stops_enabled\": false, \"token_ids\": [";
+                for (std::size_t token = 0; token < rep.generation->token_ids.size(); ++token) {
+                    if (token != 0) { out << ','; }
+                    out << rep.generation->token_ids[token];
+                }
+                out << "], \"content\": \"" << json_escape(rep.generation->content)
+                    << "\", \"reasoning\": \"" << json_escape(rep.generation->reasoning) << "\"}";
+            }
             out << "\n        }" << (r + 1 == result.reps.size() ? "" : ",") << '\n';
         }
         out << "      ]\n    }" << (i + 1 == results.size() ? "" : ",") << '\n';
@@ -772,12 +813,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "label,kind,n_prompt,n_gen,target,weights_id,max_context,prefill_chunk,"
-           "speculative_backend,draft_tokens,"
+    out << "label,kind,n_prompt,n_gen,target,weights_id,tp,devices,max_context,prefill_chunk,mtp_draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
-           "workspace_general_capacity_bytes,vision_handoff_capacity_bytes,"
-           "cuda_graph_allowance_bytes,"
+           "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
            "spec_rounds,spec_fallback_steps,spec_acceptance_rate,"
            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
@@ -797,24 +836,16 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                                                     static_cast<double>(spec.drafted_tokens));
         out << result.test.label << ',' << kind_string(result.test.kind) << ','
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.target << ','
-            << env.load.weights_id << ',' << env.max_context << ',' << env.prefill_chunk << ','
-            << product::speculative_backend_name(env.speculative.backend) << ','
-            << env.speculative.draft_tokens << ','
-            << proposal_head_name(env.speculative.proposal_head) << ','
-            << decode_path_name(env.use_cuda_graph, env.speculative) << ','
+            << env.load.weights_id << ',' << env.tp << ",\"" << device_list(env.devices)
+            << "\"," << env.max_context << ',' << env.prefill_chunk << ','
+            << env.mtp_draft_tokens << ',' << proposal_head_name(env.proposal_head) << ','
+            << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens) << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
-            << ','
-            << (env.memory.vision_workspace
-                    ? std::to_string(env.memory.vision_workspace->general_capacity_bytes)
-                    : std::to_string(env.memory.workspace.capacity_bytes))
-            << ','
-            << (env.memory.vision_workspace
-                    ? std::to_string(env.memory.vision_workspace->handoff_capacity_bytes)
-                    : std::string())
-            << ',' << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes
-            << ',' << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
+            << ',' << env.memory.request_transient.capacity_bytes << ','
+            << env.memory.cuda_graph_allowance_bytes << ',' << result.workspace_peak_bytes << ','
+            << result.workspace_allocator_peak_bytes << ',' << spec.rounds << ','
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
             << ',' << mean(decode_output_tok_s_series(result)) << ','
@@ -866,12 +897,6 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "bf16";
     case KvCacheStorage::Int8Group64:
         return "int8-group64";
-    case KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-row256";
-    case KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
     }
     return "unknown";
 }

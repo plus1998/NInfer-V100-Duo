@@ -52,45 +52,27 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
     return result.bits;
 }
 
-// The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
-template <class Schedule>
-union alignas(16) W8SmallTMmaSharedStorage {
-    struct {
-        std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kGroupK];
-        __nv_bfloat16 activations[Schedule::kKWarps]
-                                 [Schedule::kTileTokens * Schedule::kTileKPerWarp];
-        std::uint8_t scales[Schedule::kRowsPerCta]
-                           [Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
-                                ? Schedule::kScaleBytesPerRow
-                                : 1];
-    } staging;
-
-    float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
-};
-
-struct W8SmallTMmaIdentityColumns {
-    __device__ __forceinline__ int operator()(int column) const { return column; }
-};
-
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
-          bool DirectPairEpilogue = false, bool TiledColumns = false,
-          class ColumnPolicy = W8SmallTMmaIdentityColumns>
-__device__ __forceinline__ void
-w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-               const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
-               RowPolicy row_policy = {}, std::int32_t columns = ActiveCols,
-               ColumnPolicy column_policy = {}) {
+          bool DirectPairEpilogue = false>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
+    RowPolicy row_policy = {}) {
+// ldmatrix (sm_75+) + mma.m16n8k16 (sm_80+), same as every other tensor-core kernel this
+// port has hit. Unlike rowsplit_grouped_mma.cuh / bf16_gdn_gating_proj_gemm_mma.cuh, this
+// one genuinely IS on the decode-critical path (vocabulary/gate-up/down/attention-in-out
+// projections — see the V100 performance summary), so it doesn't just get trapped and forgotten:
+// launch_w8_small_t (w8_small_t.cu) routes to the already-Volta-validated warp-per-row
+// SIMT kernel (w8_rowsplit_gemm_simt.cuh) instead below sm_80, via the NINFER_VOLTA_BUILD
+// host-side signal (CMakeLists.txt) — __CUDA_ARCH__ isn't visible in that host function,
+// so the kernel body itself still needs its own guard purely so it compiles.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-    // ldmatrix (sm_75+) + mma.m16n8k16 (sm_80+) have no Volta hardware. launch_w8_small_t
-    // (w8_small_t.cu) routes Volta through the SIMT kernel; this body is compiled but
-    // unreachable below sm_80, guarded only so ptxas accepts the PTX.
-    const int column_offset = TiledColumns ? static_cast<int>(blockIdx.y) * ActiveCols : 0;
-    const int live_columns  = TiledColumns ? min(ActiveCols, columns - column_offset) : ActiveCols;
-    constexpr int kHidden   = Geometry::kInputRows;
-    constexpr int kTileK    = Schedule::kTileKPerWarp;
-    constexpr int kWarps    = Schedule::kKWarps;
-    constexpr int kMmaRows  = Schedule::kRowsPerCta;
+    constexpr int kHidden     = Geometry::kInputRows;
+    constexpr int kTileK      = Schedule::kTileKPerWarp;
+    constexpr int kWarps      = Schedule::kKWarps;
+    constexpr int kMmaRows    = Schedule::kRowsPerCta;
     constexpr int kRowsPerCta = Schedule::kRowsPerCta;
     constexpr int kGroupK     = Schedule::kGroupK;
     constexpr int kGroups     = kHidden / kGroupK;
@@ -101,14 +83,19 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
-    using SharedStorage = W8SmallTMmaSharedStorage<Schedule>;
+    union SharedStorage {
+        struct {
+            std::uint8_t codes[kMmaRows][kGroupK];
+            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
+            std::uint8_t scales[kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                              ? Schedule::kScaleBytesPerRow
+                                              : 1];
+        } staging;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
-    __shared__ __align__(
-        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
-    extern __shared__ __align__(16) unsigned char dynamic_shared[];
-    auto& shared =
-        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
+        float partial[kWarps * kNt * 32 * 4];
+    };
+
+    __shared__ __align__(16) SharedStorage shared;
     auto& code_shared  = shared.staging.codes;
     auto& b_shared     = shared.staging.activations;
     auto& scale_shared = shared.staging.scales;
@@ -131,26 +118,16 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
             auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
-            if constexpr (TiledColumns) {
-                const int source_col = col < live_columns ? col : 0;
-                cp_async_zfill<16, Schedule::kActivationCache>(
-                    dst,
-                    &x[static_cast<std::int64_t>(column_policy(column_offset + source_col)) *
-                           kHidden +
-                       group_k0 + warp * kTileK + k8 * 8],
-                    col < live_columns ? 16 : 0);
-            } else if constexpr (!kPaddedStage || ActiveCols == kTileCols) {
+            if constexpr (!kPaddedStage || ActiveCols == kTileCols) {
                 cp_async<16, Schedule::kActivationCache>(
-                    dst,
-                    &x[static_cast<std::int64_t>(column_policy(column_offset + col)) * kHidden +
-                       group_k0 + warp * kTileK + k8 * 8]);
+                    dst, &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + warp * kTileK +
+                            k8 * 8]);
             } else {
                 const int source_col = col < ActiveCols ? col : 0;
                 cp_async_zfill<16, Schedule::kActivationCache>(
                     dst,
-                    &x[static_cast<std::int64_t>(column_policy(column_offset + source_col)) *
-                           kHidden +
-                       group_k0 + warp * kTileK + k8 * 8],
+                    &x[static_cast<std::int64_t>(source_col) * kHidden + group_k0 + warp * kTileK +
+                       k8 * 8],
                     col < ActiveCols ? 16 : 0);
             }
         }
@@ -315,7 +292,8 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
     __syncthreads();
 
     if (k_split == 0) {
-        float* projected = partial;
+        const W8OutputTile output_tile = output.tile(cta_row0);
+        float* projected               = partial;
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             float4 sum = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
@@ -332,10 +310,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
             if constexpr (std::is_same_v<Epilogue, W8SmallTMmaStoreEpilogue> ||
                           std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
                 const auto store = [&](int row, int col, float value) {
-                    if constexpr (TiledColumns) {
-                        if (col >= live_columns) return;
-                    }
-                    __nv_bfloat16* destination = output.tile(cta_row0).at(row, col + column_offset);
+                    __nv_bfloat16* destination = output_tile.at(row, col);
                     if constexpr (std::is_same_v<Epilogue, W8SmallTMmaResidualEpilogue>) {
                         value += __bfloat162float(*destination);
                     }
@@ -350,8 +325,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
                     store(cta_row0 + gid + 8, col0 + 1, sum.w);
                 }
             } else if constexpr (DirectPairEpilogue) {
-                epilogue.store_pair(cta_row0 + gid, col0 + column_offset, sum,
-                                    TiledColumns ? columns : ActiveCols);
+                epilogue.template store_pair<ActiveCols>(cta_row0 + gid, col0, sum);
             } else {
                 if (col0 < ActiveCols) {
                     projected[gid * kTileCols + col0]       = sum.x;
@@ -377,20 +351,15 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
             }
         }
     }
-#endif
-}
-
-// Standard projection entry. Multi-layer fused Ops call the same contraction after selecting
-// their independent weight views and provide a closed FP32 epilogue.
-template <class Geometry, int ActiveCols, class Schedule, class Output,
-          class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
-          bool DirectPairEpilogue = false, bool TiledColumns = false>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t_mma_kernel(
-    const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* scales, Output output,
-    Epilogue epilogue = {}, RowPolicy row_policy = {}, std::int32_t columns = ActiveCols) {
-    w8_small_t_mma<Geometry, ActiveCols, Schedule, Output, Epilogue, RowPolicy, DirectPairEpilogue,
-                   TiledColumns>(x, codes, scales, output, epilogue, row_policy, columns);
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)codes;
+    (void)scales;
+    (void)output;
+    (void)epilogue;
+    (void)row_policy;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

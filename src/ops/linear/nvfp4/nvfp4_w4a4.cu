@@ -52,8 +52,11 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    constexpr bool kResidualGeometry = std::is_same_v<Geometry, Nvfp4Residual6144Geometry> ||
-                                       std::is_same_v<Geometry, Nvfp4Residual17408Geometry>;
+    // Schedule selection is inherited from the tp1 parent, so a shard keeps the family's measured
+    // choice instead of drifting onto whichever branch its halved extent happens to fall into.
+    using Parent                     = Nvfp4ParentGeometryType<Geometry>;
+    constexpr bool kResidualGeometry = std::is_same_v<Parent, Nvfp4Residual6144Geometry> ||
+                                       std::is_same_v<Parent, Nvfp4Residual17408Geometry>;
     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear(
@@ -76,7 +79,7 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
     } else if (tokens <= 384) {
         launch_gemm<Geometry, M128N128Resident>(weight, out, workspace, tokens, stream);
     } else if (tokens <= 512) {
-        if constexpr (Geometry::kOutputRows == Nvfp4GdnInputGeometry::kOutputRows) {
+        if constexpr (Parent::kOutputRows == Nvfp4GdnInputGeometry::kOutputRows) {
             launch_gemm<Geometry, M128N128Resident>(weight, out, workspace, tokens, stream);
         } else {
             launch_gemm<Geometry, M128N128Pipelined>(weight, out, workspace, tokens, stream);
@@ -103,6 +106,13 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     case Nvfp4Activation17408Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream);
         return;
+    // Row-parallel tp2 halves: a rank quantizes only its own block of the activation rows.
+    case Nvfp4Activation3072Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation3072Geometry>(x, weight, workspace, stream);
+        return;
+    case Nvfp4Activation8704Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation8704Geometry>(x, weight, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }
@@ -113,21 +123,12 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
-    case Nvfp4Problem::AttnInput:
-        launch_problem<Nvfp4AttnInputGeometry>(weight, out, workspace, tokens, stream);
+#define NINFER_NVFP4_W4A4_CASE(name, geometry)                                                     \
+    case Nvfp4Problem::name:                                                                       \
+        launch_problem<geometry>(weight, out, workspace, tokens, stream);                          \
         return;
-    case Nvfp4Problem::GdnInput:
-        launch_problem<Nvfp4GdnInputGeometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Nvfp4Problem::MlpGateUp:
-        launch_problem<Nvfp4MlpGateUpGeometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Nvfp4Problem::Residual6144:
-        launch_problem<Nvfp4Residual6144Geometry>(weight, out, workspace, tokens, stream);
-        return;
-    case Nvfp4Problem::Residual17408:
-        launch_problem<Nvfp4Residual17408Geometry>(weight, out, workspace, tokens, stream);
-        return;
+        NINFER_NVFP4_LINEAR_PROBLEMS(NINFER_NVFP4_W4A4_CASE)
+#undef NINFER_NVFP4_W4A4_CASE
     }
 }
 

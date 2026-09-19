@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/launcher/kernel_attr_once.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_gemm_mma_config.h"
 
@@ -24,10 +25,9 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
                                          Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attr = cudaFuncSetAttribute(
+        ensure_func_attr_per_device(
             bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16MmaContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attr);
     }
     bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
@@ -55,6 +55,17 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
     }
     if (weight.n == 5120 && weight.k == 6144) {
         launch_geometry<Bf16GemvGeometry<5120, 6144>>(x, weight, out, stream);
+        return;
+    }
+    // TP2 shards of the two registered problems: the same kernel and the same measured schedule,
+    // instantiated at the halved extent, so the column shard's grid is exactly half the parent's
+    // along the output axis and the row shard's K loop exactly half as long.
+    if (weight.n == 7168 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<7168, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 3072) {
+        launch_geometry<Bf16GemvGeometry<5120, 3072>>(x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("bf16 linear MMA: unsupported exact problem");

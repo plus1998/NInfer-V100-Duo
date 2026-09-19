@@ -30,8 +30,13 @@ std::string cuda_version_string(int version) {
     return std::to_string(version / 1000) + "." + std::to_string((version % 1000) / 10);
 }
 
-void fill_cuda_environment(ninfer::bench::BenchEnvironment& env, int device) {
-    env.device_id       = device;
+void fill_cuda_environment(ninfer::bench::BenchEnvironment& env) {
+    env.tp = env.load.tp;
+    env.devices.clear();
+    for (int rank = 0; rank < env.tp; ++rank) {
+        env.devices.push_back(env.load.devices[rank].device);
+    }
+    env.device_id = env.devices.front();
     int runtime_version = 0;
     if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
         env.cuda_runtime_version = cuda_version_string(runtime_version);
@@ -41,7 +46,7 @@ void fill_cuda_environment(ninfer::bench::BenchEnvironment& env, int device) {
         env.cuda_driver_version = cuda_version_string(driver_version);
     }
     cudaDeviceProp properties{};
-    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+    if (cudaGetDeviceProperties(&properties, env.device_id) == cudaSuccess) {
         env.gpu_name = properties.name;
     }
 }
@@ -72,7 +77,8 @@ ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
 
 ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
                                         const ninfer::bench::BenchTest& test,
-                                        const std::vector<ninfer::TokenId>& corpus) {
+                                        const std::vector<ninfer::TokenId>& corpus,
+                                        bool capture_generation = false) {
     const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
                                   ? ninfer::bench::kDecodeSeedTokens
                                   : test.n_prompt;
@@ -94,6 +100,11 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
     timing.timings                 = generated.timings;
     timing.speculative             = std::move(generated.speculative);
     timing.generated_output_tokens = expected;
+    if (capture_generation) {
+        timing.generation = ninfer::bench::CapturedGeneration{
+            std::move(generated.generated_token_ids), std::move(generated.content),
+            std::move(generated.reasoning)};
+    }
     return timing;
 }
 
@@ -145,17 +156,23 @@ int main(int argc, char** argv) {
         }
         ninfer::bench::validate_prompt_lengths(tests, corpus.size());
         const std::uint32_t max_context = ninfer::bench::resolve_max_context(
-            tests, options.max_context, options.speculative.draft_tokens, options.use_cuda_graph);
+            tests, options.max_context, options.mtp_draft_tokens, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path  = options.artifact_path;
-        engine_options.device         = options.device;
-        engine_options.max_context    = max_context;
-        engine_options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
-        engine_options.prefill_chunk  = options.prefill_chunk;
-        engine_options.kv_cache       = options.kv_cache;
-        engine_options.speculative    = options.speculative;
-        engine_options.use_cuda_graph = options.use_cuda_graph;
+        engine_options.artifact_path = options.artifact_path;
+        engine_options.device        = options.device;
+        engine_options.tp            = options.tp;
+        engine_options.devices       = options.devices;
+        engine_options.max_context   = max_context;
+        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.prefill_chunk = options.prefill_chunk;
+        engine_options.kv_cache      = options.kv_cache;
+        engine_options.speculative.backend       = options.mtp_draft_tokens == 0
+                                                       ? ninfer::SpeculativeBackend::None
+                                                       : ninfer::SpeculativeBackend::Mtp;
+        engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
+        engine_options.speculative.proposal_head = options.proposal_head;
+        engine_options.use_cuda_graph            = options.use_cuda_graph;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
@@ -163,7 +180,8 @@ int main(int argc, char** argv) {
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
-        env.speculative              = options.speculative;
+        env.mtp_draft_tokens         = options.mtp_draft_tokens;
+        env.proposal_head            = options.proposal_head;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
@@ -171,15 +189,15 @@ int main(int argc, char** argv) {
         env.corpus_tokens            = corpus.size();
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.speculative.draft_tokens);
+                ninfer::bench::decode_graph_prime_output_tokens(options.mtp_draft_tokens);
         }
 
         std::cerr << "[ninfer_bench] loading " << options.artifact_path
                   << " (max_context=" << max_context
                   << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
         ninfer::Engine engine(std::move(engine_options));
-        fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
+        fill_cuda_environment(env);
         env.memory = engine.memory_summary();
 
         prime_decode_graph(engine, env, corpus);
@@ -204,7 +222,8 @@ int main(int argc, char** argv) {
                 require_cuda(cudaProfilerStart(), "cudaProfilerStart");
             }
             for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-                result.reps.push_back(run_repetition(engine, test, corpus));
+                result.reps.push_back(
+                    run_repetition(engine, test, corpus, options.capture_generation));
             }
             if (options.profile_measured) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");

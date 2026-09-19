@@ -116,6 +116,7 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+GGML_K256_V1 = Layout("ggml-k256-v1", 256, frozenset(("GGML_K",)))
 
 LAYOUTS = MappingProxyType(
     {
@@ -125,6 +126,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            GGML_K256_V1,
         )
     }
 )
@@ -273,6 +275,8 @@ def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
     shape: Sequence[int],
+    *,
+    stored_bytes: int | None = None,
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
@@ -280,6 +284,17 @@ def encoded_size(
         raise ValueError(
             f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
         )
+    if layout_spec is GGML_K256_V1:
+        n, k = _shape(shape, rank=2)
+        if k % 256:
+            raise ValueError("ggml-k256-v1 requires K divisible by 256")
+        minimum = align_up(n * 8, 256) + n * (k // 256) * 144
+        maximum = align_up(n * 8, 256) + n * (k // 256) * 210
+        if stored_bytes is None or not minimum <= stored_bytes <= maximum:
+            raise ValueError("ggml-k256-v1 requires its exact descriptor-derived byte size")
+        if (stored_bytes - minimum) % ((k // 256) * 66):
+            raise ValueError("ggml-k256-v1 byte size does not describe whole Q6_K rows")
+        return stored_bytes
     if layout_spec is CONTIGUOUS_LE_V1:
         if not isinstance(numeric_spec, DirectFormat):
             raise ValueError("contiguous-le-v1 requires a direct format")
@@ -300,6 +315,22 @@ def encoded_size(
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
+
+
+def validate_ggml_k_payload(shape: Sequence[int], payload: bytes | memoryview) -> None:
+    n, k = _shape(shape, rank=2)
+    encoded_size(GGML_K256_V1, "GGML_K", shape, stored_bytes=len(payload))
+    code_offset = align_up(n * 8, 256)
+    cursor = 0
+    for row in range(n):
+        descriptor = struct.unpack_from("<Q", payload, row * 8)[0]
+        if descriptor >> 1 != cursor:
+            raise ValueError("GGML_K row descriptors are not canonical contiguous rows")
+        cursor += (k // 256) * (210 if descriptor & 1 else 144)
+    if code_offset + cursor != len(payload):
+        raise ValueError("GGML_K row descriptors disagree with payload byte size")
+    if any(payload[n * 8:code_offset]):
+        raise ValueError("GGML_K descriptor padding must be zero")
 
 
 _DIRECT_DTYPES = {
@@ -1073,6 +1104,7 @@ __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
     "BlockScaleGeometry",
     "CONTIGUOUS_LE_V1",
+    "GGML_K256_V1",
     "K_ALIGNMENT",
     "LAYOUTS",
     "Layout",
@@ -1103,4 +1135,5 @@ __all__ = [
     "split_row_planes",
     "swizzle_nvfp4_scales",
     "unswizzle_nvfp4_scales",
+    "validate_ggml_k_payload",
 ]

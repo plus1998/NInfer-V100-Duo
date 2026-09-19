@@ -36,7 +36,7 @@ __device__ __forceinline__ unsigned smem_addr(const void* ptr) {
 // no async-copy hardware, so below sm_80 every op here decomposes into a
 // synchronous vectorized load+store: cp_async becomes an ordinary copy, and
 // cp_commit()/cp_wait() become no-ops since the data has already landed by
-// the time cp_async() returns. See docs/v100.md.
+// the time cp_async() returns. See the V100 performance summary.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 
 template <int Bytes, Cache Policy = Cache::ca>

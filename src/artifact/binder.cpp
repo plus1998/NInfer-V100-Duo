@@ -20,10 +20,21 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 
 } // namespace
 
-Binder::Binder(const Reader& reader)
+Binder::Binder(const Reader& reader, int device_count)
     : reader_(reader), consumed_(reader.objects().size(), false),
       planned_(reader.objects().size(), false) {
+    if (device_count < 1 || device_count > static_cast<int>(kMaximumDevices)) {
+        throw ArtifactError("materialization device count must be 1 or 2");
+    }
     materialization_.object_count = reader.objects().size();
+    materialization_.device_count = device_count;
+}
+
+void Binder::set_shard_resolver(ShardResolver resolver) {
+    if (!materialization_.device_objects.empty()) {
+        throw ArtifactError("the shard resolver must be installed before any tensor is placed");
+    }
+    shard_resolver_ = std::move(resolver);
 }
 
 ObjectHandle Binder::find_unconsumed(std::string_view name) {
@@ -68,10 +79,6 @@ ObjectHandle Binder::require_resource(std::string_view name, ResourceEncoding en
     return handle;
 }
 
-bool Binder::contains(std::string_view name) const noexcept {
-    return reader_.find(name) != nullptr;
-}
-
 const ObjectDescriptor& Binder::descriptor(ObjectHandle handle) const {
     if (handle.index >= reader_.objects().size()) {
         throw ArtifactError("artifact object handle is out of range");
@@ -81,6 +88,20 @@ const ObjectDescriptor& Binder::descriptor(ObjectHandle handle) const {
 
 PayloadSpan Binder::payload(ObjectHandle handle) const {
     return reader_.payload(descriptor(handle));
+}
+
+void Binder::place(ObjectHandle handle, int device, std::uint64_t bytes, std::uint64_t alignment,
+                   std::uint64_t logical_rows, std::vector<PlaneCopy> copies) {
+    std::uint64_t& capacity =
+        materialization_.device_capacity_bytes[static_cast<std::size_t>(device)];
+    const std::uint64_t offset = align_up(capacity, alignment);
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
+        throw ArtifactError("materialization plan size overflows u64");
+    }
+    materialization_.device_objects.push_back(
+        DeviceMaterialization{handle, device, offset, bytes, alignment, logical_rows,
+                              std::move(copies)});
+    capacity = offset + bytes;
 }
 
 void Binder::materialize_on_device(ObjectHandle handle) {
@@ -93,14 +114,79 @@ void Binder::materialize_on_device(ObjectHandle handle) {
                             std::string(tensor->name));
     }
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
-    const std::uint64_t offset    = align_up(materialization_.device_capacity_bytes, alignment);
-    if (tensor->bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
-        throw ArtifactError("materialization plan size overflows u64");
+    const ShardPlacement placement =
+        shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
+
+    for (int device = 0; device < materialization_.device_count; ++device) {
+        const std::vector<SliceRange>& ranges =
+            placement.device_ranges[static_cast<std::size_t>(device)];
+        if (placement.axis == ShardAxis::Replicated) {
+            if (!ranges.empty()) {
+                throw ArtifactError("a replicated placement must carry no shard ranges: " +
+                                    std::string(tensor->name));
+            }
+            // Whole object. `copies` stays empty: the materializer copies the payload verbatim,
+            // which is byte-for-byte what the single-device path has always done.
+            place(handle, device, tensor->bytes, alignment, tensor->shape.front(), {});
+            continue;
+        }
+        if (ranges.empty()) {
+            throw ArtifactError("sharded object names no range for device " +
+                                std::to_string(device) + ": " + std::string(tensor->name));
+        }
+        TensorSlice slice;
+        if (placement.axis == ShardAxis::Rows) {
+            slice = tensor_row_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
+        } else {
+            // Multiple column ranges are legal only where the layout allows them
+            // (contiguous-le-v1 and whole-block ggml-k256-v1);
+            // tensor_column_slice enforces that per layout rather than this call site guessing.
+            slice = tensor_column_slice(tensor->layout, tensor->format, tensor->shape, ranges, payload(handle).data);
+        }
+        std::uint64_t covered = 0;
+        for (const PlaneCopy& copy : slice.copies) {
+            if (copy.bytes == 0 || copy.source_offset > tensor->bytes ||
+                tensor->bytes - copy.source_offset < copy.bytes ||
+                copy.dest_offset > slice.encoded_bytes ||
+                slice.encoded_bytes - copy.dest_offset < copy.bytes) {
+                throw ArtifactError("shard slice range is outside its tensor: " +
+                                    std::string(tensor->name));
+            }
+            covered += copy.bytes;
+        }
+        if (covered > slice.encoded_bytes) {
+            throw ArtifactError("shard slice copies overlap: " + std::string(tensor->name));
+        }
+        // Two copies writing the same shard byte would make the result depend on staging-chunk
+        // order. The single-device path got this for free (one copy per object); reinstate it
+        // explicitly now that a shard is many copies. Ordering by destination is cheap here --
+        // every layout emits its copies plane by plane, so this is nearly sorted already.
+        {
+            std::vector<const PlaneCopy*> ordered;
+            ordered.reserve(slice.copies.size());
+            for (const PlaneCopy& copy : slice.copies) { ordered.push_back(&copy); }
+            std::sort(ordered.begin(), ordered.end(),
+                      [](const PlaneCopy* a, const PlaneCopy* b) {
+                          return a->dest_offset < b->dest_offset;
+                      });
+            for (std::size_t i = 1; i < ordered.size(); ++i) {
+                if (ordered[i]->dest_offset <
+                    ordered[i - 1]->dest_offset + ordered[i - 1]->bytes) {
+                    throw ArtifactError("shard slice writes the same byte twice: " +
+                                        std::string(tensor->name));
+                }
+            }
+        }
+        std::uint64_t logical_rows = tensor->shape.front();
+        if (placement.axis == ShardAxis::Rows) {
+            logical_rows = 0;
+            for (const SliceRange& range : ranges) { logical_rows += range.count; }
+        }
+        place(handle, device, slice.encoded_bytes, alignment, logical_rows,
+              std::move(slice.copies));
+        materialization_.device_objects.back().prefix = std::move(slice.prefix);
     }
-    materialization_.device_objects.push_back(
-        DeviceMaterialization{handle, offset, tensor->bytes, alignment});
-    materialization_.device_capacity_bytes = offset + tensor->bytes;
-    planned_[handle.index]                 = true;
+    planned_[handle.index] = true;
 }
 
 void Binder::retain_on_host(ObjectHandle handle) {
@@ -122,7 +208,20 @@ void Binder::validate_only(ObjectHandle handle) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
                             std::string(object_name(object)));
     }
+    consumed_[handle.index] = true;
     planned_[handle.index] = true;
+}
+
+void Binder::validate_unconsumed_matching(std::string_view prefix) {
+    for (std::size_t i = 0; i < reader_.objects().size(); ++i) {
+        if (!consumed_[i]) {
+            std::string_view name = object_name(reader_.objects()[i]);
+            if (prefix.empty() || name.starts_with(prefix)) {
+                consumed_[i] = true;
+                planned_[i]  = true;
+            }
+        }
+    }
 }
 
 MaterializationPlan Binder::finish() {

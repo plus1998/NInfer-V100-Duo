@@ -15,6 +15,7 @@ The storage registry contains exactly these identities:
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
+| `ggml-k256-v1` | tensor layout | `GGML_K` | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
@@ -351,7 +352,29 @@ Layout decoding yields only persistent logical words:
 - `row-scale-v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
 - `raw-bytes-v1` yields the enclosing resource bytes.
+- `ggml-k256-v1` yields each row's unchanged Q4_K or Q6_K codes and scales.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
+
+## 8. `ggml-k256-v1`
+
+This layout accepts `GGML_K` rank-two `[N,K]` matrices with positive dimensions and `K % 256 == 0`.
+The payload starts with `N` little-endian unsigned 64-bit row descriptors, followed by zero padding
+through `code_offset = align_up(8*N,256)`. Each descriptor is `(row_offset << 1) | codec`, where
+`row_offset` is relative to the code plane and codec `0` means Q4_K and `1` means Q6_K. The code plane
+concatenates each row's `K/256` raw GGML blocks, of 144 or 210 bytes respectively. Rows have no
+additional padding; offsets must describe contiguous rows in logical order.
+
+Encoded length depends on represented row codec tags as well as shape. The directory `bytes` must
+fit a whole number of Q4_K and Q6_K rows, and the reader validates that the descriptors derive
+exactly that length. There is no second directory schema or artifact version for this layout.
+
+TP row slicing concatenates selected unchanged code rows and rebuilds the descriptor offsets and
+padding. Column slicing accepts ascending, disjoint ranges whose boundaries are divisible by 256;
+it concatenates whole blocks from those ranges within every row and rebuilds offsets. This preserves
+GGUF GDN output columns when TP2 selects key-head groups from three tiled repeat sections without
+requantizing any block. The materialization plan owns the generated descriptor
+prefix until its host-to-device transfer completes. `Weight.qhigh` points to the descriptor table
+and `Weight.qdata` to the code plane; scales remain inside the raw blocks.

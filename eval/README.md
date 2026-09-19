@@ -2,8 +2,8 @@
 
 `eval/` contains the repository-local capability evaluation coordinator. It can evaluate this
 project's server, another local OpenAI-compatible service, or a remote online model. The inference
-engine is only one possible target; each target and job declares the concurrency admitted by that
-particular server run instead of baking an Engine policy into the framework.
+engine is only one possible target; its single-sequence limitation is represented by
+`max_concurrency: 1`, not built into the framework.
 
 EvalScope is the first real evaluation backend. The coordinator, configuration, logging, progress,
 resume, and result contracts do not import or depend on EvalScope. The deterministic `mock` backend
@@ -28,13 +28,6 @@ Qwen model or create a `.ninfer` artifact.
 See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the initial AIME25,
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
-
-The published Qwen3.6 reasoning runs retain their exact configurations in
-[`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml),
-[`configs/qwen3_6_35b_aime.yaml`](configs/qwen3_6_35b_aime.yaml), and
-[`configs/qwen3_6_35b_gpqa.yaml`](configs/qwen3_6_35b_gpqa.yaml). The Qwen3.8 groupwise-int and
-NVFP4 campaigns use their format-specific reasoning configurations and managed scripts documented
-below.
 
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
@@ -69,9 +62,8 @@ Concurrency has two levels:
 - optional job `max_concurrency` caps how many target slots one job may reserve.
 
 For EvalScope, the granted job slots become `eval_batch_size`. Multiple jobs sharing a target can
-never reserve more slots than the target capacity. For `ninfer-serve`, match the target capacity to
-the server's startup `--max-concurrency`; an individual long-output job may set a lower concurrency
-when its KV entitlement requires it.
+never reserve more slots than the target capacity. Set the local `ninfer-serve` target to one; set a
+larger explicit value for an online service that supports it.
 
 Portable generation settings live under `generation`. Evaluator-specific controls live under
 `backend_args`; unknown fields are rejected rather than silently ignored.
@@ -211,6 +203,130 @@ eval/.venv/bin/python -m ninfer_eval plan \
 Run the one-sample NIAH smoke only after the active model evaluation has released the single target
 slot, then select `standard` or `native_long` as a separate formal run.
 
+### Qwen3.8-27B NVFP4 needles across two GPUs (TP2)
+
+[`configs/qwen3_8_27b_nvfp4_needle_haystack.yaml`](configs/qwen3_8_27b_nvfp4_needle_haystack.yaml)
+is the dual-RTX-5090 long-context acceptance suite for the NVFP4 artifact.
+`eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh` owns one `ninfer-serve --tp 2 --devices 0,1
+--max-context 262144 --kv-dtype int8` process per step and runs one suite against it:
+
+```bash
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh --plan 262k
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh smoke     # one 8k needle, contract check
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh 64k       # 10 needles
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh 128k      # 10 needles
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh 262k      # 10 needles, ~18 minutes
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh           # the whole 64k -> 128k -> 262k ladder
+
+# Retrieval-vs-memorization controls at 262k (one sample each, ~3 minutes)
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh control                 # novel needle, expect score 1
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh control-absent          # absent question, strict prompt
+eval/run_qwen3_8_27b_nvfp4_needle_tp2.sh control-absent-optout   # absent question, NOT FOUND allowed
+```
+
+Every step samples GPU memory for as long as its suite runs and prints the peaks it saw, so the
+per-GPU VRAM budget is a re-runnable measurement rather than a number someone watched go by. The
+samples land in `eval/server-logs/<...>.vram.csv` as `timestamp_utc,kind,key,used_mib`, with one
+`kind=gpu` row per device (which includes memory other processes hold) and one `kind=process` row
+per `<pid>@gpu<index>` (this server's own residency on that card) per tick.
+`NINFER_VRAM_SAMPLE_SECONDS` overrides the 3-second interval. The per-GPU key matters: a TP2 server
+appears once per card per tick, and keying on the pid alone would collapse the two cards and hide
+an asymmetric split. So the peaks a 262k step prints look like:
+
+```
+  peak gpu 0                       16353 MiB  (15.97 GiB, 40 samples)
+  peak gpu 1                       15436 MiB  (15.07 GiB, 40 samples)
+  peak process 3417924@gpu0        15396 MiB  (15.04 GiB, 40 samples)
+  peak process 3417924@gpu1        15396 MiB  (15.04 GiB, 40 samples)
+```
+
+Each `native_*` tier is 5 depths (10/30/50/70/90 %) x 2 corpora (English, Chinese) = 10 needles.
+The 262k tier builds a 260,000-token haystack, which becomes a 259,954-token prompt and leaves
+2,190 tokens of the 262,144-token window for the bounded 512-token answer. Speculative decoding is
+off: `--tp 2` and `--spec` are mutually exclusive in the engine.
+
+Scoring is `judge_strategy: rule`, and the config overrides EvalScope's prompt template to ask for
+the source sentence copied word for word. EvalScope's stock needle prompt asks for a paraphrase
+while its rule metric is a normalized *exact* string match, so a correctly retrieved needle answered
+in the model's own words scores 0; the benchmark's own default is an LLM judge, which this
+repository does not run for a hardware acceptance gate. The override makes the rule metric a
+faithful, judge-free measurement of retrieval. Corpus, needle text, retrieval question, and the
+insertion algorithm are EvalScope's unmodified defaults.
+
+`eval/tp2_needle_throughput_probe.py` issues one streamed request on a needle prompt of a chosen
+length and reports prompt tokens, TTFT, and decode tokens/second, so the same prompt can be timed
+against a TP2 server and a single-GPU server. `--task summary` keeps the identical haystack but
+asks for a long answer, so the decode phase is long enough to time precisely. Point it at whichever
+server is currently up:
+
+```bash
+# TP2, against a server started as above
+eval/.venv/bin/python eval/tp2_needle_throughput_probe.py \
+  --context-tokens 250000 --depth 50 --task summary --max-tokens 512 \
+  --label tp2-250k-summary --out eval/server-logs/throughput-probe.jsonl
+
+# TP1 baseline: restart ninfer-serve with `--device 0 --max-context 252928` (262,144 does not fit
+# one card), then issue the byte-identical prompt.
+eval/.venv/bin/python eval/tp2_needle_throughput_probe.py \
+  --context-tokens 250000 --depth 50 --task summary --max-tokens 512 \
+  --label tp1-250k-summary --out eval/server-logs/throughput-probe.jsonl
+```
+
+The server's own `--request-log-jsonl` record (`timings_seconds.prefill` / `.decode`) is the
+authoritative split between the two phases; the probe's streamed timings agree within about 1 %.
+
+`eval/mtp_reasoning_probe.py` is the MTP acceptance gate's probe. It sends one fixed
+~512-token reasoning prompt -- a multi-part derivation, so the answer is long and its acceptance
+rate is meaningful -- and reports the same client-side timings. Unlike the needle probe it builds
+no corpus and needs no tokenizer, so plain `python3` runs it. The acceptance numbers themselves
+come from the server's request log, whose `speculative` block carries `rounds`, `drafted_tokens`,
+`accepted_tokens` and `accepted_per_position` per request:
+
+```bash
+# Start ninfer-serve with `--spec mtp --draft-tokens 3 --lm-head-draft`, then:
+python3 eval/mtp_reasoning_probe.py --label tp2-mtp --max-tokens 512 \
+  --out eval/server-logs/mtp-probe.jsonl
+python3 -c "import json,sys; [print(json.loads(l)['speculative']) for l in open(sys.argv[1]) \
+  if 'speculative' in l]" eval/server-logs/<server>.requests.jsonl
+```
+
+Recorded MTP3 results for `qwen3_8_27b_nvfp4.ninfer` (`--draft-tokens 3 --lm-head-draft`, INT8 KV,
+CUDA graphs on), TP2 at `--max-context 262144` against TP1 at `--max-context 252928`. **All rows in
+this subsection were taken at the 400 W per-GPU cap**; see `docs/performance.md` for the 575 W
+re-measurement and for why figures from the two conditions must not be compared:
+
+| Prompt | Acceptance TP1 | Acceptance TP2 | Decode tok/s TP1 | Decode tok/s TP2 |
+|---|---:|---:|---:|---:|
+| 536-token reasoning | 56.61 % | 58.06 % | 152.0 | 189.5 |
+| 249,955-token needle summary | 50.83 % | 57.96 % | 101.7 | 152.1 |
+
+Per-GPU process residency under TP2 with MTP is a flat 16,062 MiB (15.69 GiB); TP1 with the smaller
+252,928-token window uses 29,858 MiB (29.16 GiB) on one card. Both were measured at the 400 W cap
+alongside the table above (residency is a memory figure, so the power condition does not move it —
+it is stated for provenance).
+
+Recorded TP2 results for `qwen3_8_27b_nvfp4.ninfer` (INT8 KV, CUDA graphs on, speculation off):
+
+| Tier | Prompt tokens | Needles | Run directory |
+|---|---:|---:|---|
+| 64k | 65,490 | 10 / 10 | `eval/runs/20260825T162206Z-e50f922c` |
+| 128k | 131,025 | 10 / 10 | `eval/runs/20260826T064554Z-5fe0220d` |
+| 262k | 259,954 | 10 / 10 | `eval/runs/20260826T065823Z-055cb1f2` |
+
+Each tier's 10 samples are 5 depths across two haystacks. Note that `chinese` selects a different
+*corpus* (Journey to the West), not a translated needle: EvalScope inserts the same English needle
+and asks the same English question in both, so the pair is a second haystack condition rather than
+a second language condition. The grid is also deliberately narrower than the 35B `native_long`
+profile's eleven depths — five depths x two haystacks is what the TP2 acceptance gate specifies,
+and at ~105 s per 262k prefill an eleven-depth grid would cost about 40 minutes per tier.
+
+Retrieval-vs-memorization controls at 262k (`eval/runs/20260826T074339Z-f9f7c5cb`,
+`20260826T074608Z-bb0da9f5`, `20260826T074907Z-b6f62525`): with a needle the model cannot have
+memorized, it reproduced the invented sentence verbatim out of a 259,956-token prompt (score 1).
+Asked about an entity absent from the prompt it returned the nearest matching sentence under the
+strict prompt, but answered `NOT FOUND` once the prompt allowed it to decline -- so the
+substitution is a prompt artifact, not a failure to discriminate.
+
 BFCL-v4 full evaluation contains 5,106 samples. Multi-turn samples can make more than one model
 request. Its Web Search subsets require `SERPAPI_API_KEY`; `memory_vector` may download an upstream
 model, which the example explicitly acknowledges with `allow_network_downloads: true`.
@@ -225,6 +341,93 @@ eval/.venv/bin/python -m ninfer_eval summarize --run eval/runs/<run-id>
 
 Resume rejects a changed effective configuration or backend version. Completed jobs are skipped;
 an incomplete EvalScope job reuses its own prediction cache when available.
+
+### Qwen3.8-27B NVFP4 needles at 655k and 1M (TP2 + YaRN x4), with a vLLM control
+
+[`configs/qwen3_8_27b_nvfp4_needle_1m.yaml`](configs/qwen3_8_27b_nvfp4_needle_1m.yaml) is the
+extended-context suite. It differs from the 262k suite above in three ways that matter.
+
+**1. A distinct-text corpus.** EvalScope's needle adapter *tiles* a corpus shorter than the
+requested context (`_get_context_tokens` concatenates the file to itself until it is long enough),
+and the stock ModelScope corpus is only ~155k tokens, so every tier above that measures retrieval
+over repeated text. This suite instead uses a purpose-built corpus of Project Gutenberg
+public-domain English books:
+
+```bash
+eval/.venv/bin/python tools/tp2/build_needle_1m_corpus.py \
+    --out-dir /home/pc/models/ninfer-38/needle-1m \
+    --tokenizer /home/pc/models/ninfer-38/unsloth-nvfp4     # ~4 min, needs gutenberg.org
+
+# Prove the benchmark never tiles it, and measure the prompt lengths it will produce:
+eval/.venv/bin/python tools/tp2/verify_needle_1m_prompt.py \
+    --context-lengths 8192 653000 1046000 \
+    --json-out eval/results/needle-1m/corpus-no-tiling-verification.json
+```
+
+The builder writes two **disjoint** 6,000,000-character bundles, both English. Their file names are
+dictated by the adapter, which hardcodes `english -> PaulGraham_Essays.txt` and
+`chinese -> Journey_to_the_West.txt`: bundle A goes into the first slot, bundle B into the second.
+Neither file contains what its name says, and neither subset is Chinese. Running both subsets is
+what gives **two independent samples per depth**. `provenance.json` in the output directory lists
+every book and both bundle checksums.
+
+**2. Two engines, never at the same time.** Each needs both GPUs.
+
+```bash
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh --plan 1m
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh smoke        # one 8k needle, ~1 min
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh 655k         # 10 needles, ~1.4 h
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh 1m           # 10 needles, ~3.2 h
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh ninfer-all   # all three on ONE server, ~4.6 h
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh control-1m   # novel-needle retrieval control, ~21 min
+
+# The vLLM control: starts and stops /home/pc/Projects/vllm/serve-orca-qwen38-27b-long.sh
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh vllm-smoke
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh vllm-655k    # ~1.1 h
+eval/run_qwen3_8_27b_nvfp4_needle_1m.sh vllm-all
+```
+
+The script asserts `nvidia-smi --query-compute-apps` is empty **before** launching and **after**
+exiting, writing both to `eval/server-logs/needle1m-<step>-<stamp>.nvidia-smi.txt`, and refuses to
+start alongside a job it did not start. vLLM is launched under `setsid` and stopped by signalling
+its process group, because `vllm serve` forks engine-core and worker children that would otherwise
+keep holding GPU memory.
+
+Every step's sampler also records `power.limit` and `power.draw` per GPU per tick, and the step
+prints a `power gpu N limit ... W, draw peak ... W, mean ... W` line beside the memory peaks. This
+matters on this host: the 1M needle numbers were all measured with both RTX 5090s at a **400 W**
+power limit against 600 W / 575 W stock defaults, and the original artifacts did not record it.
+`report_vram_peaks` accepts sampler CSVs both with and without the two power columns.
+
+`NINFER_NEEDLE_1M_CORPUS` overrides the haystack directory. The corpus is a `local_path` inside the
+YAML and `ninfer_eval` does not expand environment variables in configs, so the script renders a
+copy of the config with the `local_path: &corpus_path` anchor rewritten (to
+`eval/server-logs/needle1m-<step>-<stamp>.config.yaml`) and runs that; unset, the shipped config is
+used verbatim. The rewrite fails loudly if the anchor is missing or the directory does not exist.
+
+The NInfer steps serve both tiers from one `--max-context 1048576 --rope yarn --yarn-factor 4.0
+--yarn-origin 262144 --max-concurrency 1` process. The YaRN table depends on the factor and origin,
+not on `--max-context`, so the 655k tier is rope-identical to the 1M tier and to the control.
+`--max-concurrency 1` is arithmetic, not policy: the per-slot sequence cost at 1M is 16.66
+GiB/device.
+
+**3. The tiers are haystack lengths, not prompt lengths.** 653,000 produces a 652,954-token prompt
+that fits the control's `--max-model-len 655360` with the 512-token answer and 1,893 tokens to
+spare; 1,046,000 produces 1,045,954 and leaves 2,109 tokens of the 1,048,576-token window. Both
+tokenizers (the served artifact's and the vLLM checkpoint's) were verified to agree on those counts.
+
+Consolidate the runs into one small table:
+
+```bash
+eval/.venv/bin/python tools/tp2/summarize_needle_1m.py \
+    --run eval/runs/<ninfer-655k-run> --run eval/runs/<ninfer-1m-run> \
+    --run eval/runs/<vllm-655k-run> \
+    --requests eval/server-logs/needle1m-ninfer-all-<stamp>.requests.jsonl \
+    --out-json eval/results/needle-1m/results.json \
+    --out-md   eval/results/needle-1m/results.md
+```
+
+Scoring and the `prompt_template` override are the 262k suite's, unchanged.
 
 ## Progress And Logs
 
@@ -247,32 +450,6 @@ Every run is stored below `eval/runs/<timestamp>-<config-hash>/`:
 
 The sample-retention policy is recorded in the manifest. API keys and known secret values are
 redacted from coordinator events and task snapshots.
-
-## Historical Qwen3.6-27B reasoning profile
-
-The published Qwen3.6-27B scores and per-dataset correct/total counts are recorded in the
-[groupwise-int model card](../model-cards/Qwen3.6-27B-NInfer/README.md#evaluation) and
-[NVFP4 model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md#evaluation).
-Those runs used EvalScope 1.9.0, one sample per problem, and the sampling settings recorded on
-the cards. The current pinned evaluation environment is newer; rerunning the commands below
-reproduces the workload on the selected environment, not the historical score automatically.
-
-The NVFP4 serving command was:
-
-```bash
-build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 18080 \
-  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
-Run the configured reasoning suite in a separate shell using the evaluation environment above:
-
-```bash
-PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
-  --config eval/configs/qwen3_6_27b_reasoning.yaml \
-  --suite reasoning_full
-```
 
 ## Scores
 

@@ -35,7 +35,7 @@ __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
 // cvt.e2m1x2 is native FP4 hardware, Blackwell-only -- Volta has no FP4 hardware at all,
 // so unlike the mma.cuh helpers this isn't "no SIMT replacement built yet", it's simply
-// never going to have one. Already permanently out of scope (see docs/v100.md);
+// never going to have one. Already permanently out of scope (see the V100 performance summary);
 // this only needs a guard so ptxas doesn't reject the PTX outright at compile time.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("{\n"

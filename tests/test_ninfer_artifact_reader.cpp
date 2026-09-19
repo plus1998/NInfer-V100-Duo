@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <span>
@@ -187,11 +188,53 @@ void test_common_validation() {
         expect_artifact_error([&] { Reader reader(fixture.path); }, "misaligned offset");
     }
     {
-        constexpr std::array<std::uint8_t, 8> invalid_magic = {
-            'I', 'N', 'V', 'A', 'L', 'I', 'D', '!',
-        };
-        auto fixture = write_fixture(normative_directory(), "invalid_magic", invalid_magic);
-        expect_artifact_error([&] { Reader reader(fixture.path); }, "invalid magic");
+        auto directory = normative_directory();
+        auto fixture =
+            write_fixture(directory, "legacy_v1", ninfer::test::artifact_fixture::kV1Magic);
+        try {
+            Reader reader(fixture.path);
+        } catch (const ninfer::artifact::ArtifactError& error) {
+            if (std::string_view(error.what())
+                    .find("python3 -m tools.artifact.migrate_v1_to_v2 <artifact>") ==
+                std::string_view::npos) {
+                throw std::runtime_error("v1 rejection omitted the migration command");
+            }
+            return;
+        }
+        throw std::runtime_error("v1 artifact was accepted");
+    }
+}
+
+void test_official_qwen38_v3_if_configured() {
+    const char* path = std::getenv("NINFER_QWEN3_8_27B_WEIGHTS");
+    if (path == nullptr || *path == '\0') { return; }
+
+    Reader reader(path);
+    if (reader.identity().model_id != "qwen3.8-27b" ||
+        reader.identity().weights_id != "nvfp4" || reader.objects().size() != 1124) {
+        throw std::runtime_error("official qwen3.8 v3 projection identity or inventory mismatch");
+    }
+    const auto* qkgv = std::get_if<TensorDescriptor>(
+        reader.find("text/layers/3/attention/query_key_gate_value"));
+    const auto* gate_up =
+        std::get_if<TensorDescriptor>(reader.find("text/layers/0/mlp/gate_up"));
+    const auto* divisor = std::get_if<TensorDescriptor>(
+        reader.find("text/layers/0/mlp/gate_up_projection/input_scale_divisor"));
+    if (qkgv == nullptr || qkgv->format != NumericFormat::FP8_E4M3FN_ROW_BF16S ||
+        gate_up == nullptr || gate_up->format != NumericFormat::NVFP4 || divisor == nullptr ||
+        divisor->format != NumericFormat::FP32 || !divisor->shape.empty()) {
+        throw std::runtime_error("official qwen3.8 v3 projected tensor contract mismatch");
+    }
+
+    const auto tokenizer_config = reader.payload("frontend/tokenizer_config.json").data;
+    const auto chat_template    = reader.payload("frontend/chat_template.jinja").data;
+    const auto* begin = reinterpret_cast<const char*>(tokenizer_config.data());
+    const Json config = Json::parse(begin, begin + tokenizer_config.size());
+    const auto expected = config.at("chat_template").get<std::string>();
+    const std::string_view actual(reinterpret_cast<const char*>(chat_template.data()),
+                                  chat_template.size());
+    if (actual != expected) {
+        throw std::runtime_error("official qwen3.8 v3 chat template projection mismatch");
     }
 }
 
@@ -202,6 +245,7 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_official_qwen38_v3_if_configured();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

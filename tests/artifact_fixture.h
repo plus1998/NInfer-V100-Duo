@@ -19,6 +19,9 @@ namespace ninfer::test::artifact_fixture {
 
 using Json = nlohmann::json;
 
+inline constexpr std::array<std::uint8_t, 8> kV1Magic = {
+    'N', 'I', 'N', 'F', 'E', 'R', 0, 1,
+};
 inline constexpr std::array<std::uint8_t, 8> kMagic = {
     'N', 'I', 'N', 'F', 'E', 'R', 0, 2,
 };

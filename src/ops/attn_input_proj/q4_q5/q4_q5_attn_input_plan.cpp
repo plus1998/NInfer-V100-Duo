@@ -50,7 +50,7 @@ struct RouteSpec {
 // applied. SIMT still wins at T<=32, so this does not affect decode concurrency (C8 with MTP3
 // is T=32); it recovers up to 1.33x in the T=40..63 band. Contrast gdn_input_proj, whose larger
 // SIMT work (16384 vs 7168 parent rows) against a similar fixed dequant cost puts its crossover
-// at 28. See docs/v100.md.
+// at 28. See the V100 performance summary.
 // Band for the fused tensor-core route (ops/linear/q{4,5}/q{4,5}_volta_mma_gemm.cuh), the same
 // change gdn_input_proj took. Both stored parents are [7168,5120] with rows 0..6143 feeding
 // q/gate and 6144..7167 feeding k/v, and both fused launchers take a weight_row_offset, so this
@@ -290,6 +290,51 @@ void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
     const Q4Q5AttnInputPlan plan = q4_q5_attn_input_resolve_plan(problem);
     q4_q5_attn_input_execute_plan(plan, x, query_key_weight, gate_value_weight, q, gate, k, v,
                                   workspace, stream);
+}
+
+bool q4_q5_attn_input_admits_shard(const Q4Q5AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 5120 && problem.query_rows == 3072 && problem.kv_rows == 512 &&
+           problem.padded_k == 5120 && problem.cols >= 1;
+}
+
+void q4_q5_attn_input_dispatch_shard(const Tensor& x, const Weight& query_key_weight,
+                                     const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, WorkspaceArena& workspace,
+                                     cudaStream_t stream) {
+    const Q4Q5AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], query_key_weight.padded_shape[1],
+                                       x.ne[1]};
+    if (!q4_q5_attn_input_admits_shard(problem)) {
+        throw std::invalid_argument(
+            "Q4/Q5 attention input column-parallel: exact shard problem is not admitted");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    launch_q4_volta_mma(x, query_key_weight, q, workspace, stream, 0);
+    launch_q4_volta_mma(x, query_key_weight, k, workspace, stream, problem.query_rows);
+    launch_q5_volta_mma(x, gate_value_weight, gate, false, 0, workspace, stream);
+    launch_q5_volta_mma(x, gate_value_weight, v, false, problem.query_rows, workspace, stream);
+#else
+    (void)workspace;
+    q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q, gate,
+                                                   k, v, stream);
+#endif
+}
+
+std::size_t q4_q5_attn_input_shard_capacity_workspace_bytes(std::int32_t min_cols,
+                                                           std::int32_t max_cols) {
+    if (min_cols <= 0 || max_cols < min_cols) {
+        throw std::invalid_argument("Q4/Q5 attention shard: invalid column interval");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    // The split count can drop as T grows; inspect each supported extent to keep the bound exact.
+    std::size_t bytes = 0;
+    for (std::int64_t cols = min_cols; cols <= max_cols; ++cols) {
+        bytes = std::max(bytes, attn_volta_mma_workspace_bytes(
+                                    {5120, 3072, 512, 5120, static_cast<std::int32_t>(cols)}));
+    }
+    return bytes;
+#else
+    return 0;
+#endif
 }
 
 } // namespace ninfer::ops::detail

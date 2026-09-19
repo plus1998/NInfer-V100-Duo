@@ -3,10 +3,46 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
 
-Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("q5 linear: unsupported shape or T"); }
+// --- TP2 shard geometries ---------------------------------------------------------------------
+//
+// A tp2 shard is the same row-split tensor with one axis halved: a column-parallel shard halves N
+// (attention/query_key, attention/gate_value, mlp/gate_up, gdn/*), a row-parallel shard halves K
+// (attention/output, gdn/output, mlp/down). No new kernel exists -- every launcher named below
+// reads its extents from the tensors, so a shard entry only records which launcher serves the
+// halved extent and the halved grid follows automatically.
+//
+// Two deliberate rules, stated once here and followed by every groupwise family:
+//
+//   1. Shard entries are ADDITIVE and looked up AFTER the tp1 table (tp1 wins on any collision),
+//      but no shard extent coincides with a registered tp1 extent, so the tp1 path is bit-for-bit
+//      the one it was.
+//   2. A shard uses the family's GENERIC runtime-dimension launchers. It deliberately does not
+//      inherit the parent's compile-time EXACT instantiations (q5's gemv_r16_s2_x is N-exact and
+//      its split2 SIMT is K-exact, so neither covers a halved extent), and it deliberately does
+//      not get its own exact instantiation: that would be a second tuned kernel set to qualify.
+//      This is a performance choice only -- the generic launchers are the same qualified compute
+//      body -- and re-measuring the halved crossovers is a separate, benchmarked change.
+//
+// Returns nullptr when (n, k) is not a registered shard extent, so the caller falls through to the
+// tp1 table and its error message.
+Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard = k == 5120 && (n == 512 ||   // 1024  / 2
+                                            n == 3072 ||  // 6144  / 2
+                                            n == 3584);   // 7168  / 2
+    const bool row_shard    = n == 5120 && (k == 3072 ||  // 6144  / 2 (attention/gdn output)
+                                            k == 8704);   // 17408 / 2 (mlp/down)
+    if (!column_shard && !row_shard) { return nullptr; }
+    if (t <= 4) { return launch_q5_simt_r8_c4; }
+    if (t <= 24) { return launch_q5_simt_r8_c8; }
+    return launch_q5_mma_r64_c128;
+}
 
+// The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
+// can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
+// both registered here and listed as a shard extent keeps its tuned tp1 launcher.
+Q5Launch select_q5_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 5120:
         switch (n) {
@@ -71,6 +107,19 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
+    return nullptr;
+}
+
+} // namespace
+
+Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0) { throw std::invalid_argument("q5 linear: unsupported shape or T"); }
+    if (const Q5Launch tp1 = select_q5_a16_registered(n, k, t); tp1 != nullptr) {
+        return tp1;
+    }
+    if (const Q5Launch shard = select_q5_tp2_shard_launch(n, k, t); shard != nullptr) {
+        return shard;
+    }
     throw std::invalid_argument("q5 linear: unsupported shape or T");
 }
 
@@ -122,25 +171,7 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
-    const std::int32_t t = x.ne[1];
-    // Basic Linear historically had no Q5 Volta-MMA route because split-K needs caller-owned
-    // accumulation storage. Large vision matrices provide enough CTAs to select one split, which
-    // stores directly to BF16 output, so admit exactly that zero-workspace case here.
-    if (workspace != nullptr && t >= 9 &&
-        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
-        const std::size_t need = q5_volta_mma_workspace_bytes(out.ne[0], x.ne[0], t);
-        if (need == 0) {
-            launch_q5_volta_mma(x, w, out, /*add_residual=*/false,
-                                /*weight_row_offset=*/0, *workspace, stream);
-            return;
-        }
-    }
-#else
-    (void)workspace;
-#endif
+                 cudaStream_t stream) {
     const Q5Launch launch = select_q5_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);
 }

@@ -7,7 +7,7 @@
 // (rows [0,6144) -> value, into qkv[4096:10240); rows [6144,12288) -> z, a separate tensor) --
 // the dequant buffer is row-major-by-n (k-contiguous per row), so splitting is a pointer offset
 // into one shared dequant pass, not a second dequant. Compute-bound prefill shapes only;
-// decode/small-T stays on the existing SIMT/gemv/split4 paths. See docs/v100.md.
+// decode/small-T stays on the existing SIMT/gemv/split4 paths. See the V100 performance summary.
 
 #include "core/arena.h"
 #include "core/tensor.h"

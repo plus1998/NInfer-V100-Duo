@@ -32,7 +32,6 @@
 //     repacking, exactly as in Q4.
 
 #include "ops/common/volta_mma.cuh"
-#include "ops/common/math.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -55,13 +54,11 @@ struct W8VoltaQpnSchedule {
 // reads before consuming any, in units of kCodeBytesPerGroup. See the Q4 sibling: a lane streams
 // its own weight row, but a warp's 32 lanes stream 32 different rows at once, so consuming a whole
 // 128B line per lane per iteration is what keeps that off DRAM.
-template <int kTiles, int kBlk, bool kDynamicConvAdd = false, bool kSwiGluUp = false>
+template <int kTiles, int kBlk>
 __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
-    int padded_groups, int out_ld, const __nv_bfloat16* __restrict__ finish_delta = nullptr,
-    const __nv_bfloat16* __restrict__ base = nullptr,
-    __nv_bfloat16* __restrict__ residual = nullptr, int width = 0) {
+    int padded_groups, int out_ld) {
     using S = W8VoltaQpnSchedule;
     constexpr int kGroupK = W8RowSplitStorage::kGroupK;
     constexpr int kCodeB  = W8RowSplitStorage::kCodeBytesPerGroup;
@@ -209,41 +206,7 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
             float v = 0.0f;
 #pragma unroll
             for (int w = 0; w < S::kWarps; ++w) { v += cs[w][e]; }
-            if constexpr (kDynamicConvAdd) {
-                // Preserve the old materialized projection boundary exactly: convolution sees
-                // BF16-rounded current and predecessor projections, even though both live in
-                // this CTA's reduction tile. Width is request-local, so row%width guards against
-                // carrying the second tap across batched request boundaries.
-                constexpr int kHidden = 5120;
-                constexpr int kGroups = 320;
-                const int group = ocol / 16;
-                const float projected0 = __bfloat162float(__float2bfloat16(v));
-                const float base0 = __bfloat162float(base[ocol + 2LL * kHidden]);
-                const float delta0 = __bfloat162float(
-                    finish_delta[group + static_cast<std::int64_t>(kGroups) * (2 * row)]);
-                float acc = (base0 + delta0) * projected0;
-                if ((row % width) != 0) {
-                    float previous = 0.0f;
-#pragma unroll
-                    for (int w = 0; w < S::kWarps; ++w) {
-                        previous += cs[w][(row - 1) * S::kColsPerCta + cl];
-                    }
-                    const float projected1 = __bfloat162float(__float2bfloat16(previous));
-                    const float base1 = __bfloat162float(base[ocol + 3LL * kHidden]);
-                    const float delta1 = __bfloat162float(finish_delta[
-                        group + static_cast<std::int64_t>(kGroups) * (1 + 2 * row)]);
-                    acc += (base1 + delta1) * projected1;
-                }
-                const std::int64_t offset = ocol + static_cast<std::int64_t>(row) * kHidden;
-                residual[offset] = __float2bfloat16_rn(__bfloat162float(residual[offset]) + acc);
-            } else if constexpr (kSwiGluUp) {
-                const std::int64_t offset = static_cast<std::int64_t>(row) * out_ld + ocol;
-                const float gate = __bfloat162float(out[offset]);
-                const float up = __bfloat162float(__float2bfloat16(v));
-                out[offset] = __float2bfloat16_rn(silu(gate) * up);
-            } else {
-                out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
-            }
+            out[static_cast<std::int64_t>(row) * out_ld + ocol] = __float2bfloat16(v);
         }
     }
 }

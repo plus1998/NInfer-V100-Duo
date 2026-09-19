@@ -36,9 +36,18 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    // TP2 row-parallel halves of the two residual geometries (o_proj / gdn/output 6144 -> 3072,
+    // mlp/down 17408 -> 8704). Not a new kernel: the shard is the same row-split tensor with K
+    // halved, so `q5_linear_add_mma_r64_c*` (q5_linear_add_gemm_mma.cu) already reads N and K from
+    // the Weight/Tensor at runtime and its `Full` grid predicate already handles K % 64 == 0 at the
+    // halved extent. Only the GEMV (T=1) and split2 (T=2..16/17) schedules are K-EXACT templates
+    // that do not cover the halved K, so the shard routes below skip straight to the generic MMA
+    // schedule for every token count -- see kK3072ShardRoutes / kK8704ShardRoutes.
+    {5120, 3072, 3072},
+    {5120, 8704, 8704},
 }};
 
 #ifdef NINFER_VOLTA_BUILD
@@ -55,7 +64,7 @@ constexpr std::array<SupportSpec, 2> kSupports{{
 // ~0.17%; 19.6x measured speedup at the real N=5120/K=17408/T=256 down-proj shape on this
 // V100). Cold-cache sweeps place both CUTLASS crossovers at T=17: for k=6144 the last SIMT
 // win is T=16 (429us versus 439us), while for k=17408 the exact split2 route owns through T=16
-// and the former wide-T SIMT route is already slower than CUTLASS at T=17. See docs/v100.md.
+// and the former wide-T SIMT route is already slower than CUTLASS at T=17. See the V100 performance summary.
 constexpr std::array<RouteSpec, 4> kK6144Routes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
@@ -74,8 +83,8 @@ constexpr std::array<RouteSpec, 6> kK6144Routes{{
     {{2, 13}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{14, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S4},
-    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
 constexpr std::array<RouteSpec, 6> kK17408Routes{{
@@ -83,10 +92,26 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
     {{2, 16}, Q5LinearAddScheduleId::Split2ExactResidual},
     {{17, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
-    {{49, 192}, Q5LinearAddScheduleId::MmaResidualR64C32S3},
-    {{193, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 #endif
+
+// TP2 row-parallel shard routes (K = 3072, 8704). GemvResidual and Split2ExactResidual are K-EXACT
+// templates that do not cover a halved K (see q5_linear_add_gemv.cu / q5_linear_add_gemm_simt.cu),
+// so unlike the tp1 tables above, every token count here routes straight to one of the MMA
+// schedules -- MmaResidualR64C* is fully N/K-generic (q5_linear_add_gemm_mma.cu reads both from the
+// Weight/Tensor at runtime), so this is the SAME qualified compute body as the tp1 route at T>=14
+// (K=6144) / T>=17 (K=17408), not a new kernel. Q5's own ops::linear shard table makes the
+// identical choice for its plain GEMV/split2-exact schedules
+// (src/ops/linear/q5/q5_dispatch.cpp), and this is a performance decision only; re-measuring the
+// shard's own T=1..13 crossover is deliberately deferred tuning work.
+constexpr std::array<RouteSpec, 4> kShardRoutes{{
+    {{1, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
@@ -99,7 +124,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kShardRoutes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
@@ -124,10 +150,8 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.r64.c16.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C24:
         return "linear_add.q5.mma.r64.c24.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
-        return "linear_add.q5.mma.r64.c32.s3.cta_collective_residual";
-    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
-        return "linear_add.q5.mma.r64.c32.s4.cta_collective_residual";
+    case Q5LinearAddScheduleId::MmaResidualR64C64:
+        return "linear_add.q5.mma.r64.c64.cta_collective_residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         return "linear_add.q5.mma.r64.c128.cta_collective_residual";
     case Q5LinearAddScheduleId::SimtWideTResidual:
@@ -196,7 +220,9 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    if (problem.k == 6144) { return resolve_from(kK6144Routes); }
+    if (problem.k == 17408) { return resolve_from(kK17408Routes); }
+    return resolve_from(kShardRoutes); // K == 3072 or 8704, already checked by supported_shape()
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,
@@ -216,8 +242,7 @@ std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32
 }
 
 void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, const Weight& w,
-                                Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
-
+                                Tensor& residual_out, WorkspaceArena* ws, cudaStream_t stream) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan resolved = q5_linear_add_resolve_plan(problem);
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
@@ -240,11 +265,8 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     case Q5LinearAddScheduleId::MmaResidualR64C24:
         q5_linear_add_mma_r64_c24_launch(x, w, residual_out, stream);
         return;
-    case Q5LinearAddScheduleId::MmaResidualR64C32S3:
-        q5_linear_add_mma_r64_c32_s3_launch(x, w, residual_out, stream);
-        return;
-    case Q5LinearAddScheduleId::MmaResidualR64C32S4:
-        q5_linear_add_mma_r64_c32_s4_launch(x, w, residual_out, stream);
+    case Q5LinearAddScheduleId::MmaResidualR64C64:
+        q5_linear_add_mma_r64_c64_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128:
         q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
@@ -256,15 +278,17 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 #ifdef NINFER_VOLTA_BUILD
         // Reads the residual as C and writes the sum back as D -- the same beta=1 epilogue
         // contract the CUTLASS schedule provides.
+        if (ws == nullptr) { throw std::invalid_argument("Q5 Volta MMA requires workspace"); }
         launch_q5_volta_mma(x, w, residual_out, /*add_residual=*/true, /*weight_row_offset=*/0,
-                            ws, stream);
+                            *ws, stream);
         return;
 #else
         throw std::logic_error("q5 linear_add: VoltaMmaFusedResidual is Volta-only");
 #endif
     case Q5LinearAddScheduleId::CutlassSm70TensorCoreResidual:
 #ifdef NINFER_VOLTA_BUILD
-        q5_linear_add_cutlass_sm70_launch(x, w, residual_out, ws, stream);
+        if (ws == nullptr) { throw std::invalid_argument("Q5 CUTLASS requires workspace"); }
+        q5_linear_add_cutlass_sm70_launch(x, w, residual_out, *ws, stream);
         return;
 #else
         throw std::logic_error("q5 linear_add: CutlassSm70TensorCoreResidual is Volta-only");
@@ -274,7 +298,7 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
 }
 
 void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                            WorkspaceArena& ws, cudaStream_t stream) {
+                            WorkspaceArena* ws, cudaStream_t stream) {
     const Q5LinearAddProblem problem{residual_out.ne[0], x.ne[0], w.padded_shape[1], x.ne[1]};
     const Q5LinearAddPlan plan = q5_linear_add_resolve_plan(problem);
     q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);

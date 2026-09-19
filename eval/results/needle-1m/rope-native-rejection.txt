@@ -1,0 +1,22 @@
+# --rope native past the registered 262,144-position ceiling: rejected by admission.
+#
+# There is no debug override that would allow a `--rope native` diagnostic row at 1M:
+# rope_effective_max_context()
+# (src/targets/qwen3_6/impl/runtime/yarn_rope.cpp:98-153) computes the ceiling as the
+# variant's native capacity under RopeMode::Native and rejects any larger --max-context
+# unconditionally. Neither apps/cli/options.cpp nor src/serve/serve_options.cpp exposes an
+# override. Captured on this machine; the rejection is raised during engine construction,
+# before any needle prompt is built.
+#
+# host: 2x NVIDIA GeForce RTX 5090, both at a 400 W power limit (defaults 600 W / 575 W)
+# captured: 2026-08-28T14:44:08Z
+
+$ ./build/apps/ninfer /home/pc/models/ninfer-38/huihui-nvfp4/qwen3_8_27b_nvfp4.ninfer \
+    --tp 2 --devices 0,1 --rope native --max-context 1048576 \
+    --kv-dtype int8 --kv-capacity auto --prompt "Say hello." --max-new 4 --greedy
+
+phase       detail                      elapsed/progress
+error: max_context 1048576 exceeds the variant native context capacity 262144
+
+# For contrast, the same command with --rope yarn --yarn-factor 4.0 --yarn-origin 262144
+# is admitted and is what every 1M row in this campaign ran on.

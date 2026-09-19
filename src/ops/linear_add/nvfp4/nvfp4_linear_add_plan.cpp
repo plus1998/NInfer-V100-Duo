@@ -24,16 +24,24 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
     W4A4,
 };
 
+// The 6144/17408 families each admit their tp1 extent and its tp2 row-parallel half (3072/8704):
+// the shard is the same kernel template at a halved K, so it inherits the parent's measured A16/
+// W4A4 crossover rather than getting one re-measured for it (see nvfp4_config.h's
+// Nvfp4LinearSmallTProductionSchedule specializations for the shard geometries, which do the same
+// inheritance at the schedule level).
+bool is_6144_family(std::int32_t input_rows) { return input_rows == 6144 || input_rows == 3072; }
+bool is_17408_family(std::int32_t input_rows) { return input_rows == 17408 || input_rows == 8704; }
+
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+    if (tokens <= 0 || output_rows != 5120 ||
+        !(is_6144_family(input_rows) || is_17408_family(input_rows))) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) {
 #ifdef NINFER_VOLTA_BUILD
-        // Prepacked down projections are consumed by QPN2 for every decode width. Materialize the
-        // projection and add the residual separately because the row-major fused kernels cannot
-        // read that load-time layout.
+        // The load-time-prepacked MLP down projection is consumed by QPN2 at every decode width;
+        // the fused row-major kernels cannot read that layout.
         return Nvfp4LinearAddRoute::LinearThenAdd;
 #else
         return Nvfp4LinearAddRoute::A16;
@@ -42,13 +50,8 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported policy");
     }
-    const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
-    if (tokens >= first_w4a4) { return Nvfp4LinearAddRoute::W4A4; }
-#ifdef NINFER_VOLTA_BUILD
-    return Nvfp4LinearAddRoute::LinearThenAdd;
-#else
-    return Nvfp4LinearAddRoute::A16;
-#endif
+    const std::int32_t first_w4a4 = is_6144_family(input_rows) ? 7 : 8;
+    return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -130,7 +133,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                               LinearPolicy policy, WorkspaceArena& workspace,
+                               LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
     const Nvfp4LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Nvfp4LinearAddRoute::A16) {
@@ -139,12 +142,16 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
     }
 #ifdef NINFER_VOLTA_BUILD
     if (route == Nvfp4LinearAddRoute::LinearThenAdd) {
-        launch_linear_then_add(x, weight, residual, workspace, stream);
+        if (!workspace) throw std::invalid_argument("nvfp4 linear_add requires workspace");
+        launch_linear_then_add(x, weight, residual, *workspace, stream);
         return;
     }
 #endif
-    auto scope                       = workspace.scope();
-    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], weight.k);
+    if (workspace == nullptr) {
+        throw std::invalid_argument("nvfp4 W4A4 linear_add requires caller workspace");
+    }
+    auto scope                       = workspace->scope();
+    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_linear_add_w4a4_launch(x, weight, residual, scratch, stream);
 }
 
