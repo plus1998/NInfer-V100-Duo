@@ -29,6 +29,9 @@ hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
 
 NInfer uses the official v3 artifact.
 
+[Swift Qwen3.8-27B Abliterated NVFP4](https://huggingface.co/Dragoy/Swift-Qwen3.8-27B-abliterated-NVFP4-NInfer)
+has also been tested successfully. Benchmark data is not currently available for this model.
+
 ## Quick Start
 
 After downloading the model, build and start NInfer:
