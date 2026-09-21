@@ -3,6 +3,7 @@
 #include "artifact/typed_binding.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/common/split_launch.h"
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #endif
 #include "targets/qwen3_6_27b/impl/config.h"
@@ -1079,6 +1080,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     final_norm = artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16,
                                                {5120}, device);
     output_head = materialized_weight(backing, plan.output_head, 248320 / tp, 5120, device);
+#ifdef NINFER_VOLTA_BUILD
+    if (output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        ::ninfer::ops::detail::fp8_prepack_qpn_sm70(output_head);
+    }
+#endif
     if (plan.features.optimized_proposal()) {
         auto& proposal = runtime.optimized_proposal.emplace();
         proposal.head =

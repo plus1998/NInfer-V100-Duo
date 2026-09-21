@@ -154,7 +154,9 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_
     if (window <= 0) { return launch_capacity; }
     int splits = 0;
     if constexpr (Int8) {
-        if (tokens == 5 && window > 128 && window <= 512) {
+        if (tokens == 4 && window > 5000 && window <= 8198) {
+            splits = div_up(window, 192 / Geometry::DecodeSplitScale);
+        } else if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::DecodeSplitScale);
         } else if (tokens == 6 && window > 128 && window <= 160) {
             splits = div_up(window, 24 / Geometry::DecodeSplitScale);

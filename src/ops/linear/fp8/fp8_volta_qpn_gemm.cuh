@@ -85,7 +85,7 @@ __device__ __forceinline__ void fp8_decode_quad(std::uint32_t word, half2& lo, h
 // nvfp4_volta_qpn_gemm.cuh, which got them first; this is the same pattern applied to the
 // simpler single-projection kernel. The shared reduce buffer is SPLITK * kTiles * 256 floats, so
 // SPLITK=16 at kTiles=4 is never instantiated (64 KB, over Volta's 48 KB static limit).
-template <int kTiles, int SPLITK, int NACC, class OutputPolicy>
+template <int kTiles, int SPLITK, int NACC, bool Prepacked, class OutputPolicy>
 __global__ __launch_bounds__(
     SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
         ? 1
@@ -110,8 +110,10 @@ __global__ __launch_bounds__(
     // line.
     const int blocks = k / S::kKPerBlock;
     const int bq     = blocks / SPLITK;
-    const int b0     = warp * bq;
-    const int bend   = (warp == SPLITK - 1) ? blocks : b0 + bq;
+    // A TP2 residual K=8704 has 68 blocks for eight warps; spread its four extra blocks.
+    const int extra  = blocks % SPLITK;
+    const int b0     = warp * bq + min(warp, extra);
+    const int bend   = b0 + bq + (warp < extra);
 
     const std::uint8_t* crow = codes + static_cast<std::int64_t>(good ? col : 0) * k;
 
@@ -126,11 +128,19 @@ __global__ __launch_bounds__(
     }
 
     for (int b = b0; b < bend; ++b) {
-        // One 128-byte line per lane per iteration: 128 adjacent k, eight uint4 loads.
-        const std::uint8_t* p = crow + static_cast<std::int64_t>(b) * S::kKPerBlock;
         uint4 cw[8];
 #pragma unroll
-        for (int e = 0; e < 8; ++e) { cw[e] = __ldg(reinterpret_cast<const uint4*>(p + 16 * e)); }
+        for (int e = 0; e < 8; ++e) {
+            if constexpr (Prepacked) {
+                const std::int64_t index =
+                    (((static_cast<std::int64_t>(blockIdx.x) * blocks + b) * 8 + e) * 32) + lane;
+                cw[e] = __ldg(reinterpret_cast<const uint4*>(codes) + index);
+            } else {
+                // One 128-byte line per lane per iteration: 128 adjacent k, eight uint4 loads.
+                const std::uint8_t* p = crow + static_cast<std::int64_t>(b) * S::kKPerBlock;
+                cw[e] = __ldg(reinterpret_cast<const uint4*>(p + 16 * e));
+            }
+        }
 
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
@@ -228,6 +238,7 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata);
     const auto* scales = static_cast<const __nv_bfloat16*>(w.scales);
     const auto* xd     = static_cast<const __nv_bfloat16*>(x.data);
+    const bool vocabulary = n >= 100000 && k == 5120;
     // Generation-2 winners from a private sweep (bench/ops/fp8_qpn8_splitk_sweep.cu, deleted):
     // SPLITK8 NACC1 wins at every kTiles on attn input, GDN input, and the 17408-K residual shape
     // (1.08-1.55x over SPLITK4). The 6144-K residual shape is the one exception -- SPLITK16 wins
@@ -237,19 +248,47 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     // registers on a kernel that is already issue/DRAM-bound, not dependency-bound.
     const bool wide_k_headroom = k == 6144;
     if (t <= S::kRowsPerTile) {
-        if (wide_k_headroom) {
-            fp8_volta_qpn_gemm_kernel<1, 16, 1><<<grid, 16 * 32, 0, stream>>>(codes, scales, xd, n,
-                                                                              k, t, output);
+        if (vocabulary) {
+            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+                fp8_volta_qpn_gemm_kernel<1, 4, 1, true><<<grid, 4 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            } else {
+                fp8_volta_qpn_gemm_kernel<1, 4, 1, false><<<grid, 4 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            }
+        } else if (wide_k_headroom) {
+            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+                fp8_volta_qpn_gemm_kernel<1, 16, 1, true><<<grid, 16 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            } else {
+                fp8_volta_qpn_gemm_kernel<1, 16, 1, false><<<grid, 16 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            }
         } else {
-            fp8_volta_qpn_gemm_kernel<1, 8, 1><<<grid, 8 * 32, 0, stream>>>(codes, scales, xd, n, k,
-                                                                            t, output);
+            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+                fp8_volta_qpn_gemm_kernel<1, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            } else {
+                fp8_volta_qpn_gemm_kernel<1, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
+                    codes, scales, xd, n, k, t, output);
+            }
         }
     } else if (t <= 2 * S::kRowsPerTile) {
-        fp8_volta_qpn_gemm_kernel<2, 8, 1><<<grid, 8 * 32, 0, stream>>>(codes, scales, xd, n, k, t,
-                                                                        output);
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+            fp8_volta_qpn_gemm_kernel<2, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
+                codes, scales, xd, n, k, t, output);
+        } else {
+            fp8_volta_qpn_gemm_kernel<2, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
+                codes, scales, xd, n, k, t, output);
+        }
     } else {
-        fp8_volta_qpn_gemm_kernel<4, 8, 1><<<grid, 8 * 32, 0, stream>>>(codes, scales, xd, n, k, t,
-                                                                        output);
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+            fp8_volta_qpn_gemm_kernel<4, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
+                codes, scales, xd, n, k, t, output);
+        } else {
+            fp8_volta_qpn_gemm_kernel<4, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
+                codes, scales, xd, n, k, t, output);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

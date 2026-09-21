@@ -85,6 +85,26 @@ int run_fp8_a16() {
     failures +=
         run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                   {5120, 17408, 829U, Comparison::Sampled, true, residual17408_invocations});
+    constexpr std::array tp2_down_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("FP8_A16 TP2 down", ActivationCompute::A16, make_fp8_weight,
+                          {5120, 8704, 833U, Comparison::Sampled, true, tp2_down_invocations});
+    constexpr std::array prepacked_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{4, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("FP8_A16 Volta QPN prepacked", ActivationCompute::A16, make_fp8_weight,
+                          {7168, 5120, 835U, Comparison::Sampled, true,
+                           prepacked_invocations, true});
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {

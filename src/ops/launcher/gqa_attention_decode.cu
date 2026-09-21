@@ -54,6 +54,9 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
 
 template <typename Geometry>
 std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+    if (kv_dtype == DType::I8 && tokens == 4 && window > 5000 && window <= 8198) {
+        return div_up(window, 192 / Geometry::DecodeSplitScale);
+    }
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.

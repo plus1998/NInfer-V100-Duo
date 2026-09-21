@@ -497,6 +497,7 @@ int run_int8_split_policy_cases() {
     // A1 and A3 both compare every output directly with the fixture's FP64 oracle.
     constexpr Geometry geometry{"qwen3_6_27b_tp2", 12, 2};
     constexpr AttentionCase cases[] = {
+        {4, 6138, 8199, 600u},
         {5, 252, 257, 601u},
         {6, 139, 145, 602u},
         {6, 6138, 8199, 603u},

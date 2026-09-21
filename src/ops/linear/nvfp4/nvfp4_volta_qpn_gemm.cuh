@@ -419,7 +419,8 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
 //   - the split SwiGLU kernel's per-half shape (17408 rows, 544 CTAs): SPLITK=16 at *both*
 //     kTiles=1 and kTiles=2 (344.2 vs 279.8 GB/s at T=4; 214.4 vs 209.3 at T=16) --
 //     bench/ops/nvfp4_qpn2_split_shape_sweep.cu, deleted.
-//   - down (5120 rows, 160 CTAs): SPLITK=8 tops out, 16 is worse.
+//   - tp1 down (5120 rows, K=17408, 160 CTAs): SPLITK=8 tops out, 16 is worse.
+//     TP2 down (K=8704) has half the K work; SPLITK=16 wins at T=4 in whole decode.
 // NACC barely moves any of them once SPLITK is right, so it only varies where it measured a real
 // (if small) edge. Geometries this dispatch doesn't name (attn/gdn input, the 6144-residual)
 // aren't reached by the mixed artifact's routing and fall to the SPLITK=8 default, which was never
@@ -455,8 +456,9 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     const bool prepacked  = w.layout == QuantLayout::VoltaQpnPrepacked;
     const bool gate_up    = (n == 34816 && k == 5120);
     const bool split_half = (n == 17408 && k == 5120);
+    const bool tp2_down   = (n == 5120 && k == 8704);
     if (t <= S::kRowsPerTile) {
-        if (gate_up || split_half) {
+        if (gate_up || split_half || tp2_down) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
                                                 inverse_weight_divisor, output, stream);
         } else {
