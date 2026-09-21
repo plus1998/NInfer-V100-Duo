@@ -52,10 +52,16 @@ The deterministic synthetic continuation measures the high-acceptance ceiling. I
 
 | Prefill | Decode | MTP accepted | Tokens/round |
 |---:|---:|---:|---:|
-| 1,012.85 +/- 0.14 tok/s | **109.39 +/- 0.05 tok/s** | **576 / 576 (100%)** | 4.00 |
+| 1,013.94 +/- 0.17 tok/s | **123.97 +/- 0.06 tok/s** | **576 / 576 (100%)** | 4.00 |
 
-Real programming behavior was measured through one persistent `ninfer-serve` process with prefix
-reuse disabled. The three repository code fixtures use the same fixed seed and request up to 4,096
+On this workload, routing the FP8 GDN and attention TP2 small-token projections through the Volta
+QPN tensor-core kernels improved decode from 109.27 to 123.97 tok/s (+13.4%) on the same artifact
+and hardware. The three measured continuations matched the pre-optimization tokens exactly; the
+TP2 projections also pass independent sampled FP64 checks at the four-token decode shape.
+
+The following real programming behavior was measured before this decode optimization through one
+persistent `ninfer-serve` process with prefix reuse disabled. It has not been remeasured on the
+current build. The three repository code fixtures use the same fixed seed and request up to 4,096
 completion tokens:
 
 | Fixture | Prompt | Completion | Finish | Decode | MTP accepted | Tokens/round |

@@ -53,6 +53,9 @@ void fp8_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor
 void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,
                                      cudaStream_t stream);
+void launch_fp8_attn_input_volta_qpn_shard(const Tensor& x, const Weight& weight, Tensor& query,
+                                           Tensor& gate, Tensor& key, Tensor& value,
+                                           cudaStream_t stream);
 #endif
 
 } // namespace ninfer::ops::detail

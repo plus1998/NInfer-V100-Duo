@@ -1,5 +1,6 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
 
 #include <cuda_bf16.h>
@@ -18,6 +19,15 @@ void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tens
                                          static_cast<__nv_bfloat16*>(key.data),
                                          static_cast<__nv_bfloat16*>(gate.data),
                                          static_cast<__nv_bfloat16*>(value.data)};
+    launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
+}
+
+void launch_fp8_attn_input_volta_qpn_shard(const Tensor& x, const Weight& weight, Tensor& query,
+                                           Tensor& gate, Tensor& key, Tensor& value,
+                                           cudaStream_t stream) {
+    const Fp8AttentionInputShardOutput<Fp8AttnInputTp2ColumnGeometry> output{
+        static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(value.data)};
     launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
 }
 

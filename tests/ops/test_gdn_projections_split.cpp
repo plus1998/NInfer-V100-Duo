@@ -59,6 +59,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -292,6 +293,24 @@ int compare(const std::string& label, const std::vector<double>& got,
     return verify_reduction(label, got, expected, criterion);
 }
 
+int verify_fp8_sample(const std::string& label, const qw::PackedWeight& weight,
+                      const std::vector<float>& activation, const std::vector<double>& output,
+                      std::int32_t output_stride, std::int32_t output_offset,
+                      std::int32_t weight_offset, std::int32_t section_rows, std::int32_t tokens) {
+    std::vector<double> actual, expected;
+    for (const std::int32_t token : {0, tokens / 2, tokens - 1}) {
+        for (const std::int32_t row : {0, section_rows / 2, section_rows - 1}) {
+            actual.push_back(output[static_cast<std::size_t>(token) * output_stride +
+                                    output_offset + row]);
+            expected.push_back(qw::dot_fp64(weight, weight_offset + row,
+                                            activation.data() + static_cast<std::size_t>(token) *
+                                                                    kInputRows,
+                                            kInputRows));
+        }
+    }
+    return compare(label + " FP64", actual, expected);
+}
+
 // Extracts, per token, `block_rows` rows starting at `row_offset` from a `stride_rows`-row packed
 // buffer. One helper serves every section of every form (reference and shard alike), since the
 // qkv/z row-offset convention (0/2048/4096 tp1, 0/1024/2048 shard) is identical across NVFP4, FP8,
@@ -386,7 +405,7 @@ int run_fused_case(const ExecutionContext& ec, QType qtype,
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4/A8 route under the permissive
     // policy), T=1024 (a multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, and the
     // shard's own TMA descriptor per the w4a4.cu/w4a4_tma.cu changes).
-    const std::vector<std::int32_t> tokens_sweep{1, 2, 5, 8, 17, 32, 48, 128, 1024};
+    const std::vector<std::int32_t> tokens_sweep{1, 2, 4, 5, 8, 17, 32, 48, 128, 1024};
 
     for (const std::int32_t tokens : tokens_sweep) {
         std::vector<float> activation(static_cast<std::size_t>(kInputRows) * tokens);
@@ -476,6 +495,23 @@ int run_fused_case(const ExecutionContext& ec, QType qtype,
                                                       static_cast<std::size_t>(kShardQkvRows) * tokens);
                 observed_z[slot] = from_device_bf16(split_z[slot]->data(),
                                                     static_cast<std::size_t>(kShardValueRows) * tokens);
+
+                if (qtype == QType::FP8_E4M3FN_ROW_BF16S && tokens > 1 && tokens <= 32) {
+                    const auto& packed = shard[slot].shard;
+                    failures += verify_fp8_sample(prefix + " q", packed, activation,
+                                                  observed_qkv[slot], kShardQkvRows, 0, 0,
+                                                  kShardKeyRows, tokens);
+                    failures += verify_fp8_sample(prefix + " k", packed, activation,
+                                                  observed_qkv[slot], kShardQkvRows, kShardKeyRows,
+                                                  kShardKeyRows, kShardKeyRows, tokens);
+                    failures += verify_fp8_sample(prefix + " v", packed, activation,
+                                                  observed_qkv[slot], kShardQkvRows,
+                                                  2 * kShardKeyRows, 2 * kShardKeyRows,
+                                                  kShardValueRows, tokens);
+                    failures += verify_fp8_sample(prefix + " z", packed, activation,
+                                                  observed_z[slot], kShardValueRows, 0,
+                                                  kShardQkvRows, kShardValueRows, tokens);
+                }
 
                 failures += compare(
                     prefix + " q",
@@ -1221,7 +1257,12 @@ int verify_split_rejections(const ExecutionContext& ec) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool fp8_only = argc == 2 && std::string_view(argv[1]) == "--fp8-only";
+    if (argc != 1 && !fp8_only) {
+        std::cerr << "usage: ninfer_gdn_projections_split_test [--fp8-only]\n";
+        return 2;
+    }
     int failures = verify_registry();
     if (failures != 0) {
         std::cout << "FAIL gdn_projections split (registry)\n";
@@ -1249,14 +1290,27 @@ int main() {
               << '\n';
 
     failures += verify_split_rejections(ec);
+    cudaDeviceProp device_props{};
+    cuda_check(cudaGetDeviceProperties(&device_props, 0), "cudaGetDeviceProperties");
+    if (!fp8_only) {
+        failures += run_fused_case(
+            ec, QType::NVFP4,
+            device_props.major >= 12
+                ? std::vector{ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}
+                : std::vector{ops::LinearPolicy::A16Only},
+            41u);
+    }
     failures += run_fused_case(
-        ec, QType::NVFP4, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}, 41u);
-    failures += run_fused_case(
-        ec, QType::FP8_E4M3FN_ROW_BF16S, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8},
+        ec, QType::FP8_E4M3FN_ROW_BF16S,
+        device_props.major >= 10
+            ? std::vector{ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}
+            : std::vector{ops::LinearPolicy::A16Only},
         45u);
-    failures += run_split_storage_case(ec, 43u);
-    failures += run_gating_case(ec, 51u);
-    failures += run_gating_fused_case(ec, 53u, 48);
+    if (!fp8_only) {
+        failures += run_split_storage_case(ec, 43u);
+        failures += run_gating_case(ec, 51u);
+        failures += run_gating_fused_case(ec, 53u, 48);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " gdn_projections split\n";
     return failures ? 1 : 0;

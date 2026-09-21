@@ -107,7 +107,13 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
         return;
     }
 #endif
+#ifdef NINFER_VOLTA_BUILD
+    const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
+    const std::int32_t kChunk =
+        qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+#else
     constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+#endif
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -120,6 +126,12 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor qkv_chunk(qkv_output, DType::BF16, {kQkvRows, active});
         Tensor z_chunk(z_output, DType::BF16, {kZRows, active});
+#ifdef NINFER_VOLTA_BUILD
+        if (active > 1 && fp8_volta_qpn_supported(weight.n, weight.k, active)) {
+            launch_fp8_gdn_input_volta_qpn_shard(input_chunk, weight, qkv_chunk, z_chunk, stream);
+            continue;
+        }
+#endif
         if (active == 1) {
             fp8_gdn_input_decode_launch_shard(input_chunk, weight, qkv_chunk, z_chunk, stream);
         } else {
