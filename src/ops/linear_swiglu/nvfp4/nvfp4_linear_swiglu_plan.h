@@ -28,8 +28,7 @@ void nvfp4_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight,
 [[nodiscard]] bool nvfp4_linear_swiglu_volta_qpn_supported(std::int32_t k, std::int32_t t) noexcept;
 
 void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                          float* gate_scratch, float* up_scratch,
-                                          void* activation_scratch,
+                                          float* gate_scratch, void* activation_scratch,
                                           cudaStream_t stream);
 [[nodiscard]] bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
                                                             std::int32_t t) noexcept;

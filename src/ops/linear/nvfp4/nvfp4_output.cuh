@@ -30,13 +30,10 @@ struct Nvfp4ContiguousOutput {
     }
 };
 
-// Writes the mma accumulator straight through, no BF16 round. Exists for split-projection SwiGLU
-// (see nvfp4_linear_swiglu_qpn_split.cuh): two independent QPN2 launches -- one per weight half,
-// unmodified, at whatever schedule QPN2 already measured fastest for this shape -- write gate and
-// up into two fp32 scratch planes, and a small combine kernel applies silu(gate)*up in fp32 before
-// the single BF16 round. Splitting keeps each launch at QPN2's own tuned register/occupancy
-// profile instead of the fused kernel's doubled one; see the plan.cpp route for the measured
-// comparison.
+// Writes the mma accumulator straight through, no BF16 round. Split-projection SwiGLU uses this
+// for its gate pass; its up pass reads that fp32 plane from a fused output policy and performs the
+// activation before the only BF16 round. Splitting keeps each launch at QPN2's tuned
+// register/occupancy profile instead of the fused kernel's doubled one.
 struct Nvfp4Fp32ContiguousOutput {
     float* data;
     std::int32_t rows;

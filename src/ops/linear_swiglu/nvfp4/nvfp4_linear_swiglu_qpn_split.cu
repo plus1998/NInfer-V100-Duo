@@ -5,7 +5,6 @@
 
 #include <cuda_bf16.h>
 
-#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -26,8 +25,7 @@ bool nvfp4_linear_swiglu_qpn_split_supported(std::int32_t n, std::int32_t k,
 }
 
 void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                          float* gate_scratch, float* up_scratch,
-                                          void* activation_scratch,
+                                          float* gate_scratch, void* activation_scratch,
                                           cudaStream_t stream) {
     const std::int32_t k = x.ne[0];
     const std::int32_t t = x.ne[1];
@@ -55,14 +53,10 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
         x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
         kIntermediate, inverse_weight_divisor, stream);
     launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16, Nvfp4Fp32ContiguousOutput{up_scratch, kIntermediate},
+        x, up_weight, x_fp16,
+        Nvfp4SwiGluFromGateOutput{gate_scratch, static_cast<__nv_bfloat16*>(out.data),
+                                  kIntermediate},
         kIntermediate, inverse_weight_divisor, stream);
-
-    const std::int64_t elements = static_cast<std::int64_t>(kIntermediate) * t;
-    const int threads           = 256;
-    const int blocks = static_cast<int>(std::min<std::int64_t>((elements + threads - 1) / threads, 4096));
-    nvfp4_swiglu_fp32_combine_kernel<<<blocks, threads, 0, stream>>>(
-        gate_scratch, up_scratch, static_cast<__nv_bfloat16*>(out.data), elements);
     CUDA_CHECK(cudaGetLastError());
 }
 

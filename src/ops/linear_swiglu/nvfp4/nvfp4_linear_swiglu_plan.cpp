@@ -44,9 +44,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
 #ifdef NINFER_VOLTA_BUILD
-        // T>=2 on Volta: two independent QPN2 passes (one per weight half) into fp32 scratch, then
-        // a combine kernel applies silu(gate)*up before the single BF16 round -- not the fused
-        // single-kernel route (VoltaQpnFused, still built and correct, now unused in production)
+        // T>=2 on Volta: two independent QPN2 passes (one per weight half). Gate is retained in
+        // fp32 scratch and the up pass applies silu(gate)*up before the single BF16 round -- not
+        // the fused single-kernel route (VoltaQpnFused, still built and correct, now unused in production)
         // and not the unfused linear()+silu_mul() composition (tried first, failed the
         // correctness test the same way the fused kernel's own precision note explains). Measured
         // against the fused kernel directly at T=4: 371.6 GB/s per QPN2 pass against the fused
@@ -114,7 +114,6 @@ std::size_t baseline_workspace_bytes(std::int32_t tokens) {
 #ifdef NINFER_VOLTA_BUILD
 struct Nvfp4QpnSplitWorkspace {
     DeviceSpan gate;
-    DeviceSpan up;
     DeviceSpan activation;
 };
 
@@ -124,7 +123,6 @@ Nvfp4QpnSplitWorkspace allocate_qpn_split_workspace(Allocator& allocator, std::i
     const std::size_t bytes = static_cast<std::size_t>(kIntermediate) * tokens * sizeof(float);
     Nvfp4QpnSplitWorkspace out;
     out.gate = allocator.alloc_bytes(bytes, 256);
-    out.up   = allocator.alloc_bytes(bytes, 256);
     out.activation = allocator.alloc_bytes(
         static_cast<std::size_t>(Geometry::kInputRows) * tokens * sizeof(std::uint16_t),
         256);
@@ -164,7 +162,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     (void)resolve_route(policy, max_tokens);
     if (policy == LinearPolicy::A16Only) {
         // The fused A16 kernel (T==1 only) needs no transient; the baseline route needs its
-        // projected plane; the Volta split route needs its two fp32 scratch planes. Checked via
+        // projected plane; the Volta split route needs its gate fp32 scratch plane. Checked via
         // resolve_route rather than a hardcoded token threshold since the boundary differs by
         // build.
         const Nvfp4LinearSwiGluRoute route = resolve_route(policy, max_tokens);
@@ -260,7 +258,6 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
             allocate_qpn_split_workspace<Geometry>(*workspace, x.ne[1]);
         nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
                                              reinterpret_cast<float*>(scratch.gate.data),
-                                             reinterpret_cast<float*>(scratch.up.data),
                                              scratch.activation.data, stream);
         return;
     }
@@ -289,7 +286,6 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
             allocate_qpn_split_workspace<Geometry>(*workspace, x.ne[1]);
         nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
                                              reinterpret_cast<float*>(scratch.gate.data),
-                                             reinterpret_cast<float*>(scratch.up.data),
                                              scratch.activation.data, stream);
         return;
     }

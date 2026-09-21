@@ -52,7 +52,7 @@ The deterministic synthetic continuation measures the high-acceptance ceiling. I
 
 | Prefill | Decode | MTP accepted | Tokens/round |
 |---:|---:|---:|---:|
-| 1,023.79 +/- 0.18 tok/s | **132.75 +/- 0.01 tok/s** | **576 / 576 (100%)** | 4.00 |
+| 1,023.68 +/- 0.30 tok/s | **133.04 +/- 0.07 tok/s** | **576 / 576 (100%)** | 4.00 |
 
 On this workload, routing the FP8 GDN and attention TP2 small-token projections through the Volta
 QPN tensor-core kernels improved decode from 109.27 to 123.97 tok/s (+13.4%) on the same artifact
@@ -64,6 +64,9 @@ prefill measurements can vary between runs.
 Prepacking the decode-only FP8 output head and tuning its split-K schedule further raised decode
 to 129.33 tok/s without adding a persistent weight copy. Increasing the INT8 GQA attention work
 per split at this decode shape reduced partial and reduction overhead, reaching 132.75 tok/s.
+Fusing the NVFP4 SwiGLU activation into the up-projection epilogue removed one FP32 scratch plane
+and the separate combine launch while preserving the tuned projection kernels, reaching 133.04
+tok/s.
 
 The following real programming behavior was measured before this decode optimization through one
 persistent `ninfer-serve` process with prefix reuse disabled. It has not been remeasured on the

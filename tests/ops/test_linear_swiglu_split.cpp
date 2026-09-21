@@ -56,6 +56,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -871,7 +872,14 @@ int verify_split_rejections(const ExecutionContext& ec) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool nvfp4_a16_only =
+        argc == 2 && std::string_view(argv[1]) == "--nvfp4-a16-only";
+    if (argc != 1 && !nvfp4_a16_only) {
+        std::cerr << "usage: ninfer_linear_swiglu_split_test [--nvfp4-a16-only]\n";
+        return 2;
+    }
+
     int failures = verify_registry();
     if (failures != 0) {
         std::cout << "FAIL linear_swiglu split (registry)\n";
@@ -925,7 +933,13 @@ int main() {
         {"fp8 gate_up", QType::FP8_E4M3FN_ROW_BF16S, 38u, {1, 2, 3, 4, 5, 48, 128, 1024},
          {kA16, kA8}},
     };
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec); }
+    for (const Case& test_case : cases) {
+        if (nvfp4_a16_only && std::string_view(test_case.label) == "nvfp4 gate_up A16") {
+            failures += run_case(test_case, ec);
+        } else if (!nvfp4_a16_only) {
+            failures += run_case(test_case, ec);
+        }
+    }
 
     const std::vector<PipelineCase> pipeline_cases{
         {"nvfp4+nvfp4", QType::NVFP4, QType::NVFP4, 41u, 8, kA4},
@@ -940,8 +954,10 @@ int main() {
         {"fp8+fp8 T=1024", QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, 45u, 1024,
          kA16},
     };
-    for (const PipelineCase& test_case : pipeline_cases) {
-        failures += run_pipeline_case(test_case, ec, events);
+    if (!nvfp4_a16_only) {
+        for (const PipelineCase& test_case : pipeline_cases) {
+            failures += run_pipeline_case(test_case, ec, events);
+        }
     }
 
     std::cout << (failures ? "FAIL" : "OK") << " linear_swiglu split\n";
