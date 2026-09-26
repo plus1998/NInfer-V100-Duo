@@ -382,6 +382,13 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
+bool binds_nvfp4(const artifact::Binder& binder, std::string_view name) {
+    const auto* object = binder.find(name);
+    const auto* tensor =
+        object == nullptr ? nullptr : std::get_if<artifact::TensorDescriptor>(object);
+    return tensor != nullptr && tensor->format == NumericFormat::NVFP4;
+}
+
 void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
     const NumericFormat matrix_format = ggml_k ? NumericFormat::GGML_K : NumericFormat::FP8_E4M3FN_ROW_BF16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
@@ -422,7 +429,7 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (!ggml_k && layer < 56) {
+        if (binds_nvfp4(binder, prefix + "mlp/gate_up")) {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");

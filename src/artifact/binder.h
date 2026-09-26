@@ -90,6 +90,8 @@ public:
                                 std::span<const std::uint64_t> shape);
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
+    [[nodiscard]] const ObjectDescriptor* find(std::string_view name) const;
+
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);

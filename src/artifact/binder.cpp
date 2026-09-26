@@ -79,6 +79,8 @@ ObjectHandle Binder::require_resource(std::string_view name, ResourceEncoding en
     return handle;
 }
 
+const ObjectDescriptor* Binder::find(std::string_view name) const { return reader_.find(name); }
+
 const ObjectDescriptor& Binder::descriptor(ObjectHandle handle) const {
     if (handle.index >= reader_.objects().size()) {
         throw ArtifactError("artifact object handle is out of range");

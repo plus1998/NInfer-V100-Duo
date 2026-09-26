@@ -210,9 +210,19 @@ void test_official_qwen38_v3_if_configured() {
     if (path == nullptr || *path == '\0') { return; }
 
     Reader reader(path);
+    std::size_t nvfp4_mlp_layers = 0;
+    for (int layer = 0; layer < 64; ++layer) {
+        const auto* gate_up = std::get_if<TensorDescriptor>(
+            reader.find("text/layers/" + std::to_string(layer) + "/mlp/gate_up"));
+        if (gate_up == nullptr) {
+            throw std::runtime_error("qwen3.8 v3 projection omitted an MLP gate_up tensor");
+        }
+        if (gate_up->format == NumericFormat::NVFP4) { ++nvfp4_mlp_layers; }
+    }
     if (reader.identity().model_id != "qwen3.8-27b" ||
-        reader.identity().weights_id != "nvfp4" || reader.objects().size() != 1124) {
-        throw std::runtime_error("official qwen3.8 v3 projection identity or inventory mismatch");
+        reader.identity().weights_id != "nvfp4" ||
+        reader.objects().size() != 1012 + 2 * nvfp4_mlp_layers) {
+        throw std::runtime_error("qwen3.8 v3 projection identity or inventory mismatch");
     }
     const auto* qkgv = std::get_if<TensorDescriptor>(
         reader.find("text/layers/3/attention/query_key_gate_value"));

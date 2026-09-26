@@ -330,6 +330,7 @@ public:
         add("text/draft_head", {"proposal/head"});
         add("text/draft_head_token_ids", {"proposal/token_ids"});
 
+        std::size_t nvfp4_mlp_layers = 0;
         for (int layer = 0; layer < 64; ++layer) {
             const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
             add(prefix + "input_norm", {prefix + "input_norm"});
@@ -359,6 +360,7 @@ public:
             const auto& gate_up = add(prefix + "mlp/gate_up", {gate, up});
             add(prefix + "mlp/down", {prefix + "mlp/down"});
             if (require_string(gate_up.at("format"), "v3 tensor format") == "nvfp4") {
+                ++nvfp4_mlp_layers;
                 add_input_divisor(prefix + "mlp/gate_up_projection/input_scale_divisor",
                                   {gate, up});
                 add_input_divisor(prefix + "mlp/down_projection/input_scale_divisor",
@@ -413,8 +415,12 @@ public:
                 {"vision/merger/norm_" + std::string(part)});
         }
 
-        if (selected_.size() != 1124) {
-            throw ArtifactError("qwen3.8-27b v3 projection did not produce 1124 objects");
+        constexpr std::size_t kStructuralObjects = 1012;
+        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
+        if (selected_.size() != expected) {
+            throw ArtifactError("qwen3.8-27b v3 projection produced " +
+                                std::to_string(selected_.size()) + " objects; expected " +
+                                std::to_string(expected));
         }
         Json objects = Json::array();
         for (const auto& [old_name, object] : selected_) {
