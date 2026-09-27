@@ -131,6 +131,15 @@ tools/v100/ninfer-v100-duo.sh \
   --host 0.0.0.0 --port 8081 --max-concurrency 1
 ```
 
+`draft-tokens=N` selects the MTP window (default 3, valid 1..5). Measured on the three repository
+code fixtures with thinking off, `draft-tokens=4` raises decode speed and tokens per round and
+lowers the acceptance rate; its launch-time context ceiling is 203,712 instead of 203,776 tokens,
+so the 200,000-token capacity above is unchanged.
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/path/to/model.ninfer draft-tokens=4
+```
+
 ## Requirements
 
 - Linux x86_64

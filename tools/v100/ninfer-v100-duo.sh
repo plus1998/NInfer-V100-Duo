@@ -11,26 +11,47 @@ readonly cuda_lib_dir=/usr/local/cuda-12.8/lib64
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<EOF
-usage: ${BASH_SOURCE[0]} model=PATH [ninfer-serve options]
+usage: ${BASH_SOURCE[0]} model=PATH [draft-tokens=N] [ninfer-serve options]
 
 Starts the HTTP server with the dual-V100 production defaults:
   --tp 2 --devices 0,1 --max-context 200000 --kv-dtype int8
   --spec mtp --draft-tokens 3 --lm-head-draft
   --max-concurrency 1 --host 127.0.0.1 --port 8080
 
-Vision stays off: no --vision is passed, and --tp 2 rejects it at startup.
+model=PATH and draft-tokens=N are read from the leading key=value arguments; draft-tokens defaults
+to 3 and takes any MTP window in 1..5 (N=4 is the faster measured window: acceptance rate down,
+decode speed and tokens per round up, launch ceiling 203712 instead of 203776, 200000 unchanged).
+Any remaining arguments are passed to ninfer-serve after these defaults and therefore override them.
 
-Additional options are passed to ninfer-serve after these defaults.
+Vision stays off: no --vision is passed, and --tp 2 rejects it at startup.
 EOF
     exit 0
 fi
 
-if [[ "${1:-}" != model=* || -z "${1#model=}" ]]; then
+artifact=
+draft_tokens=3
+while [[ $# -gt 0 && "${1}" == ?*=?* ]]; do
+    key=${1%%=*}
+    value=${1#*=}
+    case "${key}" in
+        model)
+            artifact=${value} ;;
+        draft-tokens)
+            if [[ ! "${value}" =~ ^[1-5]$ ]]; then
+                echo "draft-tokens=N must be an integer in 1..5 (see --help)" >&2
+                exit 2
+            fi
+            draft_tokens=${value} ;;
+        *)
+            break ;;
+    esac
+    shift
+done
+readonly artifact draft_tokens
+if [[ -z "${artifact}" ]]; then
     echo "first argument must be model=PATH (see --help)" >&2
     exit 2
 fi
-readonly artifact=${1#model=}
-shift
 
 if [[ ! -x "${executable}" ]]; then
     echo "ninfer executable is missing: ${executable}" >&2
@@ -67,7 +88,7 @@ exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 \
     --max-context 200000 \
     --kv-dtype int8 \
-    --spec mtp --draft-tokens 3 --lm-head-draft \
+    --spec mtp --draft-tokens "${draft_tokens}" --lm-head-draft \
     --max-concurrency 1 \
     --host 127.0.0.1 --port 8080 \
     "$@"
