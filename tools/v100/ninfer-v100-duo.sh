@@ -14,9 +14,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 usage: ${BASH_SOURCE[0]} model=PATH [ninfer-serve options]
 
 Starts the HTTP server with the dual-V100 production defaults:
-  --tp 2 --devices 0,1 --max-context 196608 --kv-dtype int8
+  --tp 2 --devices 0,1 --max-context 200000 --kv-dtype int8
   --spec mtp --draft-tokens 3 --lm-head-draft
   --max-concurrency 1 --host 127.0.0.1 --port 8080
+
+Vision stays off: no --vision is passed, and --tp 2 rejects it at startup.
 
 Additional options are passed to ninfer-serve after these defaults.
 EOF
@@ -63,7 +65,7 @@ fi
 # changing the inference defaults.
 exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 \
-    --max-context 196608 \
+    --max-context 200000 \
     --kv-dtype int8 \
     --spec mtp --draft-tokens 3 --lm-head-draft \
     --max-concurrency 1 \

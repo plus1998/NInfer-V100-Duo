@@ -31,7 +31,8 @@ NInfer uses the official v3 artifact.
 
 ## Quick Start
 
-After downloading the model, build and start NInfer:
+Vision-off launch scheme: text-only Engine, no `--vision` passed (and `--tp 2` rejects it at
+startup), with a 200,000-token context capacity:
 
 ```bash
 tools/v100/build.sh
@@ -39,10 +40,15 @@ tools/v100/ninfer-v100-duo.sh \
   model="$HOME/models/Qwen3.8-27B-nvfp4-NInfer/qwen3_8_27b_nvfp4.ninfer"
 ```
 
+The launcher applies `--tp 2 --devices 0,1 --max-context 200000 --kv-dtype int8 --spec mtp
+--draft-tokens 3 --lm-head-draft --max-concurrency 1 --host 127.0.0.1 --port 8080`; any option
+passed after `model=` overrides that default. 200,000 tokens boots with about 155 MiB free per
+card, and this two-card profile tops out at 203,776 tokens.
+
 ## Performance
 
 Official Qwen3.8-27B NVFP4 v3 artifact, TP2, NVLink, INT8 group-64 KV, CUDA Graphs, optimized
-MTP3, greedy decoding, and the production 196,608-token context capacity.
+MTP3, greedy decoding, and a 196,608-token context capacity.
 
 The deterministic synthetic continuation measures the high-acceptance ceiling. It uses
 `PP6144+TG256`, a 1,024-token prefill chunk, one discarded warmup, and three measured repetitions:
@@ -80,10 +86,11 @@ completion tokens:
 These measurements used two V100-SXM2 16 GB cards and CUDA 12.8. Decode is committed output-token
 throughput and excludes the first token produced by prefill. The synthetic row is an acceptance
 ceiling, not expected application throughput; the code row is a three-request workload sample, not
-a quality evaluation. Each card holds 10.46 GiB of weights. The production context allocation
-leaves about 235 MiB startup headroom per card. A 201,024-token diagnostic configuration has also
-run, but leaves only about 133 MiB free per card. The native 262,144-token model ceiling does not
-fit this two-card 16 GiB profile.
+a quality evaluation. Each card holds 10.46 GiB of weights. The 196,608-token configuration used
+for these measurements leaves about 235 MiB startup headroom per card, and the production
+200,000-token allocation leaves about 155 MiB. The native 262,144-token model ceiling does not fit
+this two-card 16 GiB profile: the largest context this profile admits is 203,776 tokens, which
+leaves 71 MiB free per card.
 
 ## Build
 
@@ -109,10 +116,11 @@ Recommended production configuration:
 | Option | Value |
 |---|---|
 | Tensor parallelism | `--tp 2 --devices 0,1` |
-| Context capacity | `--max-context 196608` |
+| Context capacity | `--max-context 200000` |
 | KV cache | `--kv-dtype int8` |
 | Speculative decoding | `--spec mtp --draft-tokens 3 --lm-head-draft` |
 | Concurrency | `--max-concurrency 1` |
+| Vision | off; `--vision` is unsupported at `--tp 2` |
 
 The launcher requires the model path, binds to `127.0.0.1:8080`, and starts one request slot by
 default. Additional server options override those defaults:
