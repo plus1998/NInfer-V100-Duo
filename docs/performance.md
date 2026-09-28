@@ -365,51 +365,151 @@ NVFP4 baseline. We therefore do not quote those throughput figures as an NInfer 
 On September 28, 2026, the local **2 × Tesla V100-SXM2 16 GB** host, CUDA 12.8,
 official Qwen3.8-27B NVFP4 artifact (`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer`),
 and the production launcher (`tools/v100/ninfer-v100-duo.sh`) ran TP2, INT8 KV,
-MTP3 with optimized draft head, CUDA Graph, 180,224-token context capacity,
-4,096-token prefill chunks, and one active request. Thinking and prefix reuse
-were disabled. The **exact English user prompt** was:
+MTP3/4/5 with optimized draft head, CUDA Graph, 180,224-token context capacity,
+4,096-token prefill chunks, and one active request. Each window had its own
+resident server; thinking and prefix reuse were disabled. The **exact English
+user prompt** was:
 
 > Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.
 
-The public OpenAI Chat Completions endpoint received one user message, `reasoning_effort:
-"none"`, `temperature: 0` (greedy), `seed: 42`, and `max_tokens: 12288`.
-The Qwen chat template counted **74 prompt tokens**. Each measured request was
-independent, with zero prefix-cache hits, on the same resident server. Both
-returned a natural stop and **9,668 completion tokens** (no reasoning content):
+The public OpenAI Chat Completions endpoint received one user message,
+`reasoning_effort: "none"`, `temperature: 0` (greedy), `seed: 42`, and
+`max_tokens: 12288`. The Qwen chat template counted **74 prompt tokens**.
+Each window ran three complete requests on its own resident server, with zero
+prefix-cache hits and no reasoning content. All nine
+stopped naturally. The speeds below use committed decode tokens divided by
+`request_done.timings_seconds.decode`, namely
+`(completion_tokens - 1) / decode_seconds` because prefill emits the first token.
+**Peak (5 s)** is the highest single 5-second `throughput` interval's committed
+decode rate across the three requests, as logged by the server (one active
+request); **average** is the arithmetic mean of three full-request rates. These
+are *different time windows*, so peak and average should not be treated as
+statistics over identical intervals. The highest full-request rate is also
+listed to disambiguate peak definitions.
 
-| Run | Decode seconds | Decode tok/s | TTFT | MTP drafts accepted |
-|---|---:|---:|---:|---:|
-| 1 | 79.0407 | 122.304 | 0.3302 s | 7,003 / 7,998 (87.56%) |
-| 2 | 79.0371 | 122.310 | 0.3273 s | 7,003 / 7,998 (87.56%) |
+| Draft window | Output tokens per run | Decode seconds (3 runs) | Peak 5 s tok/s | Peak full-request tok/s | Average full-request tok/s | Drafts accepted |
+|---|---:|---|---:|---:|---:|---:|
+| MTP3 (default) | 9,668 | 78.9587 / 78.9618 / 78.9562 | 132.0 | 122.435 | 122.431 | 7,003 / 7,998 (87.56%) |
+| MTP4 | 9,324 | 72.5892 / 72.5987 / 72.6085 | 142.4 | 128.435 | 128.418 | 7,140 / 8,748 (81.62%) |
+| MTP5 | 9,881 | 72.7104 / 72.7043 / 72.7035 | **159.2** | **135.894** | **135.890** | 7,859 / 10,110 (77.73%) |
 
-Mean **122.307 committed decode tok/s**, computed as
-`(completion_tokens - 1) / request_done.timings_seconds.decode`: prefill emits
-the first token. This is *decode throughput*, not end-to-end throughput or a
-comparison with the previous 85K synthetic code-prompt run. The response
-contains a fenced, complete HTML document with inline SVG, wheel/pedal rotation
-and animated legs; save **the HTML inside the fence**, not the surrounding
-explanation. Static inspection found no external asset references; browser
-rendering and animation behavior were not independently tested.
+The MTP5 average is **10.99% above MTP3** on this prompt; MTP4 is **4.89%
+above MTP3**. Each window produces *different text and lengths*, so these are
+same-prompt throughput comparisons, not identical-output kernel speedups or a
+quality-parity result. All nine responses contain fenced, complete HTML with
+parsable inline SVG and no external asset references. MTP3 animates both the
+wheels and the pelican's leg paths via SVG animation. MTP4/5 use CSS to spin
+wheels and pedals/crank but their pelican leg and foot paths remain static,
+falling short of the requested pedaling motion. Thus **MTP3 remains the default**
+for this task; higher raw throughput alone does not justify changing it. Save
+the HTML *inside the fence*, not the surrounding explanation. Browser rendering
+and animation behavior were not independently tested. These results exclude
+model load and prefill and do not describe 85K-context decode.
 
 Reproduce the benchmark with the same local artifact and hardware:
 
 ```bash
+# Start the server with one draft window (repeat for N=3, 4, 5, stopping
+# the previous server before changing N):
+N=3
 tools/v100/ninfer-v100-duo.sh model=/home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
-  --no-thinking --no-prefix-reuse --request-log-jsonl /tmp/pelican-decode.jsonl
-# In a separate terminal, after the server is listening:
+  "draft-tokens=${N}" --no-thinking --no-prefix-reuse \
+  --request-log-jsonl "/tmp/pelican-mtp${N}.jsonl"
+# In a separate terminal, after the server is listening (set N to the same number):
+N=3
 prompt='Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.'
 jq -n --arg prompt "$prompt" '{model:"qwen3.8-27b",messages:[{role:"user",content:$prompt}],reasoning_effort:"none",max_tokens:12288,seed:42,temperature:0}' > /tmp/pelican-request.json
-for run in 1 2; do
+for run in 1 2 3; do
   curl -fsS -H 'Content-Type: application/json' \
     --data-binary @/tmp/pelican-request.json \
-    http://127.0.0.1:8080/v1/chat/completions > "/tmp/pelican-response-${run}.json"
+    http://127.0.0.1:8080/v1/chat/completions > "/tmp/pelican-mtp${N}-response-${run}.json"
 done
-jq -c 'select(.event=="request_done") | {finish:.result.finish_reason,output:.result.completion_tokens,decode_seconds:.timings_seconds.decode,decode_tok_s:((.result.completion_tokens-1)/.timings_seconds.decode)}' /tmp/pelican-decode.jsonl
+jq -c 'select(.event=="request_done") | {finish:.result.finish_reason,output:.result.completion_tokens,decode_seconds:.timings_seconds.decode,decode_tok_s:((.result.completion_tokens-1)/.timings_seconds.decode)}' "/tmp/pelican-mtp${N}.jsonl"
+# To reproduce the 5-second peak, retain stdout/stderr from the server and
+# take the maximum decode=...tok/s from its throughput interval=5.000s lines.
 ```
 
 An initial three-run attempt with `max_tokens: 3072` stopped at the output
 limit in all three runs and truncated the HTML (about 121.3 decode tok/s);
-those runs are **excluded** from the complete-output result above.
+those runs are **excluded** from the complete-output comparison above. An
+earlier two-run MTP3 campaign measured 122.304 / 122.310 tok/s with the
+same prompt and output; the table is the subsequent matched three-run campaign.
+
+## V100 Duo context decay
+
+On September 28, 2026, the same local **2 × V100-SXM2 16 GB**, CUDA 12.8,
+official Qwen3.8-27B NVFP4 artifact and public `ninfer_bench` Engine route
+measured TP2, 180,224-token context *capacity*, 4,096-token prefill chunks,
+INT8 KV, MTP3 with optimized draft head, CUDA Graph, greedy sampling and no
+prefix reuse. The `--code-chat` corpus generator assembled **30,000 / 50,000 /
+100,000 / 150,000 actual occupied prompt tokens** from distinct repository
+C++/CUDA source excerpts followed by the *same* bounded-queue coding task;
+thinking was disabled in the rendered prompt. Each point made **two cold
+requests, zero discarded warmups**, in a resident Engine, after decode graph
+priming. Every request emitted one token during prefill plus **1,024 measured
+decode tokens**, reaching the fixed output limit. Independent processes and
+model loads were used per context length; load time is excluded. `--capture-generation`
+retained the output for inspecting the fixed-length continuation.
+
+| Occupied prompt | Prefill seconds (two runs) | TTFT mean | Prefill tok/s mean | Decode seconds (two × 1,024 tokens) | Decode tok/s mean | MTP accepted |
+|---:|---|---:|---:|---|---:|---:|
+| 30,000 | 28.0109 / 28.0779 | 28.0451 s | 1,069.73 | 10.0072 / 10.0116 | 102.30 | 75.11% |
+| 50,000 | 49.5062 / 49.6299 | 49.5691 s | 1,008.72 | 10.5481 / 10.5506 | 97.07 | 77.02% |
+| 100,000 | 113.0494 / 113.2717 | 113.1625 s | 883.70 | 12.6322 / 12.6295 | 81.07 | 72.75% |
+| 150,000 | 192.4502 / 192.2744 | 192.3653 s | 779.78 | 14.4855 / 14.4810 | 70.70 | 72.24% |
+
+Prefill rate is the mean of each run's `prompt_tokens / prefill_seconds`;
+decode rate is the mean of each run's `1024 / decode_seconds`. TTFT is the
+Engine's `first_token_seconds` from request start, not HTTP/UI latency. At
+150K occupied tokens versus 30K, prefill throughput falls 27.1% and decode
+throughput falls 30.9% **on this controlled workload**. Context capacity
+remains 180,224 in every row; it is the *occupied* prompt that changes.
+
+This public-Engine benchmark feeds **raw pretokenized** Qwen chat-prompt IDs
+and **disables model stops** to force equal, sufficiently long decode windows.
+Captured continuations eventually repeat after an apparent natural stop, and
+some emit special-token strings such as `<think>` after the stopping point.
+Consequently these are *fixed-output performance measurements*, **not**
+natural-stop completion times, a thinking-enabled comparison, an Agent
+transcript, or evidence of 1,024 useful generated tokens. Prompt content also
+grows with length, so acceptance rates change; the rows do not isolate the
+attention kernel's complexity from continuation differences. The pelican
+section above measures actual naturally stopped generation separately.
+
+Reproduce with the same registered artifact and device configuration; all
+files after the last needed excerpt are omitted here (the generator stops
+reading once it has enough code tokens):
+
+```bash
+cmake -S . -B build-v100-duo -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build-v100-duo --target ninfer_bench ninfer_v100_corpus -j
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+mkdir -p /tmp/ninfer-context-decay
+sources=(
+  src/core/host_worker_pool.h src/core/host_worker_pool.cpp
+  src/runtime/engine/concurrent_executor.h
+  src/targets/qwen3_6/impl/runtime/program_impl.h
+  src/targets/qwen3_6/impl/runtime/text_context_impl.h
+  src/targets/qwen3_6/impl/runtime/layouts_impl.h
+  src/targets/qwen3_6/impl/runtime/mtp_impl.h
+  src/ops/kernel/gqa_attention_decode_i8.cuh
+  src/ops/kernel/gqa_attention_decode_i8_tc_volta.cuh
+  src/ops/wrapper/gdn_input_proj.cpp
+)
+for length in 30000 50000 100000 150000; do
+  build-v100-duo/bench/ninfer_v100_corpus \
+    /home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+    "/tmp/ninfer-context-decay/code-${length}.ids" \
+    --code-chat "$length" --output-tokens 1024 "${sources[@]}"
+  build-v100-duo/bench/ninfer_bench \
+    --weights /home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+    --tp 2 --devices 0,1 --kv-dtype int8 --max-ctx 180224 \
+    --prefill-chunk 4096 --mtp-draft-tokens 3 --lm-head-draft \
+    --corpus "/tmp/ninfer-context-decay/code-${length}.ids" \
+    -pg "${length},1024" --warmup 0 -r 2 --capture-generation \
+    -o json --output-file "/tmp/ninfer-context-decay/result-${length}.json"
+done
+```
 
 ### V100 TPX attention experiments
 

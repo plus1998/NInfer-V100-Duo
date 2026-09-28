@@ -41,13 +41,44 @@ the [SDK capture procedure](tools/v100/agent_prefill/README.md).
 
 ## Decode
 
-**Default configuration above**, thinking off: the English prompt to generate a
-self-contained animated SVG pelican riding a bicycle (spinning wheels and pedaling),
-as a standalone HTML file without external resources, produced **9,668 output
-tokens** from a 74-token prompt. Two complete generations measured **122.30 and
-122.31 decode tok/s** (mean **122.31 tok/s**); both stopped naturally. The
-decode rate excludes the first token (emitted during prefill) and model load. See the
-[exact prompt and reproduction details](docs/performance.md#v100-duo-decode-pelican-html).
+**Production configuration above, varying only the MTP draft window**, thinking
+off, on the English prompt to create a
+standalone animated SVG/HTML pelican riding a bicycle (74 prompt tokens). Three
+complete requests per MTP window, with no prefix reuse:
+
+| Draft window | Output tokens | Peak decode (5 s) | Average decode (whole request) | MTP acceptance |
+|---|---:|---:|---:|---:|
+| **MTP3 (default)** | 9,668 | 132.0 tok/s | 122.43 tok/s | 87.56% |
+| MTP4 | 9,324 | 142.4 tok/s | 128.42 tok/s | 81.62% |
+| MTP5 | 9,881 | **159.2 tok/s** | **135.89 tok/s** | 77.73% |
+
+Peak is the fastest 5-second server throughput interval across three requests;
+average is the mean of their complete-request decode rates. Decode excludes
+the first token (emitted during prefill) and model load. Acceptance counts
+accepted draft tokens divided by proposed draft tokens.
+Outputs **differ** between windows: MTP4/5 animate the wheels and crank but
+leave the pelican's legs static, unlike MTP3. The default stays MTP3 rather than
+trading the requested animation for higher throughput. See the
+[prompt, quality check and measurements](docs/performance.md#v100-duo-decode-pelican-html).
+
+## Context decay (上下文衰减)
+
+Same 180,224-token capacity, TP2, INT8 KV, 4,096-token prefill chunks, and
+**MTP3** as the default above. Two cold Engine requests per length, each with
+**1,024 measured decode tokens** (plus one first token from prefill):
+
+| Prompt context | First token | Prefill | Decode (1,024 tokens) |
+|---:|---:|---:|---:|
+| 30K | 28.05 s | 1,070 tok/s | 102.30 tok/s |
+| 50K | 49.57 s | 1,009 tok/s | 97.07 tok/s |
+| 100K | 113.16 s | 884 tok/s | 81.07 tok/s |
+| 150K | 192.37 s | 780 tok/s | 70.70 tok/s |
+
+Rates and first-token times are two-run means, excluding model load. This
+fixed-length code-prompt benchmark **disables stopping** to keep the decode
+window identical; continuations repeat after a natural stopping point, so it
+measures long-context speed, **not useful-answer quality or Agent latency**. See
+[method and individual results](docs/performance.md#v100-duo-context-decay).
 
 ## Run
 
@@ -59,8 +90,16 @@ then start the text-only server:
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer
 ```
 
-The launcher binds to `127.0.0.1:8080` and uses the default profile in the table.
-To restore the larger context:
+The launcher binds to `127.0.0.1:8080`. Choose one MTP window at startup
+(stop the current server before launching another):
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=3  # default; animated legs in this test
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=4
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=5  # fastest measured, output differs
+```
+
+All three retain the 180,224-token default profile. To restore the larger context:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
