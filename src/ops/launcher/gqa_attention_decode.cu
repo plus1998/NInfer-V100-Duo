@@ -7,6 +7,7 @@
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
+#include "ops/kernel/gqa_attention_decode_i8_key_split_volta.cuh"
 #include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
@@ -167,8 +168,23 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     // bf16 measurements put it 2.5x behind at width 1). See the V100 performance summary.
     if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-        gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
-                                                         CacheInput><<<grid, 128, 0, stream>>>(
+        constexpr bool key_split = Geometry::QHeads == 12 && Geometry::KVHeads == 2 &&
+                                   TokenTile * Geometry::GroupSize <= 32;
+        auto kernel = [] {
+            if constexpr (key_split) {
+                return gqa_attention_small_t_tc_volta_key_split_i8_kernel<
+                    Geometry, TokenTile, 8, MultiBatch, Masked, CacheInput>;
+            } else {
+                return gqa_attention_small_t_tc_volta_partial_i8_kernel<
+                    Geometry, TokenTile, 4, MultiBatch, Masked, CacheInput>;
+            }
+        }();
+        constexpr std::size_t shared_bytes = key_split ? kGqaKeySplitSmemBytes : 0;
+        if constexpr (key_split) {
+            ensure_func_attr_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(shared_bytes));
+        }
+        kernel<<<grid, key_split ? 256 : 128, shared_bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
             static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),

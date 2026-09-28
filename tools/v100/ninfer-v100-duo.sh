@@ -14,14 +14,17 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 usage: ${BASH_SOURCE[0]} model=PATH [draft-tokens=N] [ninfer-serve options]
 
 Starts the HTTP server with the dual-V100 production defaults:
-  --tp 2 --devices 0,1 --max-context 200000 --kv-dtype int8
+  --tp 2 --devices 0,1 --max-context 180224 --prefill-chunk 4096 --kv-dtype int8
   --spec mtp --draft-tokens 3 --lm-head-draft
   --max-concurrency 1 --host 127.0.0.1 --port 8080
 
 model=PATH and draft-tokens=N are read from the leading key=value arguments; draft-tokens defaults
 to 3 and takes any MTP window in 1..5 (N=4 is the faster measured window: acceptance rate down,
-decode speed and tokens per round up, launch ceiling 203712 instead of 203776, 200000 unchanged).
+decode speed and tokens per round up; the 180224-token default remains within its capacity).
 Any remaining arguments are passed to ninfer-serve after these defaults and therefore override them.
+
+For the previous long-context configuration, pass --max-context 200000 --prefill-chunk 1024
+together: 200000 plus the 4096-token default chunk exceeds the 16 GB reservation.
 
 Vision stays off: no --vision is passed, and --tp 2 rejects it at startup.
 EOF
@@ -86,7 +89,7 @@ fi
 # changing the inference defaults.
 exec "${executable}" "${artifact}" \
     --tp 2 --devices 0,1 \
-    --max-context 200000 \
+    --max-context 180224 --prefill-chunk 4096 \
     --kv-dtype int8 \
     --spec mtp --draft-tokens "${draft_tokens}" --lm-head-draft \
     --max-concurrency 1 \

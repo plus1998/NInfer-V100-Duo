@@ -183,6 +183,209 @@ oracles. Real-model MTP/non-MTP teacher forcing, graph/eager comparisons and cro
 checks qualify the execution path. A plausible answer or a faster kernel alone is insufficient to
 claim unchanged model quality or an end-to-end speedup.
 
+## V100 Duo prefill investigation
+
+The three application labels below are *length proxies*, not runs of Pi agent, Codex, or Claude
+Code. All requests consume the same fixed `bench/fixtures/bench_corpus.ids` through the public
+Engine's raw-token route; each measured request has cold prefix state, one generated token, and no
+MTP decode. This controls the workload when comparing prefill chunk widths, but does not measure
+agent tool calls, prompt quality, or model inference in 1Cat-vLLM. Token IDs are fixed; prefill
+phase duration is measured inside Engine, excluding load, preparation, and decode.
+
+On September 28, 2026, the local dual Tesla V100-SXM2 16 GB host (CUDA 12.8), official
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` v3 artifact (23,719,715,844 bytes), TP2,
+INT8 group-64 KV, and 32,768-token capacity produced the following. Each cell is the mean of
+two measured requests after one discarded warmup, using `ninfer_bench` and the same corpus:
+
+| Length proxy | Prompt | Chunk 1,024 (seconds; tok/s) | Chunk 2,048 | Chunk 4,096 |
+|---|---:|---:|---:|---:|
+| Pi agent | 1,024 | 0.982; 1,042.3 | 0.984; 1,041.1 | 0.983; 1,041.3 |
+| Codex | 10,240 | 10.051; 1,018.8 | 9.295; 1,101.7 | 9.040; 1,132.7 |
+| Claude Code | 20,480 | 20.639; 992.3 | 19.155; 1,069.2 | 18.549; 1,104.1 |
+
+This is a **chunk configuration** result, not a new operator speedup or a comparison of the two
+engines. The 4,096-token chunk gains 11.2% at 10K and 11.3% at 20K relative to 1,024; at 1K,
+all chunks are within 0.2%. Per-rank reserved workspace rises from 505,670,144 bytes (1,024)
+to 654,576,128 (2,048) and 952,388,096 (4,096), while the observed arena peak at 20K rises
+from 273,686,528 to 369,115,136 and 559,972,352 bytes. Larger chunks cost memory *before* a
+request starts, even when it is only 1K long.
+
+The 200,000-token production context plus MTP3 rejects a 2,048 chunk at Engine reservation:
+5,388,112,128 bytes requested against 5,370,736,128 available. At 196,608 capacity, MTP3 and
+2,048 do fit, with 65,018,112 bytes of planned slack; a one-request cold 20,480-token check
+returned 19.242 s (1,064.4 tok/s), versus 20.750 s (987.0 tok/s) with 1,024 at the same
+capacity. This single-request production-profile check supports feasibility, **not** a stable
+long-context performance average. Both requests returned the same first token (ID 864); this
+is not a general numerical or quality qualification. The **previous** 200K capacity can only
+be restored by passing `--max-context 200000 --prefill-chunk 1024` together. A proposed 2,048
+chunk at that capacity is discarded because the memory contract does not permit it. A larger
+chunk is also discarded
+as an *exactly 1,024-token* optimization because it provides no measurable benefit at that
+boundary; a real 1,298-token Pi request instead benefits by avoiding a second chunk.
+
+Reproduce the 32K matrix after enabling `-DNINFER_BUILD_BENCHMARKS=ON` in the Volta CMake
+configuration and building `ninfer_bench` with `cmake --build build-v100-duo -j --target
+ninfer_bench`. Select the official artifact explicitly and keep the corpus and capacity fixed:
+
+```bash
+export LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+for chunk in 1024 2048 4096; do
+  build-v100-duo/bench/ninfer_bench \
+    --weights /path/to/qwen3_8_27b_nvfp4.ninfer \
+    --corpus bench/fixtures/bench_corpus.ids \
+    --tp 2 --devices 0,1 --kv-dtype int8 --max-ctx 32768 \
+    --prefill-chunk "$chunk" -p 1024,10240,20480 -r 2 --warmup 1
+done
+```
+
+**What transfers from 1Cat-vLLM.** Its SM70 NVFP4 path (`csrc/sm70_turbomind/ops/
+nvfp4_qpn4_sm70.cu`) keeps the small-M QPN route and, for admitted large M, materializes a
+transient FP16 weight matrix before a tensor-core GEMM; the dense weight is *not* kept resident
+across layers. NInfer already selects A16 on Volta (`src/ops/linear/nvfp4/nvfp4_config.h`) and
+uses CUTLASS FP16 materialization for large-T SwiGLU, GDN input, and residual projections
+(`src/ops/linear/nvfp4/nvfp4_cutlass_sm70.cu` and the affected Op plans). It does not run the
+Blackwell W4A4 arithmetic on V100. The shared QPN layout is already decoded by this CUTLASS
+route. Simply introducing a second materialization is not a new optimization; switching GEMM
+libraries or fusing the existing epilogues would need matched Op and end-to-end tests, including
+BF16-versus-FP16 casting boundaries. No arithmetic kernel is changed by this chunk sweep.
+
+### Chunk peak and captured agent requests
+
+Further 32K cold-prefix sweeps used the same two-V100 host, artifact, fixed-corpus prompt
+sizes and two measured repetitions. The following are **whole-Engine** rates; reserved
+workspace is per rank and includes the effect of the chunk selection:
+
+| Prefill chunk | 10,240 prompt tok/s | 20,480 prompt tok/s | Reserved workspace (MiB) |
+|---:|---:|---:|---:|
+| 1,024 | 1,018.8 | 992.3 | 482 |
+| 2,048 | 1,101.7 | 1,069.2 | 624 |
+| 3,072 | 1,114.7 | 1,089.6 | 766 |
+| 4,096 | 1,132.7 | 1,104.1 | 908 |
+| 4,608 | 1,128.0 | 1,099.3 | 979 |
+| 4,864 | 1,121.5 | 1,094.5 | 1,015 |
+| 5,120 | **1,146.8** | **1,107.6** | 1,050 |
+| 5,376 | 1,137.9 | 1,099.9 | 1,086 |
+| 6,144 | 1,103.2 | 1,052.0 | 1,192 |
+| 7,168 | 1,029.9 | 989.4 | 1,334 |
+| 8,192 | 986.7 | 966.5 | 1,476 |
+| 16,384 | 950.5 | 948.6 | 2,921 |
+
+The 5,120 synthetic peak is only 1.25% faster at 10K and 0.31% at 20K than 4,096,
+despite reserving another 142 MiB per GPU. 8,192 and 16,384 are **discarded**, not kept as
+larger-is-better routes. As a separate check, the three SDKs were invoked with the same small
+repository question in an empty workspace, pointing model requests at a loopback rejecting
+server. The raw JSON first-turn payloads and derived text are local to
+`/tmp/ninfer-agent-prefill/` (not committed). The rendered system instructions, tool schemas
+and user messages were encoded using this **artifact's tokenizer** via `ninfer_v100_corpus`,
+then measured through cold NInfer Engine requests with the same TP2/INT8/32K/one-output-token
+contract as the fixed-length sweep:
+
+| First-turn SDK payload | NInfer tokens | Chunk 1,024 | Chunk 4,096 | Chunk 5,120 |
+|---|---:|---:|---:|---:|
+| Pi SDK 0.73.1 | 1,298 | 938.1 | **1,056.0** | 1,056.7 |
+| Codex SDK 0.158.0 | 11,718 | 1,004.0 | **1,132.9** | 1,129.0 |
+| Claude Agent SDK 0.3.283 | 16,368 | 999.7 | **1,116.7** | 1,113.7 |
+
+Every cell is prompt tok/s from two measured repetitions after one warmup. All three chunk
+settings emitted the same first token **within** each payload; this is not a cross-engine
+quality check. The 4,096 choice improves Pi by 12.6%, Codex by 12.8%, and Claude by 11.7%
+versus 1,024. For these realistic agent first-turn *payloads* 5,120 ties Pi and loses
+slightly on both longer requests. Choose 4,096 on robustness, reserved memory and prompt
+coverage; do not make the small synthetic 5,120 peak the product default.
+
+The fast-prefill *production* selection is `--max-context 180224 --prefill-chunk 4096` with
+MTP3, the optimized proposal head, and CUDA Graph decode. It gives up 19,776 context tokens
+(9.9%) versus the former 200K default. At 180,224 capacity, the captured Claude prompt ran
+at 993.97, 1,109.23, and 1,107.50 prefill tok/s for chunks 1,024, 4,096, and 5,120
+respectively (one warmup, two measured repetitions each). Planned per-rank slack was 670.2,
+343.0, and 233.9 MB respectively. The exact requested first token matched across these three
+widths. At the selected 180,224/4,096 configuration, **all three** captured prompts also
+completed an eight-token MTP3 decode interval through the CUDA Graph route; matching 1,024
+controls returned the same nine output IDs for each prompt. This establishes a useful
+functional check, not a parity guarantee for all prompts or chunk boundaries.
+
+With a real 16,368-token captured Claude prompt and eight-token MTP3 decode window at the
+same 180,224 capacity, 4,096 versus 1,024 measured prefill 1,112.62 versus 994.44 tok/s
+on single measured requests; both graph-prime requests and the nine generated IDs matched.
+The 4,096 profile reserves 243,785,984 bytes planned slack per card before graph capture,
+similar to the formerly published 196,608/1,024 headroom. At 184,320/4,096 a single
+prefill+MTP3 graph request still passed (1,109.97 prefill tok/s, identical nine generated IDs)
+but planned slack was only 144,563,968 bytes. We select 180,224 for additional margin, not
+the tightest feasible capacity. The former 200K/1,024 capacity remains an explicit override;
+do not combine that capacity with the new 4,096 default chunk.
+
+**1Cat-vLLM's “8K” boundary** refers to the specialized SM70 Q8000/Q8192 attention
+kernel's *per-request query chunk*: other shapes fall back to the general route. Its
+`max_num_batched_tokens` may be 16,384 while scheduling two Q8192 chunks; 8,192 is **not**
+a universal vLLM scheduler limit. NInfer's measured 8,192-token chunk is slower than 4,096
+for the 10K/20K prompts and has an independent workload/precision policy.
+
+The SDKs were stopped by the local endpoint before inference or tool calls. This captures
+their original **client-side API request**, not hidden provider-added instructions, a whole
+interactive transcript, or the provider's tokenization. Qwen token IDs are generated from
+a JSON rendering of the system, messages and tools, not an exact provider chat-template
+encoding. No Pi/Codex/Claude quality or cross-model speed claim follows. The reproduction
+harness and its local-only/privacy contract are in
+[`tools/v100/agent_prefill/README.md`](../tools/v100/agent_prefill/README.md).
+
+The 1Cat-vLLM SM70 long-prefill attention (`csrc/attention/sm70_v37/` and
+`csrc/attention/sm70_79t/`) separates prefix GEMM from a causal tail, packs six Q heads per
+KV head, and uses FP32 online merge; the Q8000/Q8192 specialization needs a 768 MiB score
+workspace per GPU and has narrow FP16/KV-alignment admission. NInfer's paged INT8 KV and BF16
+query/output use a different precision and memory contract; moreover TP2 has 12 Q heads and
+2 KV heads per rank, whereas that kernel admits 6 Q heads and 1 KV head per rank. Its
+large-attention approach may be
+worth a *separate* kernel profile and independent oracle qualification at longer occupied
+contexts, but direct transplantation is not justified by the 1K/10K/20K whole-model data or
+the 16 GB production headroom. Published 1Cat-vLLM long-prefill results often use TP4 on four
+V100 32 GB cards, sometimes with FP8 weights/draft models; none is a like-for-like two-card
+NVFP4 baseline. We therefore do not quote those throughput figures as an NInfer speed ratio.
+
+### V100 TPX attention experiments
+
+We evaluated two ideas from `/tmp/ninfer-v100-tpx` on the **official Qwen3.8-27B NVFP4
+artifact**, 2 x V100-SXM2 16 GB over NVLink, CUDA 12.8, TP2, INT8 group-64 KV and
+4,096-token prefill chunks. All rates below are public-Engine `ninfer_bench` results, not
+the external repository's published measurements. Each point has two measured requests,
+no discarded warmup. The 85,000-token code-chat corpus was generated with
+`ninfer_v100_corpus --code-chat 85000 --output-tokens 1024` from the listed source files in
+the V100 code-corpus recipe above; the benchmark window requested one prefill token plus
+128 decode tokens with MTP3 and the optimized proposal head.
+
+| Volta prefill flash tile | Capacity | 1,024 | 10,240 | 20,480 | 85,000 | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| Existing 32-column tile | 180,224 | 1,031.6 | 1,131.6 | 1,103.1 | 916.9 | Keep |
+| 32-column, 8-warp / 64-key | 180,224 | 1,027.8 | 1,114.4 | 1,079.3 | 873.9 | Reject |
+| 64-column, 8-warp / 64-key | 163,840 | 1,031.2 | 1,131.6 | 1,110.7 | 957.7 | Reject |
+
+All throughput cells are prompt tokens/s. The 64-column candidate passed the attention
+FP64-oracle suite but its workspace could not start at the existing 180,224-token capacity:
+the reservation exceeded available device memory by about 82 MB. At 163,840 capacity its
+85K rate was 4.4% above the **180,224-capacity** baseline (not a same-capacity A/B), while
+the 1K/10K/20K rates were almost unchanged. Losing at least 16,384 tokens of capacity for
+that narrowly scoped gain does not justify changing the production tile. The 32-column
+candidate kept capacity but regressed on all measured prompt lengths. Neither tile survives.
+
+For decode, the TP2 D256 12Q/2KV INT8 attention verification path now uses eight warps,
+64 keys per tile, warp-partitioned QK, PRMT INT8-to-FP16 conversion and FP32 PV accumulation
+at the admitted three-to-five-token widths. T=1/2 and other geometries retain the prior
+path. At 180,224 capacity on the 85K code prompt, the previous kernel measured
+**76.25 tok/s**, 37 rounds, 82.57% draft acceptance; the selected key-split kernel
+measured **90.87 tok/s**, 36 rounds, 85.85% acceptance (+19.2% committed decode
+throughput). Decode seconds per round fell from 45.37 to 39.13 ms, so the gain is not
+entirely explained by the acceptance change. These are two measurements per route with
+zero warmups; different outputs and draft acceptance prohibit claiming token-exact parity.
+The independent INT8 attention FP64 oracle and exact KV-cache tests pass at short and
+85K occupied contexts. One 8K MTP3 request returned identical tokens and acceptance in
+CUDA Graph and eager execution. With MTP disabled (T=1), both kernels select the old
+route: 26.48 versus 26.49 tok/s and identical 128 generated IDs at 85K.
+
+We also rejected changing long-context splits from the existing policy to 1,920 keys per
+split: even though MTP3 improved from 90.87 to 92.82 tok/s on this fixture, non-MTP
+decode fell from 26.48 to 18.08 tok/s. The shipped split policy is unchanged. These
+numbers describe the local NVFP4 code prompt, not typical agent decode acceptance or
+quality on arbitrary prompts.
+
 ## V100 Duo maximum-context capacity sweep
 
 The capacity comparison in the README varies only the requested maximum context from 1,024

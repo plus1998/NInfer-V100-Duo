@@ -1,0 +1,15 @@
+{
+  "name": "ninfer-agent-prefill-capture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.283",
+    "@mariozechner/pi-ai": "0.73.1",
+    "@mariozechner/pi-coding-agent": "0.73.1",
+    "@openai/codex-sdk": "0.158.0",
+    "ws": "8.22.0"
+  }
+}

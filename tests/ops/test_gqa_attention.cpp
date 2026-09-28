@@ -501,6 +501,8 @@ int run_int8_split_policy_cases() {
         {5, 252, 257, 601u},
         {6, 139, 145, 602u},
         {6, 6138, 8199, 603u},
+        {4, 84996, 180224, 604u},
+        {3, 16388, 180224, 605u},
     };
     int failures = 0;
     for (const AttentionCase& test_case : cases) {
