@@ -304,6 +304,25 @@ completed an eight-token MTP3 decode interval through the CUDA Graph route; matc
 controls returned the same nine output IDs for each prompt. This establishes a useful
 functional check, not a parity guarantee for all prompts or chunk boundaries.
 
+For the concise README prefill table, each captured first-turn request was also run
+once through the public Engine under the **selected production configuration**
+(180,224 capacity, 4,096 chunk, TP2, INT8 KV, optimized MTP3 and CUDA Graph):
+
+| Captured request | Qwen tokens | First token seconds (TTFT) | Prefill seconds | Prefill tok/s |
+|---|---:|---:|---:|---:|
+| Pi | 1,298 | 1.246371524 | 1.2463 | 1,041.46 |
+| Codex | 11,718 | 10.398303200 | 10.3979 | 1,126.95 |
+| Claude Agent | 16,368 | 14.711902570 | 14.7112 | 1,112.62 |
+
+These are single cold requests with eight decode tokens after the measured prefill,
+**zero warmups and one measured repetition each**. TTFT is the public Engine's
+`reps[0].timings.first_token_seconds` in each captured Agent's
+`*-ctx180224-c4096-mtp8.json` report: request start to first generated token,
+including Engine preparation and prefill, but excluding model load, SDK startup,
+network transport, HTTP streaming, and Agent tool execution. It is not a
+measured first *visible character* in a running Agent UI. They are not the 32K-capacity,
+two-repetition chunk-sweep figures above or a claim about interactive Agent latency.
+
 With a real 16,368-token captured Claude prompt and eight-token MTP3 decode window at the
 same 180,224 capacity, 4,096 versus 1,024 measured prefill 1,112.62 versus 994.44 tok/s
 on single measured requests; both graph-prime requests and the nine generated IDs matched.
@@ -340,6 +359,57 @@ contexts, but direct transplantation is not justified by the 1K/10K/20K whole-mo
 the 16 GB production headroom. Published 1Cat-vLLM long-prefill results often use TP4 on four
 V100 32 GB cards, sometimes with FP8 weights/draft models; none is a like-for-like two-card
 NVFP4 baseline. We therefore do not quote those throughput figures as an NInfer speed ratio.
+
+### V100 Duo decode: pelican HTML
+
+On September 28, 2026, the local **2 × Tesla V100-SXM2 16 GB** host, CUDA 12.8,
+official Qwen3.8-27B NVFP4 artifact (`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer`),
+and the production launcher (`tools/v100/ninfer-v100-duo.sh`) ran TP2, INT8 KV,
+MTP3 with optimized draft head, CUDA Graph, 180,224-token context capacity,
+4,096-token prefill chunks, and one active request. Thinking and prefix reuse
+were disabled. The **exact English user prompt** was:
+
+> Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.
+
+The public OpenAI Chat Completions endpoint received one user message, `reasoning_effort:
+"none"`, `temperature: 0` (greedy), `seed: 42`, and `max_tokens: 12288`.
+The Qwen chat template counted **74 prompt tokens**. Each measured request was
+independent, with zero prefix-cache hits, on the same resident server. Both
+returned a natural stop and **9,668 completion tokens** (no reasoning content):
+
+| Run | Decode seconds | Decode tok/s | TTFT | MTP drafts accepted |
+|---|---:|---:|---:|---:|
+| 1 | 79.0407 | 122.304 | 0.3302 s | 7,003 / 7,998 (87.56%) |
+| 2 | 79.0371 | 122.310 | 0.3273 s | 7,003 / 7,998 (87.56%) |
+
+Mean **122.307 committed decode tok/s**, computed as
+`(completion_tokens - 1) / request_done.timings_seconds.decode`: prefill emits
+the first token. This is *decode throughput*, not end-to-end throughput or a
+comparison with the previous 85K synthetic code-prompt run. The response
+contains a fenced, complete HTML document with inline SVG, wheel/pedal rotation
+and animated legs; save **the HTML inside the fence**, not the surrounding
+explanation. Static inspection found no external asset references; browser
+rendering and animation behavior were not independently tested.
+
+Reproduce the benchmark with the same local artifact and hardware:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/home/gareth/models/qwen3_8_27b_nvfp4.ninfer \
+  --no-thinking --no-prefix-reuse --request-log-jsonl /tmp/pelican-decode.jsonl
+# In a separate terminal, after the server is listening:
+prompt='Create a complete, self-contained HTML file containing inline SVG that depicts a pelican riding a bicycle. Animate it in 2D: the wheels spin and the pelican pedals. Use no external resources. The file should work by saving it as an .html file and opening it directly in a browser.'
+jq -n --arg prompt "$prompt" '{model:"qwen3.8-27b",messages:[{role:"user",content:$prompt}],reasoning_effort:"none",max_tokens:12288,seed:42,temperature:0}' > /tmp/pelican-request.json
+for run in 1 2; do
+  curl -fsS -H 'Content-Type: application/json' \
+    --data-binary @/tmp/pelican-request.json \
+    http://127.0.0.1:8080/v1/chat/completions > "/tmp/pelican-response-${run}.json"
+done
+jq -c 'select(.event=="request_done") | {finish:.result.finish_reason,output:.result.completion_tokens,decode_seconds:.timings_seconds.decode,decode_tok_s:((.result.completion_tokens-1)/.timings_seconds.decode)}' /tmp/pelican-decode.jsonl
+```
+
+An initial three-run attempt with `max_tokens: 3072` stopped at the output
+limit in all three runs and truncated the HTML (about 121.3 decode tok/s);
+those runs are **excluded** from the complete-output result above.
 
 ### V100 TPX attention experiments
 
