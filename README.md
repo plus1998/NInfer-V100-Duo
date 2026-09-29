@@ -5,21 +5,58 @@ TP2, CUDA 12.8. NVFP4 is executed in software on Volta. Based on
 [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 
-## Configuration and context
+## Start
 
-| Profile | Context limit (prompt + output) | Prefill chunk | Other settings |
-|---|---:|---:|---|
-| **Text-only launcher default** | **180,224 tokens** | **4,096 tokens** | TP2, INT8 KV, MTP3, optimized draft head, CUDA Graph, one concurrent request |
-| Larger context (explicit override) | 200,000 tokens | 1,024 tokens | Same settings; slower prefill |
+Build with `tools/v100/build.sh` and download the
+[official Qwen3.8-27B NVFP4 artifact](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
+All commands below use TP2 on two V100s, INT8 KV, MTP3 with an optimized draft
+head, and CUDA Graph. The server listens on `127.0.0.1:8080`; stop it before
+starting another profile.
 
-The default leaves approximately 233 MiB of planned per-GPU headroom. The 200K
-override **must set both flags**; 200K with a 4,096-token chunk does not fit on
-these 16 GB cards. The model's 262,144-token native limit does not fit this setup.
+**Recommended single-request Vision** on 2 × 16 GB (155,648 context tokens):
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --vision --vision-max-tokens 2048 \
+  --max-context 155648 --prefill-chunk 1024 \
+  --max-concurrency 1 --kv-capacity 155648
+```
+
+This leaves about **881 MiB free on the primary GPU** after startup. The
+2,048-token Vision budget is the total merged image/video token limit per
+prompt, not a text-context limit; text, media, and output together count
+toward 155,648. Requests exceeding the visual budget are rejected. The same
+155,648-token context has also passed a real 154,771-token image prefill in
+the two-slot profile; see [Vision verification](docs/performance.md#v100-duo-vision-and-concurrency).
+
+**Text-only default**, one request, 180,224 context tokens and 4,096-token
+prefill chunks:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer
+```
+
+**Text-only 200,000-token context**, one request (smaller prefill chunks):
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 200000 --prefill-chunk 1024
+```
+
+The text-only default leaves approximately 233 MiB of planned per-GPU
+headroom. The 200K variant **must set both flags**; 200K with a 4,096-token
+chunk does not fit on these 16 GB cards and uses slower prefill. The model's
+262,144-token native limit does not fit this setup. Do not simply add
+`--vision` to either text-only command: Vision adds GPU allocations.
 See [capacity measurements](docs/performance.md#v100-duo-prefill-investigation).
+
+To change the MTP draft window in any command, put `draft-tokens=4` or
+`draft-tokens=5` immediately after `model=...`; the default is `3`. MTP5 was
+fastest in the measured decode task but generated different output.
 
 ## Prefill
 
-**Default configuration above**, using the official NVFP4 artifact, INT8 KV and
+**Text-only default above**, using the official NVFP4 artifact, INT8 KV and
 captured **first-turn API requests** from the three Agent SDKs:
 
 | Agent | Prompt (Qwen tokens) | 首 token 时间 (TTFT) | Prefill 速度 |
@@ -41,7 +78,7 @@ the [SDK capture procedure](tools/v100/agent_prefill/README.md).
 
 ## Decode
 
-**Production configuration above, varying only the MTP draft window**, thinking
+**Text-only default above, varying only the MTP draft window**, thinking
 off, on the English prompt to create a
 standalone animated SVG/HTML pelican riding a bicycle (74 prompt tokens). Three
 complete requests per MTP window, with no prefix reuse:
@@ -80,43 +117,78 @@ window identical; continuations repeat after a natural stopping point, so it
 measures long-context speed, **not useful-answer quality or Agent latency**. See
 [method and individual results](docs/performance.md#v100-duo-context-decay).
 
-## Run
+## Concurrent text requests
 
-Build with `tools/v100/build.sh`. Download the
-[official Qwen3.8-27B NVFP4 artifact](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer),
-then start the text-only server:
+The launcher's default is **one active request**. `--max-concurrency` enables
+batched decode but does **not** split `--max-context` across slots. Main Text KV
+is a shared pool: with `--kv-capacity` equal to `--max-context`, one request can
+reach its full context ceiling, while shorter requests can overlap if their
+combined capacity reservations fit. Requests that cannot be admitted wait;
+setting four slots does not guarantee four full-length requests at once.
 
-```bash
-tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer
-```
-
-The launcher binds to `127.0.0.1:8080`. Choose one MTP window at startup
-(stop the current server before launching another):
-
-```bash
-tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=3  # default; animated legs in this test
-tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=4
-tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer draft-tokens=5  # fastest measured, output differs
-```
-
-All three retain the 180,224-token default profile. To restore the larger context:
+For **two text requests** on 2 × 16 GB, keep 4,096-token prefill chunks and
+allow up to 155,648 tokens in either request:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
-  --max-context 200000 --prefill-chunk 1024
+  --max-context 155648 --prefill-chunk 4096 \
+  --max-concurrency 2 --kv-capacity 155648
 ```
 
-### Vision and concurrency
+This started with **703 MiB free on GPU 0** and **709 MiB on GPU 1**. Two
+simultaneous 384-token text completions formed actual two-row decode batches.
 
-The commands above are **text-only**. TP2 now supports `--vision`, including MTP
-and concurrent generation. Vision encoding and its weights live on the primary
-GPU; both GPUs execute the text model with the composed visual embeddings.
-Vision needs additional memory: **do not simply add `--vision` to the 180,224-
-or 200,000-token text-only profile on 16 GB cards**. The maximum visual-token
-budget is independent of the maximum text context; media is still counted in
-each request's total context.
+For **four text requests**, retain a 131,072-token *per-request* ceiling with
+1,024-token chunks and one full-length shared KV entitlement:
 
-Verified **2 × 16 GB Vision, 155K context per request, two concurrent slots**:
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 131072 --prefill-chunk 1024 \
+  --max-concurrency 4 --kv-capacity 131072
+```
+
+For more context in two-slot mode, `--max-context 180224 --prefill-chunk 1024
+--max-concurrency 2 --kv-capacity 180224` **started** with only **449 MiB** free
+on the primary card; 200,000 with those settings failed memory admission. With
+4,096-token chunks, 180,224/two-slot did **not** fit; 176,128/two-slot started
+with **231 MiB** free. These are startup boundaries, not safe defaults or
+full-context generation qualifications. Tune context, concurrency (`1..8`),
+chunk size and KV pool together for your load and inspect startup free memory.
+
+With **identical 512-token prompts, 513 output tokens/request**, 131,072-token
+context/KV and 1,024-token chunks, one discarded warmup and five measured
+public-Engine runs per slot count on 2 × 16 GB gave:
+
+| Simultaneous requests | Mean set time | Aggregate output | Mean decode batch |
+|---:|---:|---:|---:|
+| 1 | 7.523 s | 68.2 tok/s | 1.00 |
+| 2 | 9.146 s | 112.2 tok/s | 1.99 |
+| 4 | 14.381 s | 142.7 tok/s | 3.57 |
+
+Aggregate rate counts all generated tokens and includes prefill, not model
+load. Four requests give **2.09×** the one-request aggregate rate, but each
+set takes longer. These short-prompt throughput figures do not measure
+131K-token occupied-context performance or guarantee identical generated
+text across batch sizes. See [text concurrency measurements](docs/performance.md#v100-duo-text-concurrency).
+
+For **2 × 32 GB**, the following text-only four-slot setting is an **untested
+starting point**; tune context and concurrency for actual prompt lengths and
+check the resolved KV capacity and free memory at startup:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 200000 --prefill-chunk 1024 \
+  --max-concurrency 4 --kv-capacity auto
+```
+
+`auto` sets a shared pool based on available memory; four simultaneous
+200K-token requests require **800,000** shared KV tokens and are not implied
+by four slots. The native per-request context limit is 262,144 tokens.
+
+## Vision with concurrency
+
+Vision also supports TP2 batching. On 2 × 16 GB, add one Vision slot without
+halving the single-request 155K context ceiling:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
@@ -125,45 +197,18 @@ tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
   --max-concurrency 2 --kv-capacity 155648
 ```
 
-**155,648 is the per-request ceiling, not half of a two-request allocation.**
-The explicitly sized **155,648-token shared KV pool** supports one full-length
-request or two shorter requests decoding together; a second request waits if
-the combined reservation does not fit. It does **not** reserve 155K per lane.
-Startup left about **715 MiB on the primary GPU** and **1,021 MiB on the peer**;
-this is a tighter memory profile and needs otherwise idle GPUs. A real image
-request with **154,771 occupied prompt tokens** completed correctly, as did the
-two-image and batched concurrent checks. Image/video tokens, text history and
-output all count toward the same
-per-request ceiling. `--vision-max-tokens 2048` separately limits **aggregate
-merged visual tokens per prompt** (8,192 raw patches); media beyond that budget
-is rejected, not silently truncated. Increase this budget only if your media
-workload needs it, then recheck startup capacity; reduce context if other GPU
-processes consume memory. Stop other model servers first.
+The primary GPU had **715 MiB** free at startup. A real image request with
+154,771 occupied tokens completed correctly; two shorter visual requests formed
+decode batch size **2.00**. This is not two simultaneous 155K requests. For
+more headroom, lower `--max-context` to `131072` and use `--kv-capacity auto`:
+that resolved **137,920 shared tokens** and left **1.14 GiB** free on the
+primary GPU. `auto` reserves 1 GiB of planned sizing headroom and cannot admit
+the 155K Vision setting here. Increase `--vision-max-tokens` only when larger
+media is required, then recheck available memory; Vision weights and encoding
+live on the primary card. The default visual budget without the flag is 32K.
 
-For more headroom, use the **131K auto-sized** variant instead:
-
-```bash
-tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
-  --vision --vision-max-tokens 2048 \
-  --max-context 131072 --prefill-chunk 1024 \
-  --max-concurrency 2 --kv-capacity auto
-```
-
-`auto` keeps **1 GiB of planned sizing headroom** and resolved a 137,920-token
-pool, leaving **1.14 GiB actual free** on the primary card. That reserve is why
-`auto` rejects 155K even though the explicit profile fits. Startup at 164K,
-172K and 180K with explicit KV was possible, but primary free memory shrank to
-about **525, 337 and 147 MiB** respectively; those points were **not** qualified
-with near-ceiling Vision requests and are not recommended.
-
-Previously, enabling Vision reserved scratch for up to 32K visual tokens
-whenever text context exceeded 32K, making the 16K/24K profiles look like a
-text-context limit. The independent visual budget removes that coupling. The
-default `--vision-max-tokens` remains 32K for the original broad media envelope,
-so **the long-context recommendation requires the explicit 2048 setting**.
-
-For **2 × 32 GB**, use this larger-context/four-slot **starting point** and
-adjust it yourself for the workload:
+For **2 × 32 GB**, this Vision/four-slot command is a **starting point only**;
+no 32 GB GPU was available to verify it:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
@@ -171,18 +216,10 @@ tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
   --max-concurrency 4 --kv-capacity auto
 ```
 
-The 32 GB profile is **not hardware-tested here**; this machine has two 16 GB
-cards. More context and more slots both consume memory. Tune `--max-context`
-and `--max-concurrency` (`1..8`) together and inspect startup's resolved KV
-capacity/free memory. The KV pool is shared: to admit all slots at their full
-context ceiling simultaneously, it needs at least `max_context × max_concurrency`
-tokens; `auto` is memory-limited and need not reach that product. Otherwise
-large requests wait for capacity. Native context is capped at 262,144 tokens;
-**YaRN remains incompatible with Vision**. See [serving capacity semantics](docs/serving.md#execution-behavior).
-
-The real-image and simultaneous-stream checks, including actual multi-row decode
-batch evidence, are documented under
-[Vision verification](docs/performance.md#v100-duo-vision-and-concurrency).
+Adjust `--max-context` and `--max-concurrency` for your workload and check the
+resolved shared KV/free memory at startup. Native context is capped at 262,144;
+**YaRN remains incompatible with Vision**. See [serving capacity semantics](docs/serving.md#execution-behavior)
+and [real-image/concurrency checks](docs/performance.md#v100-duo-vision-and-concurrency).
 
 Requirements: Linux x86_64, two V100-SXM2 cards with NVLink (16 GB tested; 32 GB
 profiles require local verification), CUDA 12.8,

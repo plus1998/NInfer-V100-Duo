@@ -435,6 +435,63 @@ those runs are **excluded** from the complete-output comparison above. An
 earlier two-run MTP3 campaign measured 122.304 / 122.310 tok/s with the
 same prompt and output; the table is the subsequent matched three-run campaign.
 
+## V100 Duo text concurrency
+
+On **September 29, 2026**, with 2 × Tesla V100-SXM2 **16 GB**, CUDA **12.8**,
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer`, TP2, INT8 KV, optimized MTP3
+and CUDA Graphs, public Engine startup checks established the following
+**text-only** capacity points. The KV column is the *total shared* Main Text KV
+pool, not a per-request allotment. All explicit-KV entries set it equal to the
+per-request ceiling so that a single request can still fill that ceiling;
+several near-ceiling requests cannot run at once.
+
+| Slots | Prefill chunk | Context / shared KV | Primary free after startup | Result |
+|---:|---:|---:|---:|---|
+| 2 | 4,096 | 155,648 | 703 MiB | starts; two short HTTP completions form actual two-row decode batches |
+| 2 | 4,096 | 176,128 | 231 MiB | starts; little margin |
+| 2 | 4,096 | 180,224 | — | rejected: runtime reservation exceeds available budget by about 2.4 MB |
+| 2 | 1,024 | 180,224 | 449 MiB | starts; not near-ceiling generation-qualified |
+| 2 | 1,024 | 200,000 | — | rejected: runtime reservation exceeds budget |
+| 4 | 1,024 | 131,072 | 1,253 MiB | starts; benchmarked with four simultaneous short requests |
+| 4 | 1,024 | 163,840 | 495 MiB | starts; not near-ceiling generation-qualified |
+| 4 | 1,024 | 180,224 | — | rejected: runtime reservation exceeds budget |
+
+At 155,648/4,096/two slots, `--kv-capacity auto` did not start; at
+131,072/1,024/four slots, `auto` also did not start because it keeps 1 GiB of
+planned sizing headroom. Explicit KV avoids that *planning* margin but does not
+create extra physical memory. These rows bracket the tested startup boundaries,
+not a proven exact maximum or a full-length multi-request qualification. The
+README recommends profiles with greater free-memory margin.
+
+For comparable **text-only multi-request throughput**, fix the same
+131,072-token context, 131,072-token explicit shared KV and 1,024-token
+prefill chunk at all slot counts (1, 2 and 4). Each slot uses the same
+512-token prefix of `bench/fixtures/bench_corpus.ids` and greedy sampling,
+disables prefix reuse and model-default stopping, and emits exactly 513 tokens
+(first token during prefill plus 512 decode tokens). Submit each set of requests
+simultaneously through the public Engine, discard one warmup set and measure
+five sets. Wall time begins at submission and ends when all requests complete;
+it excludes model load but includes prefill and decode. Aggregate output rate
+is `slots × 513 / wall seconds`. This fixed synthetic window measures throughput,
+not response quality or performance at 131K occupied context.
+
+| Simultaneous requests | Primary free at startup | Mean set time (5 runs) | Mean aggregate output rate | Mean decode batch |
+|---:|---:|---:|---:|---:|
+| 1 | 1,749 MiB | 7.523 s | 68.19 tok/s | 1.00 |
+| 2 | 1,585 MiB | 9.146 s | 112.18 tok/s | 1.99 |
+| 4 | 1,253 MiB | 14.381 s | 142.69 tok/s | 3.57 |
+
+The aggregate rate is the mean of the five per-set rates, **1.65×** and
+**2.09×** the one-slot rate for two and four requests, respectively. Recorded
+decode-row/round counts establish actual multi-row execution. All measured
+outputs contain exactly 513 token IDs and repeat at each fixed slot position
+across runs; the four-slot greedy outputs differ across slots and from the one/two-slot
+result beginning at token 7 or 8, so this is **not** a quality-equivalence
+qualification. The saved local diagnostic measurements are under
+`profiles/bench/text_concurrency_20260929/` (ignored, not a distributed
+fixture). The four-slot command in the README retains this measured 131K
+ceiling; a 163,840-token four-slot startup is not a benchmarked recommendation.
+
 ## V100 Duo Vision and concurrency
 
 Verified on **September 29, 2026**, using two Tesla V100-SXM2 **16 GB** cards,

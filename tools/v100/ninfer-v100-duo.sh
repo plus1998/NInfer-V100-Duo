@@ -26,13 +26,15 @@ Any remaining arguments are passed to ninfer-serve after these defaults and ther
 For the previous long-context configuration, pass --max-context 200000 --prefill-chunk 1024
 together: 200000 plus the 4096-token default chunk exceeds the 16 GB reservation.
 
-Vision stays off by default. For vision with two request slots and up to 155648 tokens in any one
-request on 16 GB cards, pass --vision --vision-max-tokens 2048 --max-context 155648
---prefill-chunk 1024 --max-concurrency 2 --kv-capacity 155648. This tested profile leaves about
-715 MiB free on the primary GPU. For more headroom use --max-context 131072 --kv-capacity auto;
-auto reserves 1 GiB for sizing and cannot reach 155648 on these cards. The KV pool is shared;
-two full-length requests need not fit concurrently. Increase the visual-token budget only if
-your media needs it, then check memory again; the text-only defaults do not fit with Vision.
+Vision stays off by default. For the recommended single-request vision profile on 16 GB cards,
+pass --vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024
+--max-concurrency 1 --kv-capacity 155648 (about 881 MiB free on the primary GPU).
+For text-only concurrency, use --max-context 155648 --prefill-chunk 4096
+--max-concurrency 2 --kv-capacity 155648 (about 703 MiB free on the primary GPU).
+The KV pool is shared: each request can reach its context ceiling individually, but two
+full-length requests need not fit together. Increase the visual-token budget only if needed;
+the text-only defaults do not fit with Vision. See README.md for four-slot and vision-concurrent
+profiles and measured throughput.
 EOF
     exit 0
 fi
