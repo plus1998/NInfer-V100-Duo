@@ -231,16 +231,23 @@ int verify_tp2(const std::filesystem::path& path) {
 
     expect_equal(materialization.device_count, 2, "tp2 device count");
 
-    // Vision has no shard map (the tower is out of scope for TP2), so binding
-    // it for two devices must be refused rather than silently replicating the backbone.
     {
         ninfer::artifact::Binder vision_binder(reader, 2);
-        bool rejected = false;
-        try {
-            (void)bind_artifact(vision_binder, Package::resolve_weights(reader.identity()),
-                                features(true), 2);
-        } catch (const std::exception&) { rejected = true; }
-        expect(rejected, "tp2 + vision was not rejected at bind time");
+        const auto vision_plan = bind_artifact(
+            vision_binder, Package::resolve_weights(reader.identity()), features(true), 2);
+        std::uint64_t vision_bytes = 0;
+        for (const auto& placement : vision_plan.materialization.device_objects) {
+            const auto& object = reader.objects()[placement.object.index];
+            if (ninfer::artifact::object_name(object).starts_with("vision/")) {
+                expect(placement.device == 0, "Vision weights must reside on the primary rank");
+                expect_equal(placement.bytes, ninfer::artifact::object_bytes(object),
+                              "primary Vision payload bytes");
+                vision_bytes += placement.bytes;
+            }
+        }
+        expect(vision_bytes > 0, "Vision weights were not materialized");
+        expect_equal(vision_plan.materialization.device_capacity_bytes[1],
+                      materialization.device_capacity_bytes[1], "Vision peer arena unchanged");
     }
 
     // --- per-family audit table ---

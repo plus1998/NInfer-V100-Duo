@@ -2156,7 +2156,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
             LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            sequence.rope_delta};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||

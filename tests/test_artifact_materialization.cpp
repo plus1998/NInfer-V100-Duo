@@ -110,6 +110,20 @@ int main() {
                     validation_plan.device_capacity_bytes[0] == kSecondTensor.size(),
                 "validate-only tensor was included in the materialization plan");
 
+        {
+            ninfer::artifact::Binder primary_binder(reader, 2);
+            const auto primary = ninfer::artifact::bind_tensor(
+                primary_binder, "weights/test", ninfer::artifact::NumericFormat::BF16, {2},
+                ninfer::artifact::TensorPlacement::PrimaryDevice);
+            primary_binder.validate_unconsumed_matching();
+            const auto primary_plan = primary_binder.finish();
+            require(primary_plan.device_objects.size() == 1 &&
+                        primary_plan.device_objects.front().object.index == primary.index &&
+                        primary_plan.device_objects.front().device == 0 &&
+                        primary_plan.device_capacity_bytes[0] == kTensor.size() &&
+                        primary_plan.device_capacity_bytes[1] == 0,
+                    "primary-only tensor was replicated or omitted");
+        }
         // A sharded placement that names no range for a device is a shard-map bug, not a request
         // to replicate: the binder must refuse it rather than quietly reserving a full copy.
         {

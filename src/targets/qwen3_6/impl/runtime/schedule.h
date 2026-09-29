@@ -137,6 +137,7 @@ struct PrefillContext {
     std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    std::int32_t rope_delta = 0;
 };
 
 struct OrdinaryBatchContext {

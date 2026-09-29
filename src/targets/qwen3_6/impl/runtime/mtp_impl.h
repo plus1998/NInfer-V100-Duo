@@ -113,7 +113,8 @@ TargetVerifyFrameView verify_view(const MtpRoundView& v, const GdnReplayRecords*
 
 void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
                      const Tensor& previous_hidden, std::int32_t position,
-                     std::span<const std::int32_t> rope_position, bool build_proposal) {
+                     std::span<const std::int32_t> rope_position, bool build_proposal,
+                     const Tensor* next_embedding) {
     auto tp = tp_execution(state.execution);
     tp->mtp_kv = state.mtp_kv_peer;
     if (!tp->mtp_kv.valid() || !tp->io->mtp) {
@@ -149,7 +150,7 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
     const auto visible = static_cast<std::uint32_t>(position + 1);
     card.mtp_forward_batch(next_token, restored, positions, rope, {visible, visible}, ar_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr);
+                           build_proposal ? &draft0 : nullptr, next_embedding);
     if (build_proposal) {
         for_each_rank(*tp->execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -199,10 +200,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         throw std::logic_error("MTP bridge proposal extent is outside the configured window");
     }
     if (state.execution.peer != nullptr) {
-        if (next_embedding != nullptr) {
-            throw std::logic_error("tensor-parallel MTP bridge supports text inputs only");
-        }
-        mtp_bridge_tp2(state, next_token, previous_hidden, position, rope_position, build_proposal);
+        mtp_bridge_tp2(state, next_token, previous_hidden, position, rope_position, build_proposal,
+                       next_embedding);
         return;
     }
     state.execution.work.reset();

@@ -17,6 +17,7 @@ inline constexpr std::size_t kMaximumDevices = 2;
 
 enum class TensorPlacement : std::uint8_t {
     Device,
+    PrimaryDevice,
     ValidateOnly,
 };
 
@@ -95,6 +96,7 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    void materialize_on_primary_device(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     void validate_unconsumed_matching(std::string_view prefix = "");

@@ -235,6 +235,7 @@ public:
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+    void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
 
     void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
         prefill_rewrite_checkpoint_frontier_ = position;
@@ -335,7 +336,8 @@ public:
                            const std::array<Tensor, 2>& rope_positions,
                            ops::GqaExecutionEnvelope envelope,
                            const std::array<Tensor, 2>& mtp_hidden, int logits_column,
-                           const std::array<Tensor, 2>* logits, Tensor* draft_token);
+                           const std::array<Tensor, 2>* logits, Tensor* draft_token,
+                           const Tensor* input_embeddings = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const std::array<Tensor, 2>& previous_hidden,
                              const std::array<Tensor, 2>& position,
                              ops::GqaExecutionEnvelope envelope,
@@ -413,7 +415,8 @@ private:
     // rank 1's the NORMALIZED HIDDEN half, so device 1 never embeds a token in the MTP stem.
     void mtp_forward_stem_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                               std::array<Tensor, 2>& x, std::array<Tensor, 2>& ah,
-                              const std::array<Tensor, 2>& staging);
+                              const std::array<Tensor, 2>& staging,
+                              const Tensor* input_embeddings = nullptr);
     void mtp_forward_tail_tp2(std::array<Tensor, 2>& x, const std::array<Tensor, 2>& ah,
                               const std::array<Tensor, 2>& positions,
                               const std::array<Tensor, 2>& rope_positions,
@@ -424,13 +427,15 @@ private:
                               const std::array<Tensor, 2>& positions,
                               const std::array<Tensor, 2>& rope_positions,
                               ops::GqaExecutionEnvelope envelope,
-                              const std::array<Tensor, 2>& mtp_hidden);
+                              const std::array<Tensor, 2>& mtp_hidden,
+                              const Tensor* input_embeddings = nullptr);
     void mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                const std::array<Tensor, 2>& positions,
                                const std::array<Tensor, 2>& rope_positions,
                                ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                const std::array<Tensor, 2>* final_hidden,
-                               const std::array<Tensor, 2>* logits, Tensor* draft_token);
+                               const std::array<Tensor, 2>* logits, Tensor* draft_token,
+                               const Tensor* input_embeddings = nullptr);
     // Vocabulary-split proposal head: each rank computes its own half of the proposal logits and
     // one allgather leaves the FULL vector on both, because the winning row is a GLOBAL argmax
     // that can land in either half and `draft_head_token_ids` is replicated for exactly that
@@ -489,7 +494,8 @@ private:
     // TextPrefill, which is declared just above this line.
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill,
-                                                      bool finalize_at_end);
+                                                      bool finalize_at_end,
+                                                      const MultimodalPrefill* multimodal = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

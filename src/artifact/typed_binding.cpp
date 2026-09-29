@@ -167,6 +167,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
         binder.materialize_on_device(handle);
+    } else if (placement == TensorPlacement::PrimaryDevice) {
+        binder.materialize_on_primary_device(handle);
     } else {
         binder.validate_only(handle);
     }

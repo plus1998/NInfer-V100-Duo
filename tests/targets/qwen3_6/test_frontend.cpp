@@ -1203,6 +1203,35 @@ int test_disabled_vision() {
     return failures;
 }
 
+int test_visual_budget_independent_of_text_context() {
+    const auto prepare_image = [](const Frontend& frontend) {
+        ninfer::MessagePart image;
+        image.kind = ninfer::MessagePartKind::Media;
+        image.media.kind = ninfer::MediaKind::Image;
+        image.media.bytes = gradient_ppm();
+        image.media.media_type = "image/x-portable-pixmap";
+        image.media.source_name = "budget.ppm";
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(std::move(image));
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        return frontend.prepare(std::move(input));
+    };
+    const Frontend allowed = FrontendFactory::create_component(resources(), true, 4);
+    const Frontend blocked = FrontendFactory::create_component(resources(), true, 3);
+    int failures = check(FrontendFactory::inspect(prepare_image(allowed)).prepare.vision_tokens == 4,
+                         "visual budget rejected media within its token limit");
+    bool rejected = false;
+    try {
+        (void)prepare_image(blocked);
+    } catch (const fi::ProcessorError& error) {
+        rejected = error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
+    }
+    failures += check(rejected, "visual token limit did not reject excess media");
+    return failures;
+}
+
 int test_media_cache_reuses_immutable_payload() {
     const Frontend frontend = FrontendFactory::create_component(resources());
     auto first              = frontend.prepare(image_input());
@@ -1415,5 +1444,6 @@ int main() {
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
     failures += test_disabled_vision();
+    failures += test_visual_budget_independent_of_text_context();
     return failures == 0 ? 0 : 1;
 }

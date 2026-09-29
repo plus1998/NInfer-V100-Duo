@@ -45,6 +45,10 @@ GPU residency is frozen when the Engine starts:
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
 exclusive. The default speculative and Vision settings produce the smallest resident profile.
+`--vision-max-tokens N` independently bounds merged visual tokens per request (`1..32768`,
+default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
+fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
+context without promising to process images or videos beyond that separate budget.
 
 ## Structured messages
 
@@ -150,6 +154,7 @@ measured recommendation rather than a semantic limit.
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
@@ -207,7 +212,8 @@ device used at the default `--tp 1`; when both are given they must agree on the 
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
-`--tp 2` at startup, as do `--spec dflash` and `--vision`. `--spec mtp` is supported at `--tp 2`,
+`--tp 2` at startup, as does `--spec dflash`. `--spec mtp` and execution-qualified `--vision`
+are supported at `--tp 2`,
 including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.

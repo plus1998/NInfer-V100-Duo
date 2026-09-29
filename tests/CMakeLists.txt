@@ -147,7 +147,11 @@ set_tests_properties(ninfer_concurrent_executor_test PROPERTIES SKIP_RETURN_CODE
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_prefix_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_6_27b_vision_tp2_real_test COMMAND ninfer_qwen3_6_27b_prefix_real_test)
+set_tests_properties(ninfer_qwen3_6_27b_vision_tp2_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT "NINFER_TEST_TP2=1")
 ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_tp2_real.cpp
   LIBRARIES ninfer_engine)

@@ -118,6 +118,29 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+For TP2 Vision on the official Qwen3.8 NVFP4 artifact, build
+`ninfer_qwen3_6_27b_prefix_real_test` and run the retained two-device variant:
+
+```bash
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build-v100-duo -R '^ninfer_qwen3_6_27b_vision_tp2_real_test$' --output-on-failure
+```
+
+It checks real multimodal prefill, cross-chunk image lifetime, shifted MTP alignment,
+same-media reuse, changed/appended media, and visual prefix bridges. To verify actual concurrent
+HTTP generation, start the README's Vision profile with `--port 18081 --no-thinking --greedy
+--request-log-jsonl /tmp/ninfer-vision.jsonl --log-stats-interval-ms 500`, then run with Python 3.11:
+
+```bash
+/path/to/python3.11 tools/v100/check_vision_http.py --request-log /tmp/ninfer-vision.jsonl
+```
+
+The HTTP check generates exact red-circle/blue-square PPM scenes on white backgrounds, verifies
+their reported colors and geometry (not exact wording), tests a 1,630-token cross-chunk prompt
+and two images, and sends two simultaneous streaming requests. It requires overlapping content
+streams and structured-log evidence of an actual multi-row decode batch, not just two HTTP 200s.
+Use a dedicated idle server with a 1,024-token prefill chunk and at least two request slots.
+
 Run the peer 35B-A3B route independently:
 
 ```bash

@@ -17,6 +17,7 @@ inline constexpr std::size_t kTokenDomain = 248077;
 struct FrontendOptions {
     bool vision_enabled                    = true;
     std::uint32_t max_context              = 2'048;
+    std::uint32_t vision_max_tokens        = kMaximumVisionTokenBudget;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;

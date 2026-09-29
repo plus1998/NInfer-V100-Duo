@@ -23,6 +23,7 @@ inline constexpr std::uint32_t kMaximumConcurrency = 8;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+inline constexpr std::uint32_t kMaximumVisionTokenBudget = 32768;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -92,9 +93,9 @@ struct EngineOptions {
     // Tensor-parallel degree: 1 (default, single device) or 2. `tp == 2` splits the resident
     // model across two CUDA devices and requires `devices` to name exactly two distinct ids of
     // the same compute capability. It is supported by the 27B execution package (`qwen3.6-27b`,
-    // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`; `qwen3.6-35b-a3b`,
-    // `SpeculativeBackend::DFlash`, and `enable_vision` are rejected at construction. `tp == 1`
-    // is bit-identical to the single-device path.
+    // `qwen3.8-27b`) with `SpeculativeBackend::None` or `Mtp`, including Vision;
+    // `qwen3.6-35b-a3b` and `SpeculativeBackend::DFlash` are rejected at tp 2.
+    // `tp == 1` is bit-identical to the single-device path.
     int tp = 1;
     // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
     // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
@@ -120,6 +121,9 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
+    // use min(max_context, vision_max_tokens), independent of the text context ceiling.
+    std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };

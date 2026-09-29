@@ -62,6 +62,7 @@ struct WorkspacePlan {
 struct SequencePlanningInputs {
     WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
+    std::uint32_t vision_max_tokens        = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
@@ -96,6 +97,7 @@ template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
+    std::uint32_t vision_max_tokens        = 0;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
     std::uint32_t max_concurrency          = 1;

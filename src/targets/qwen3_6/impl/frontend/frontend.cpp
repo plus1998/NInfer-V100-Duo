@@ -639,8 +639,12 @@ public:
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
+        if (options.vision_max_tokens == 0 ||
+            options.vision_max_tokens > kMaximumVisionTokenBudget) {
+            throw std::invalid_argument("vision_max_tokens must be in [1,32768]");
+        }
         const std::uint64_t vision_tokens =
-            std::min<std::uint64_t>(options.max_context, kMaximumVisionTokens);
+            std::min(options.max_context, options.vision_max_tokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
         if (vision_enabled) {
@@ -883,10 +887,12 @@ Frontend make_frontend(const FrontendResources& resources, FrontendOptions optio
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
-                                              bool vision_enabled) {
+                                              bool vision_enabled,
+                                              std::uint32_t vision_max_tokens) {
     FrontendOptions options;
     options.vision_enabled = vision_enabled;
     options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
+    options.vision_max_tokens = vision_max_tokens;
     return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 

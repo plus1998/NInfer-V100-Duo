@@ -106,6 +106,15 @@ void Binder::place(ObjectHandle handle, int device, std::uint64_t bytes, std::ui
     capacity = offset + bytes;
 }
 
+void Binder::materialize_on_primary_device(ObjectHandle handle) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr || planned_[handle.index]) {
+        throw ArtifactError("primary-device placement requires an unplanned tensor");
+    }
+    place(handle, 0, tensor->bytes, tensor_alignment(tensor->layout), tensor->shape.front(), {});
+    planned_[handle.index] = true;
+}
+
 void Binder::materialize_on_device(ObjectHandle handle) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {

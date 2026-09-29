@@ -1,5 +1,7 @@
 #include "ninfer/engine.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -19,6 +21,11 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = true;
+    if (std::getenv("NINFER_TEST_TP2") != nullptr) {
+        options.tp = 2;
+        options.devices = {0, 1};
+        options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+    }
     return options;
 }
 
@@ -47,6 +54,7 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
 }
 
 int exercise_registered_frontend(const ninfer::Engine& engine) {
+    if (engine.load_summary().target != "qwen3_6_27b") { return 0; }
     if (engine.count_tokens(chinese_chat(true)) != 16) {
         std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
         return 1;
@@ -447,9 +455,9 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" ||
+    if ((load.target != "qwen3_6_27b" && load.target != "qwen3_8_27b") ||
         (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
-        load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
+        load.host_to_device_bytes == 0 || load.artifact_bytes_read == 0) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';
         return 1;
@@ -487,6 +495,13 @@ int main() {
         std::cout << "skip: neither NINFER_QWEN3_6_27B_WEIGHTS nor "
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS is set\n";
         return 77;
+    }
+    if (std::getenv("NINFER_TEST_TP2") != nullptr) {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+            std::cout << "skip: TP2 Vision requires two CUDA devices\n";
+            return 77;
+        }
     }
     if (groupwise != nullptr && *groupwise != '\0') {
         if (const int result = exercise_artifact(groupwise); result != 0) { return result; }

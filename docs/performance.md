@@ -435,6 +435,227 @@ those runs are **excluded** from the complete-output comparison above. An
 earlier two-run MTP3 campaign measured 122.304 / 122.310 tok/s with the
 same prompt and output; the table is the subsequent matched three-run campaign.
 
+## V100 Duo Vision and concurrency
+
+Verified on **September 29, 2026**, using two Tesla V100-SXM2 **16 GB** cards,
+CUDA **12.8**, `sm_70`, and the explicitly selected official artifact
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` (`qwen3.8-27b/nvfp4`). This is a
+functional serving qualification, not a vision-accuracy benchmark or a sustained
+throughput comparison.
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
+  --vision --max-context 16384 --prefill-chunk 1024 \
+  --max-concurrency 2 --kv-capacity auto \
+  --port 18081 --no-thinking --greedy \
+  --request-log-jsonl /tmp/ninfer-vision.jsonl --log-stats-interval-ms 500
+```
+
+Run the deterministic-scene checker against that dedicated idle server with
+Python 3.11 (the verification interpreter was `/tmp/ninfer-py311/bin/python`):
+
+```bash
+/path/to/python3.11 tools/v100/check_vision_http.py --request-log /tmp/ninfer-vision.jsonl
+```
+
+Startup completed with **32,768 shared Main Text KV tokens**, sufficient for two
+16,384-token entitlements; primary-rank runtime reservation was **2.76 GiB** and
+actual primary-rank free memory after startup was **2.10 GiB**. INT8 KV, optimized
+MTP3 and CUDA Graph were enabled. These memory figures qualify startup capacity,
+not generation at the full context frontier.
+
+The checker creates independent PPM fixtures: a red circle and a blue square on
+white backgrounds. It requires the correct shape, color and background, not
+exact wording. All **six** real HTTP requests passed:
+
+| Request | Prompt tokens | Completion tokens | HTTP first content |
+|---|---:|---:|---:|
+| Red circle, 384 × 384 | 174 | 12 | 0.581 s |
+| Blue square, 384 × 384 | 174 | 12 | 0.544 s |
+| Blue square, 1280 × 1280; crosses prefill chunks | 1,630 | 13 | 4.042 s |
+| Both images in one request | 318 | 122 | 1.039 s |
+| Concurrent red-circle request | 189 | 384 | 0.543 s |
+| Concurrent blue-square request | 189 | 384 | 1.126 s |
+
+Each row is one request, not an average or percentile. HTTP first-content latency
+includes local HTTP/media preparation and streaming; it excludes startup/model
+load. The concurrent pair finishes at 6.107 s and 6.396 s from each request's
+start, both at their 384-token output limit. Their content-stream intervals
+overlap, and structured throughput records report **average decode batch size
+2.00** during joint decoding. This establishes actual batched concurrent Vision
+generation, not two successful but sequential HTTP responses. Every completion
+record reports nonzero Vision time and there are no request errors or rejections.
+
+A separate ordinary-decoding server (same 16K/two-slot Vision profile, INT8 KV and
+CUDA Graph, but **without** `--spec` or `--lm-head-draft`) also passed all six
+HTTP checks, including actual decode batch size **2.00**. Its startup resolved
+the same 32,768-token KV pool with **2.53 GiB** primary-rank free memory. Thus
+Vision concurrency is exercised with and without the speculative backend.
+
+The retained public-Engine TP2 test additionally covers cross-chunk media lifetime,
+MTP shifted visual embeddings, same-media reuse without re-encoding, changed and
+appended media, and a visual prefix bridge against cold full prefill. See
+[test commands](../tests/README.md). The 8,192-token/two-slot Vision profile also
+passed the same six HTTP checks. The README's 32 GB/four-slot profile is a tuning
+starting point, **not a hardware-verified result**; no 32 GB GPU is available here.
+
+### TP2 Vision context capacity
+
+The initial 16K/two-slot Vision profile above was a conservative functional
+qualification, **not a measurement of the maximum context**. Before the
+independent `--vision-max-tokens` budget was added, public Engine startups on
+the same hardware, artifact, INT8 KV, optimized MTP3 and 1,024-token prefill
+chunks gave these historical default-visual-budget results:
+
+| Vision context / slots | KV policy | Resolved shared KV | Primary free after startup | Result |
+|---|---|---:|---:|---|
+| 16,384 / 2 | auto | 32,768 | 2.10 GiB | starts |
+| 24,576 / 2 | auto | 44,288 | 1.14 GiB | starts; not two full ceilings |
+| 24,576 / 2 | explicit 49,152 | 49,152 | 1.06 GiB | starts; two full ceilings |
+| 32,768 / 2 | auto | — | — | rejected: minimum runtime plus 1 GiB headroom exceeds budget |
+| 32,768 / 2 | explicit 32,768 | 32,768 | 0.56 GiB | starts; one full ceiling only |
+| 32,768 / 2 | explicit 65,536 | — | — | rejected: runtime exceeds available memory |
+| 49,152 / 1 | explicit 49,152 | 49,152 | 0.44 GiB | starts; little headroom |
+| 65,536 / 1 | explicit 65,536 | 65,536 | 0.17 GiB | starts; not recommended |
+| 180,224 / 1 | auto | — | — | rejected: runtime exceeds available memory |
+
+These are startup/admission observations, not full-context generation tests
+except where explicitly noted below. `auto` retains **1 GiB of planned sizing
+headroom**; explicit capacity bypasses that policy but cannot bypass actual
+memory requirements. Planned sizing headroom and measured free memory differ
+because graph reservation is a bound, not necessarily fully allocated memory.
+
+These runs planned Vision workspace for
+`min(max_context, 32768)` **merged visual tokens** (four patches per token),
+with a separate visual-output transient reservation. It is not sized to the
+small image used by an individual request. At the verified 24K/two-slot explicit
+profile, primary weights occupy **10.73 GiB**, shared scratch **2.28 GiB**, and
+the complete runtime reservation **3.81 GiB**. Raising context to 32K increased
+the worst-case Vision reservation as well as text KV and per-slot state. This
+explained the old 16K/24K recommendation; it did **not** establish a 24K ceiling
+for a text-heavy Vision workload.
+
+The 24K/two-slot explicit 49,152-token profile also passed all six real HTTP
+Vision checks (single image, cross-chunk image, multiple images and two
+concurrent streams). Its concurrent decode records report batch size **2.00**.
+Two additional simultaneously submitted image requests each occupied **22,180
+prompt tokens** (repeated text filler plus a 384 × 384 image), requested at most
+128 output tokens, and finished normally with 15 tokens identifying the correct
+color, shape and background. Their text prefill phases took **22.65 / 22.66 s**;
+HTTP first content arrived at **22.93 / 45.87 s** because prefill work is
+scheduled on the shared executor. This verifies long occupied context with
+Vision for this workload, not near-ceiling sustained decode throughput or a
+guarantee of simultaneous long-prefill execution.
+The current Engine independently bounds merged visual tokens per request through
+`--vision-max-tokens`; frontend admission and both Vision workspace and
+output-transient planning use the same bound. With 2,048 visual tokens,
+1,024-token prefill chunks, two slots and `--kv-capacity auto` on the same pair:
+
+| Context per request | Resolved shared KV | Primary free after startup | Outcome |
+|---:|---:|---:|---|
+| 131,072 | 137,920 | 1.14 GiB | starts; one full-length request fits |
+| 147,456 | — | — | `auto` rejects minimum runtime plus 1 GiB headroom |
+| 180,224 | — | — | `auto` rejects minimum runtime plus 1 GiB headroom |
+
+With the same Vision/token/TP2/two-slot profile, sizing the shared KV pool
+**explicitly to equal `max_context`** instead of asking `auto` to reserve 1 GiB
+gave these additional startups. Figures are primary-rank free memory after
+load, *not* unused KV capacity:
+
+| Per-request context and shared KV | Primary free after startup | Qualification |
+|---:|---:|---|
+| 155,648 | 0.70 GiB (715 MiB) | real near-ceiling image prompt and concurrent Vision checked |
+| 163,840 | 0.51 GiB | startup only |
+| 172,032 | 0.33 GiB | startup only |
+| 180,224 | 0.14 GiB | startup only; very little margin |
+
+The **155,648/2-slot profile** was subsequently tested through the real HTTP
+server. A 384 × 384 blue-square image plus repeated text occupied **154,771
+prompt tokens**; the 20-token output correctly identified the blue square and
+white background. Image encoding took **0.161 s**, text prefill **218.52 s**,
+decode **0.319 s**, and HTTP first content **219.15 s**. Main-card memory was
+**15,432 MiB used / 713 MiB free** both after startup and after that generation;
+the peer held **15,124 MiB used / 1,021 MiB free** at startup and **15,126 MiB
+used / 1,019 MiB free** afterward. All six real-image HTTP checks then passed
+on the same profile, including the concurrent pair with recorded average
+decode batch size **2.00**. This qualifies a near-ceiling *prefill* with short
+decode and short-prompt batched decode, **not** long-context sustained decode
+or concurrent full-length admissions. The higher-context rows were not tested
+with near-ceiling requests and have substantially less free memory.
+
+`--max-context 180224 --max-concurrency 2 --kv-capacity 180224` can start only
+with explicit sizing, leaving **0.14 GiB** free; it is not a robust recommendation
+and has not been qualified with a full-context Vision request. The 131K/2-slot
+profile does **not** divide its context in half: one request can occupy up to
+131,072 tokens, with the remaining **6,848 shared KV tokens** available for
+overlapping smaller reservations. It cannot promise two full-length requests.
+
+The recommended 131K/two-slot profile was also exercised through the HTTP
+server, not just startup sizing. One cold request with a real 384 × 384 image
+and **100,171 occupied prompt tokens** (repeated text filler) produced 30
+completion tokens, correctly identifying the red circle and white background;
+Vision encoding took **0.160 s**, text prefill **124.06 s**, and decode
+**0.355 s**. A second cold request with a blue-square image occupied **130,671
+prompt tokens** (401 below the 131,072 ceiling), produced 20 tokens correctly
+identifying its color, shape and background, and measured **174.55 s** text
+prefill, **0.160 s** Vision encoding, and **0.301 s** decode. These qualify
+near-ceiling *occupied* Vision context with a short continuation, not sustained
+long-context decode throughput. The same resident profile passed the six-request real-image checker,
+including 1,630-token cross-chunk media, a two-image request and two concurrent
+384-token streams; its concurrent decode reached **batch size 2.00**. Two
+1,280 × 1,280 images in one prompt exceeded the 2,048-visual-token budget and
+returned HTTP 400 `media_budget_exceeded`, confirming that reduced Vision
+workspace does not silently accept larger media than was planned.
+
+### TP2 Vision prefill and decode cost
+
+On the same **2 × V100-SXM2 16 GB**, CUDA 12.8 and Qwen3.8-27B NVFP4 artifact,
+the public Engine measured Vision disabled/enabled in separate resident processes.
+Both used TP2, 16,384 context, two concurrent slots, an explicit 32,768-token
+INT8 KV pool, optimized MTP3, CUDA Graph, greedy sampling and no prefix reuse.
+For each case, one warmup was discarded and **five** cold requests were measured;
+model load was excluded. Text inputs, fixed output limits and generated token IDs
+matched exactly across the Vision switch. Prefill-only cases requested nine
+output tokens (including the prefill token); the long text decode case requested
+1,025 (one prefill plus 1,024 decode). Fixed-length generation ignores model
+stop tokens; these are throughput measurements, not answer-quality comparisons.
+
+| Prefill chunk | Text prompt tokens | Vision off prefill tok/s | Vision on prefill tok/s | Change |
+|---:|---:|---:|---:|---:|
+| 1,024 | 512 | 885.56 | 884.26 | −0.15% |
+| 1,024 | 4,096 | 1,026.81 | 1,024.61 | −0.21% |
+| 1,024 | 12,288 | 1,005.03 | 1,003.21 | −0.18% |
+| 4,096 | 512 | 884.00 | 883.10 | −0.10% |
+| 4,096 | 4,096 | 1,150.12 | 1,148.64 | −0.13% |
+| 4,096 | 12,288 | 1,119.54 | 1,118.17 | −0.12% |
+
+At a fixed 1,024-token chunk, Vision-enabled **text-only** decode was
+**119.57 tok/s** versus **119.71 tok/s** disabled (−0.12%, 1,024 decode tokens).
+Two simultaneous text requests, each generating 513 tokens, formed real decode
+batches (mean batch size **1.987** in both modes); their mean wall-clock makespan
+was **5.610 s** versus **5.605 s** (+0.11%, including prefill). Enabling Vision
+therefore caused no material text-path prefill or decode slowdown in these
+workloads. Switching from a 4,096-token chunk to the README's conservative
+1,024-token Vision chunk independently reduced 4,096-token *text* prefill from
+1,150.12 to 1,026.81 tok/s with Vision off (−10.7%); this is a chunk-size
+tradeoff, not Vision encoding overhead. Vision also started with less free memory:
+**2.10 GiB** versus **3.64 GiB** at the 1,024-token chunk.
+
+Actual image requests add work *before* first-token delivery. At the 1,024-token
+chunk, a 384 × 384 PPM scene expanded to **193** prompt tokens: media preparation
+averaged **0.007 s**, Vision encoding **0.158 s**, text prefill **0.369 s**, and
+Engine TTFT **0.534 s**. A 1,280 × 1,280 scene expanded to **1,649** tokens:
+preparation **0.066 s**, Vision encoding **2.143 s**, text prefill **1.691 s**,
+and Engine TTFT **3.899 s**. TTFT excludes preparation and model load. A
+384 × 384 image prompt followed by 512 decode tokens reached **120.96 tok/s**;
+two such concurrent image requests formed decode batches (mean size **1.959**),
+finishing 1,026 combined output tokens in **5.867 s** on average, *including*
+their Vision encoding and prefill phases but excluding host-side preparation.
+Image and text continuations have different
+tokens and MTP acceptance, so their decode rates and pair makespans are **not**
+controlled measures of Vision-induced decode overhead; the identical text
+on/off comparison above is the appropriate isolation.
+
 ## V100 Duo context decay
 
 On September 28, 2026, the same local **2 × V100-SXM2 16 GB**, CUDA 12.8,
