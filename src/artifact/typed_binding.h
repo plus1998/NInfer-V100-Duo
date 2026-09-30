@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <string_view>
 
 namespace ninfer::artifact {
@@ -36,6 +37,14 @@ class MaterializedArtifact;
 [[nodiscard]] Weight materialized_weight(const MaterializedArtifact& materialized,
                                          ObjectHandle handle, NumericFormat format,
                                          std::int32_t rows, std::int32_t columns, int device = 0);
+
+// A GGUF-blocks weight made of consecutive row segments, each a whole-row GGUF block object
+// placed on `device` (a row shard at tp > 1). Their placed rows must sum to `rows`.
+[[nodiscard]] Weight materialized_gguf_weight(const MaterializedArtifact& materialized,
+                                              std::span<const ObjectHandle> segments,
+                                              std::span<const NumericFormat> formats,
+                                              std::int32_t rows, std::int32_t columns,
+                                              int device = 0);
 
 // Shared shape-vs-placement guard, exposed so target-owned wrappers (NVFP4 weights, which the
 // generic `materialized_weight` refuses) can discharge the same obligation.

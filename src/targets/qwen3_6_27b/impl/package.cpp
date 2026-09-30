@@ -99,6 +99,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-q4-k-m") {
         return WeightsProfile::Qwen38GgmlK;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-blocks") {
+        return WeightsProfile::Qwen38Gguf;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

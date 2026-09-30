@@ -38,7 +38,51 @@ enum class QType : std::uint16_t {
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
     GGML_K               = 9,
+    GGUF                 = 10,
 };
+
+// One ggml block type of a GGUF-blocks weight. Every block covers 256 values.
+enum class GgufType : std::uint8_t {
+    IQ4_XS  = 0,
+    IQ3_S   = 1,
+    IQ3_XXS = 2,
+    IQ2_XS  = 3,
+    IQ2_XXS = 4,
+    IQ2_S   = 5,
+    IQ1_M   = 6,
+    Q2_K    = 7,
+    Q4_K    = 8,
+    Q6_K    = 9,
+};
+
+inline constexpr int kGgufTypeCount = 10;
+
+constexpr int gguf_block_bytes(GgufType type) {
+    switch (type) {
+    case GgufType::IQ4_XS: return 136;
+    case GgufType::IQ3_S: return 110;
+    case GgufType::IQ3_XXS: return 98;
+    case GgufType::IQ2_XS: return 74;
+    case GgufType::IQ2_XXS: return 66;
+    case GgufType::IQ2_S: return 82;
+    case GgufType::IQ1_M: return 56;
+    case GgufType::Q2_K: return 84;
+    case GgufType::Q4_K: return 144;
+    case GgufType::Q6_K: return 210;
+    }
+    return 0;
+}
+
+// A GGUF-blocks weight is up to four consecutive row runs, each stored as whole rows of one ggml
+// block type in its own allocation. Row r of the logical matrix is row (r - first_row) of the
+// run containing it; a run's rows are `row_bytes = (k / 256) * gguf_block_bytes(type)` apart.
+struct GgufSegment {
+    const void* data   = nullptr;
+    std::int32_t rows  = 0;
+    GgufType type      = GgufType::Q4_K;
+};
+
+inline constexpr int kMaxGgufSegments = 4;
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
@@ -47,6 +91,7 @@ enum class QuantLayout : std::uint16_t {
     RowScale            = 3,
     VoltaQpnPrepacked    = 4,
     GgmlK256            = 5,
+    GgufBlocks          = 6,
 };
 
 struct Weight {
@@ -77,6 +122,11 @@ struct Weight {
     // or exactly two runs. Other layouts leave both fields at -1.
     std::int32_t ggml_k_first_q6   = -1;
     std::int32_t ggml_k_type_change = -1;
+
+    // GGUF (QuantLayout::GgufBlocks) row runs, in logical row order; other layouts leave
+    // gguf_segment_count at zero.
+    GgufSegment gguf_segments[kMaxGgufSegments] = {};
+    std::int32_t gguf_segment_count             = 0;
 };
 
 } // namespace ninfer

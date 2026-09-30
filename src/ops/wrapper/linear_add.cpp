@@ -6,6 +6,7 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/linear_dispatch.h" // detail-free validate_linear_semantics / dispatch_linear
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/linear/gguf/gguf.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
@@ -92,6 +93,10 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
 
     if (w.qtype == QType::GGML_K) {
         detail::ggml_k_project_split(x, w, &residual_out, 1, true, stream, false, ws);
+        return;
+    }
+    if (w.qtype == QType::GGUF) {
+        detail::gguf_project(x, w, &residual_out, 1, true, false, ws, stream);
         return;
     }
     if (w.qtype == QType::BF16_CTRL) {
@@ -229,6 +234,10 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                               min_tokens, max_tokens);
         return detail::ggml_k_cutlass_workspace_bytes(output_rows, input_rows, max_tokens);
     }
+    if (qtype == QType::GGUF) {
+        return linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy, min_tokens,
+                                               max_tokens);
+    }
     if (qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("linear_add workspace: BF16 admits only A16");
@@ -361,7 +370,8 @@ void issue_fused_rank(const Tensor& x, const Weight& w, Tensor& residual, Tensor
         residual_add(scratch, residual, stream);
         return;
     }
-    if (w.qtype == QType::GGML_K || w.qtype == QType::NVFP4 || w.qtype == QType::Q5G64_F16S ||
+    if (w.qtype == QType::GGML_K || w.qtype == QType::GGUF || w.qtype == QType::NVFP4 ||
+        w.qtype == QType::Q5G64_F16S ||
         w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         // FP8 reaches here through the same "shape alone selects the route" widening as NVFP4/Q5:
         // dispatch_linear_add's FP8 branch (above) already admits the tp2 row-shard extents, and
@@ -422,9 +432,20 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                             events);
 }
 
+namespace {
+void block_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, bool add,
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (w.qtype == QType::GGUF) {
+        detail::gguf_project(x, w, &residual, 1, add, true, workspace, stream);
+    } else {
+        detail::ggml_k_project_split(x, w, &residual, 1, add, stream, true, workspace);
+    }
+}
+} // namespace
+
 void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
                        WorkspaceArena& workspace, cudaStream_t stream) {
-    detail::ggml_k_project_split(x, w, &residual, 1, true, stream, true, &workspace);
+    block_gdn_output(x, w, residual, true, &workspace, stream);
 }
 
 void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
@@ -436,8 +457,9 @@ void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 
     validate_add_split_pair(x, w, ec);
     validate_add_split_residency(x, w, residual, ec);
     detail::for_each_rank(ec, [&](int rank) {
-        detail::ggml_k_project_split(x[rank], w[rank], &residual[rank], 1, rank == 0,
-                                     ec.dev[rank]->stream, true, workspace[rank]);
+        Tensor target = residual[rank];
+        block_gdn_output(x[rank], w[rank], target, rank == 0, workspace[rank],
+                         ec.dev[rank]->stream);
     });
     allreduce_sum(residual, staging, ec, events);
 }

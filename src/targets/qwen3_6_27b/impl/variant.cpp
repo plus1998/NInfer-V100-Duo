@@ -278,7 +278,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
-    if (weight.qtype == QType::GGML_K) {
+    if (weight.qtype == QType::GGML_K || weight.qtype == QType::GGUF) {
         ops::ggml_k_gdn_output(hidden, weight, residual, workspace, stream);
         return;
     }
@@ -357,6 +357,9 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen38GgmlK:
         return 0;
+    case WeightsProfile::Qwen38Gguf:
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::GGUF, 14336, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -374,6 +377,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     case WeightsProfile::Qwen38GgmlK:
         return ops::linear_add_workspace_capacity_bytes(
             QType::GGML_K, TextConfig::hidden, TextConfig::value_dim,
+            ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen38Gguf:
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::GGUF, TextConfig::hidden, TextConfig::query_size,
             ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -400,6 +407,9 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
         return 0;
+    case WeightsProfile::Qwen38Gguf:
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::GGUF, 16384, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
@@ -422,6 +432,11 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::GGML_K, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
+    case WeightsProfile::Qwen38Gguf:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                            QType::GGUF, 16384, TextConfig::hidden,
                             ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -453,6 +468,11 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::GGML_K, 16384, TextConfig::hidden,
                             ops::LinearPolicy::A16Only, batch_size, first, last));
+    case WeightsProfile::Qwen38Gguf:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                            QType::GGUF, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return std::max(kMinimumLeafWorkspaceBytes,
@@ -481,6 +501,10 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     switch (weights_profile) {
     case WeightsProfile::Qwen38GgmlK:
         return 0;
+    case WeightsProfile::Qwen38Gguf:
+        return ops::linear_add_workspace_capacity_bytes(QType::GGUF, TextConfig::hidden,
+                                                        TextConfig::value_dim,
+                                                        ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -511,6 +535,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::Qwen38GgmlK:
         return post_mixer_workspace_bytes(QType::GGML_K, QType::GGML_K,
                                           ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen38Gguf:
+        return post_mixer_workspace_bytes(QType::GGUF, QType::GGUF, ops::LinearPolicy::A16Only,
+                                          first, last);
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
@@ -583,7 +610,7 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
 // Both registered MTP codecs use A16 projections without transient Linear storage.
 void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
     if (a.qtype != b.qtype ||
-        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K)) {
+        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K && a.qtype != QType::GGUF)) {
         throw std::logic_error(std::string(label) +
                                ": unsupported or inconsistent tp2 MTP weight format");
     }
@@ -691,7 +718,7 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                     const std::array<Tensor, 2>& staging, qwen3_6::TextPhase,
                                     const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
-    if (weight[0].qtype == QType::GGML_K) {
+    if (weight[0].qtype == QType::GGML_K || weight[0].qtype == QType::GGUF) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
         return;
     }

@@ -1,5 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/linear/gguf/gguf.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -91,6 +92,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     if (weight.qtype == QType::GGML_K) {
         const Tensor outputs[]{q, k, gate, v};
         detail::ggml_k_project_split(x, weight, outputs, 4, false, stream, false, workspace);
+        return;
+    }
+    if (weight.qtype == QType::GGUF) {
+        const Tensor outputs[]{q, k, gate, v};
+        detail::gguf_project(x, weight, outputs, 4, false, false, workspace, stream);
         return;
     }
     if (weight.qtype == QType::BF16_CTRL) {
@@ -193,6 +199,9 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         (void)linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows,
                                               policy, min_tokens, max_tokens);
         return detail::ggml_k_cutlass_workspace_bytes(parent_rows, input_rows, max_tokens);
+    case QType::GGUF:
+        return linear_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, policy,
+                                               min_tokens, max_tokens);
     case QType::BF16_CTRL:
         if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
@@ -307,7 +316,7 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
     require_matrix(k, kShardKeyRows, cols, "k");
     require_matrix(v, kShardKeyRows, cols, "v");
 
-    if (w.qtype == QType::GGML_K) {
+    if (w.qtype == QType::GGML_K || w.qtype == QType::GGUF) {
         (void)linear_workspace_capacity_bytes(w.qtype, w.n, w.k, policy, cols, cols);
     } else if (w.qtype == QType::NVFP4) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
@@ -395,7 +404,7 @@ void validate_split_storage_split_pair(const std::array<Tensor, 2>& x,
 std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype, LinearPolicy policy,
                                                                       std::int32_t min_tokens,
                                                                       std::int32_t max_tokens) {
-    if (qtype == QType::GGML_K) {
+    if (qtype == QType::GGML_K || qtype == QType::GGUF) {
         return linear_workspace_capacity_bytes(qtype, kShardFusedRows, kShardHidden,
                                                 policy, min_tokens, max_tokens);
     }
@@ -448,6 +457,10 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
             const Tensor outputs[]{q_dst[slot], k_dst[slot], gate_dst[slot], v_dst[slot]};
             detail::ggml_k_project_split(x[slot], w, outputs, 4, false,
                                          ec.dev[slot]->stream, false, workspace[slot]);
+        } else if (w.qtype == QType::GGUF) {
+            const Tensor outputs[]{q_dst[slot], k_dst[slot], gate_dst[slot], v_dst[slot]};
+            detail::gguf_project(x[slot], w, outputs, 4, false, false, workspace[slot],
+                                 ec.dev[slot]->stream);
         } else if (w.qtype == QType::NVFP4) {
             detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
                                                     k_dst[slot], v_dst[slot], policy,

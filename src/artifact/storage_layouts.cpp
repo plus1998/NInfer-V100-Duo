@@ -75,6 +75,29 @@ std::uint64_t ggml_k_code_offset(std::uint64_t rows) {
     return align_up(checked_mul(rows, 8, "GGML row descriptors"), 256, "GGML code offset");
 }
 
+std::uint64_t gguf_block_bytes(NumericFormat format) noexcept {
+    switch (format) {
+    case NumericFormat::GGUF_IQ4_XS: return 136;
+    case NumericFormat::GGUF_IQ3_S: return 110;
+    case NumericFormat::GGUF_IQ3_XXS: return 98;
+    case NumericFormat::GGUF_IQ2_XS: return 74;
+    case NumericFormat::GGUF_IQ2_XXS: return 66;
+    case NumericFormat::GGUF_IQ2_S: return 82;
+    case NumericFormat::GGUF_IQ1_M: return 56;
+    case NumericFormat::GGUF_Q2_K: return 84;
+    case NumericFormat::GGUF_Q4_K: return 144;
+    case NumericFormat::GGUF_Q6_K: return 210;
+    default: return 0;
+    }
+}
+
+namespace {
+// gguf-blocks-v1 rows are whole, unpadded rows of 256-value blocks (storage-layouts.md).
+std::uint64_t gguf_row_bytes(NumericFormat format, std::uint64_t columns) {
+    return checked_mul(columns / 256, gguf_block_bytes(format), "GGUF row bytes");
+}
+} // namespace
+
 namespace {
 std::uint64_t ggml_row(std::span<const std::byte> payload, std::uint64_t row) {
     std::uint64_t value = 0;
@@ -133,6 +156,26 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "FP8_E4M3FN_ROW_BF16S";
     case NumericFormat::GGML_K:
         return "GGML_K";
+    case NumericFormat::GGUF_IQ4_XS:
+        return "GGUF_IQ4_XS";
+    case NumericFormat::GGUF_IQ3_S:
+        return "GGUF_IQ3_S";
+    case NumericFormat::GGUF_IQ3_XXS:
+        return "GGUF_IQ3_XXS";
+    case NumericFormat::GGUF_IQ2_XS:
+        return "GGUF_IQ2_XS";
+    case NumericFormat::GGUF_IQ2_XXS:
+        return "GGUF_IQ2_XXS";
+    case NumericFormat::GGUF_IQ2_S:
+        return "GGUF_IQ2_S";
+    case NumericFormat::GGUF_IQ1_M:
+        return "GGUF_IQ1_M";
+    case NumericFormat::GGUF_Q2_K:
+        return "GGUF_Q2_K";
+    case NumericFormat::GGUF_Q4_K:
+        return "GGUF_Q4_K";
+    case NumericFormat::GGUF_Q6_K:
+        return "GGUF_Q6_K";
     }
     return {};
 }
@@ -149,6 +192,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "row-scale-v1";
     case StorageLayout::GgmlK256V1:
         return "ggml-k256-v1";
+    case StorageLayout::GgufBlocksV1:
+        return "gguf-blocks-v1";
     }
     return {};
 }
@@ -182,6 +227,13 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
             throw ArtifactError("ggml-k256-v1 byte size does not describe whole Q4_K/Q6_K rows");
         }
         return stored_bytes;
+    }
+    if (layout == StorageLayout::GgufBlocksV1) {
+        if (!is_gguf_format(format) || shape.size() != 2 || shape[0] == 0 || shape[1] == 0 ||
+            shape[1] % 256 != 0) {
+            throw ArtifactError("gguf-blocks-v1 requires a GGUF_* [N,K] matrix with K % 256 == 0");
+        }
+        return checked_mul(shape[0], gguf_row_bytes(format, shape[1]), "GGUF tensor bytes");
     }
     if (layout == StorageLayout::ContiguousLeV1) {
         if (shape.size() > 16) {
@@ -424,6 +476,17 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
         return out;
     }
 
+    if (layout == StorageLayout::GgufBlocksV1) {
+        // Whole rows of blocks: one contiguous range per row range.
+        (void)tensor_encoded_size(layout, format, shape);
+        const std::uint64_t total_rows = validate_row_ranges(rows, shape[0], 1);
+        const std::uint64_t row_bytes  = gguf_row_bytes(format, shape[1]);
+        out.encoded_bytes = checked_mul(total_rows, row_bytes, "GGUF row slice size");
+        const std::array<SlicePlane, 1> planes = {SlicePlane{0, 0, row_bytes}};
+        append_row_plane_copies(out, planes, rows, 1);
+        return out;
+    }
+
     if (layout == StorageLayout::ContiguousLeV1) {
         // Row-major with no internal structure: one contiguous range per row range.
         const std::uint64_t total_rows = validate_row_ranges(rows, shape[0], 1);
@@ -525,6 +588,27 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
             }
         }
         out.encoded_bytes = code_base + cursor;
+        return out;
+    }
+
+    if (layout == StorageLayout::GgufBlocksV1) {
+        // Blocks never straddle a 256-column boundary, so any list of 256-aligned column ranges
+        // is a whole number of blocks per row and concatenates into the shard's own rows.
+        (void)tensor_encoded_size(layout, format, shape);
+        const std::uint64_t block_bytes = gguf_block_bytes(format);
+        for (const auto& columns : column_ranges) {
+            require_slice(columns.begin % 256 == 0 && columns.count % 256 == 0,
+                          "gguf-blocks-v1 column boundaries must be multiples of 256");
+        }
+        const std::array<SlicePlane, 1> planes = {SlicePlane{0, 0, block_bytes}};
+        std::uint64_t destination              = 0;
+        for (const SliceRange& range : column_ranges) {
+            append_column_plane_copies(out, planes, rows, range.begin / 256, shape[1] / 256,
+                                       total_count / 256, range.count / 256, destination);
+            destination += range.count / 256;
+        }
+        out.encoded_bytes = checked_mul(rows, gguf_row_bytes(format, total_count),
+                                        "GGUF column slice size");
         return out;
     }
 

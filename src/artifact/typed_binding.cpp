@@ -28,8 +28,35 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowScaleV1;
     case NumericFormat::GGML_K:
         return StorageLayout::GgmlK256V1;
+    case NumericFormat::GGUF_IQ4_XS:
+    case NumericFormat::GGUF_IQ3_S:
+    case NumericFormat::GGUF_IQ3_XXS:
+    case NumericFormat::GGUF_IQ2_XS:
+    case NumericFormat::GGUF_IQ2_XXS:
+    case NumericFormat::GGUF_IQ2_S:
+    case NumericFormat::GGUF_IQ1_M:
+    case NumericFormat::GGUF_Q2_K:
+    case NumericFormat::GGUF_Q4_K:
+    case NumericFormat::GGUF_Q6_K:
+        return StorageLayout::GgufBlocksV1;
     }
     throw std::logic_error("unhandled numeric format");
+}
+
+GgufType gguf_type_for(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::GGUF_IQ4_XS: return GgufType::IQ4_XS;
+    case NumericFormat::GGUF_IQ3_S: return GgufType::IQ3_S;
+    case NumericFormat::GGUF_IQ3_XXS: return GgufType::IQ3_XXS;
+    case NumericFormat::GGUF_IQ2_XS: return GgufType::IQ2_XS;
+    case NumericFormat::GGUF_IQ2_XXS: return GgufType::IQ2_XXS;
+    case NumericFormat::GGUF_IQ2_S: return GgufType::IQ2_S;
+    case NumericFormat::GGUF_IQ1_M: return GgufType::IQ1_M;
+    case NumericFormat::GGUF_Q2_K: return GgufType::Q2_K;
+    case NumericFormat::GGUF_Q4_K: return GgufType::Q4_K;
+    case NumericFormat::GGUF_Q6_K: return GgufType::Q6_K;
+    default: throw std::logic_error("not a GGUF block format");
+    }
 }
 
 QType qtype_for(NumericFormat format) {
@@ -54,6 +81,9 @@ QType qtype_for(NumericFormat format) {
         return QType::FP8_E4M3FN_ROW_BF16S;
     case NumericFormat::GGML_K:
         return QType::GGML_K;
+    default:
+        if (is_gguf_format(format)) { return QType::GGUF; }
+        break;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -234,6 +264,10 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         out.ggml_k_type_change = profile.type_change;
         return out;
     }
+    if (is_gguf_format(format)) {
+        return materialized_gguf_weight(materialized, std::span(&handle, 1), std::span(&format, 1),
+                                        rows, columns, device);
+    }
     if (format == NumericFormat::NVFP4) {
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
@@ -245,6 +279,47 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         return row_scale_weight(materialized, handle, format, rows, columns, device);
     }
     return row_split_weight(materialized, handle, format, rows, columns, device);
+}
+
+Weight materialized_gguf_weight(const MaterializedArtifact& materialized,
+                                std::span<const ObjectHandle> segments,
+                                std::span<const NumericFormat> formats, std::int32_t rows,
+                                std::int32_t columns, int device) {
+    if (segments.empty() || segments.size() != formats.size() ||
+        segments.size() > static_cast<std::size_t>(kMaxGgufSegments) || rows <= 0 ||
+        columns <= 0 || columns % 256 != 0) {
+        throw std::invalid_argument("materialized_gguf_weight: invalid segments or shape");
+    }
+    Weight out{};
+    out.qtype      = QType::GGUF;
+    out.layout     = QuantLayout::GgufBlocks;
+    out.group      = 256;
+    out.group_size = 256;
+    out.ndim       = 2;
+    out.n = out.shape[0] = out.padded_shape[0] = rows;
+    out.k = out.shape[1] = out.padded_shape[1] = columns;
+    std::int64_t covered = 0;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const std::uint64_t row_bytes =
+            static_cast<std::uint64_t>(columns / 256) * gguf_block_bytes(formats[i]);
+        const std::uint64_t bytes = materialized.device_bytes(segments[i], device);
+        if (row_bytes == 0 || bytes % row_bytes != 0) {
+            throw ArtifactError("GGUF segment placement is not a whole number of rows");
+        }
+        GgufSegment& segment = out.gguf_segments[i];
+        segment.data         = materialized.device_data(segments[i], device);
+        segment.rows         = static_cast<std::int32_t>(bytes / row_bytes);
+        segment.type         = gguf_type_for(formats[i]);
+        covered += segment.rows;
+        out.payload_bytes += bytes;
+    }
+    if (covered != rows) {
+        throw ArtifactError("GGUF segment placements hold " + std::to_string(covered) +
+                            " rows; the requested shape needs " + std::to_string(rows));
+    }
+    out.gguf_segment_count = static_cast<std::int32_t>(segments.size());
+    out.payload = out.qdata = out.gguf_segments[0].data;
+    return out;
 }
 
 } // namespace ninfer::artifact

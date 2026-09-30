@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/linear/gguf/gguf.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight.h"
 
@@ -213,6 +214,15 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::ggml_k_embedding(ids, table, out, stream);
+        break;
+    case QType::GGUF:
+        detail::validate_gguf_weight(table, "embedding");
+        if (table.k != out.ne[0]) {
+            throw std::invalid_argument("embedding: GGUF table width must match output");
+        }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::gguf_embedding(ids, table, out, stream);
         break;
     case QType::BF16_CTRL: {
         require_dense_metadata(table, out);

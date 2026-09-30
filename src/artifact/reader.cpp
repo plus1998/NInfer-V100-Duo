@@ -105,6 +105,16 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
     if (name == "GGML_K") { return NumericFormat::GGML_K; }
+    if (name == "GGUF_IQ4_XS") { return NumericFormat::GGUF_IQ4_XS; }
+    if (name == "GGUF_IQ3_S") { return NumericFormat::GGUF_IQ3_S; }
+    if (name == "GGUF_IQ3_XXS") { return NumericFormat::GGUF_IQ3_XXS; }
+    if (name == "GGUF_IQ2_XS") { return NumericFormat::GGUF_IQ2_XS; }
+    if (name == "GGUF_IQ2_XXS") { return NumericFormat::GGUF_IQ2_XXS; }
+    if (name == "GGUF_IQ2_S") { return NumericFormat::GGUF_IQ2_S; }
+    if (name == "GGUF_IQ1_M") { return NumericFormat::GGUF_IQ1_M; }
+    if (name == "GGUF_Q2_K") { return NumericFormat::GGUF_Q2_K; }
+    if (name == "GGUF_Q4_K") { return NumericFormat::GGUF_Q4_K; }
+    if (name == "GGUF_Q6_K") { return NumericFormat::GGUF_Q6_K; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -114,6 +124,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
     if (name == "ggml-k256-v1") { return StorageLayout::GgmlK256V1; }
+    if (name == "gguf-blocks-v1") { return StorageLayout::GgufBlocksV1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -309,10 +320,14 @@ public:
             if (!objects_.emplace(id, &object).second) {
                 throw ArtifactError("duplicate v3 object id: " + id);
             }
+            if (object.value("layout", "") == "gguf_blocks_v1") { gguf_ = true; }
         }
     }
 
-    V3CompatibilityDirectory build() {
+    V3CompatibilityDirectory build() { return gguf_ ? build_gguf() : build_nvfp4(); }
+
+private:
+    V3CompatibilityDirectory build_nvfp4() {
         for (const auto& [role, component] : std::array{
                  std::pair{"tokenizer.json", "text"},
                  std::pair{"tokenizer_config.json", "text"},
@@ -422,6 +437,105 @@ public:
                                 std::to_string(selected_.size()) + " objects; expected " +
                                 std::to_string(expected));
         }
+        return project("nvfp4");
+    }
+
+    // qwen3.8-27b/gguf-blocks: each projection keeps the GGUF block rows of its source tensors.
+    // A fused parameter group (GDN q|k|v|z, attention q|k|gate|v, MLP gate|up) may span several
+    // physical objects of different block types; its objects become consecutive row segments
+    // named `<parent>#0`, `<parent>#1`, ... in logical row order. Vision and DFlash2 companions
+    // are not projected: this identity delivers Text and MTP only.
+    V3CompatibilityDirectory build_gguf() {
+        for (const auto& [role, component] : std::array{
+                 std::pair{"tokenizer.json", "text"},
+                 std::pair{"tokenizer_config.json", "text"},
+                 std::pair{"chat_template.jinja", "text"},
+                 std::pair{"generation_config.json", "text"},
+                 std::pair{"preprocessor_config.json", "vision"},
+                 std::pair{"video_preprocessor_config.json", "vision"},
+             }) {
+            add_resource("frontend/" + std::string(role), component, role);
+        }
+        const auto& proposal = directory_.at("components").at("text").at("proposal");
+        if (proposal.value("domain", "") != "indexed" ||
+            proposal.value("rows", std::uint64_t{0}) != 131072) {
+            throw ArtifactError("qwen3.8-27b GGUF v3 requires the 131072-row indexed proposal");
+        }
+
+        add_segments("text/token_embedding", {"text/token_embedding"});
+        add_segments("text/output_head", {"text/output_head"});
+        add("text/final_norm", {"text/final_norm"});
+        add_segments("text/draft_head", {"proposal/head"});
+        add("text/draft_head_token_ids", {"proposal/token_ids"});
+
+        const auto input_columns = gdn_output_input_columns();
+        for (int layer = 0; layer < 64; ++layer) {
+            const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+            add(prefix + "input_norm", {prefix + "input_norm"});
+            if (layer >= 3 && (layer - 3) % 4 == 0) {
+                add_segments(prefix + "attention/query_key_gate_value",
+                             {prefix + "attention/query", prefix + "attention/key",
+                              prefix + "attention/gate", prefix + "attention/value"});
+                for (const char* role : {"query_norm", "key_norm"}) {
+                    add(prefix + "attention/" + role, {prefix + "attention/" + role});
+                }
+                add_segments(prefix + "attention/output", {prefix + "attention/output"});
+            } else {
+                for (const char* role : {"a_log", "dt_bias", "convolution", "a_projection",
+                                         "b_projection", "norm"}) {
+                    add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
+                }
+                add_segments(prefix + "gdn/query_key_value_z",
+                             {prefix + "gdn/query", prefix + "gdn/key", prefix + "gdn/value",
+                              prefix + "gdn/z"});
+                require_gdn_output_use(prefix + "gdn/output", input_columns);
+                add_segments(prefix + "gdn/output", {prefix + "gdn/output"});
+            }
+            add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
+            add_segments(prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
+            add_segments(prefix + "mlp/down", {prefix + "mlp/down"});
+        }
+
+        for (const char* name : {"embedding_norm", "hidden_norm", "final_norm"}) {
+            add("mtp/" + std::string(name), {"mtp/" + std::string(name)});
+        }
+        add_segments("mtp/input_projection", {"mtp/input_projection"});
+        const std::string old_mtp = "mtp/layer/";
+        const std::string new_mtp = "mtp/layers/0/";
+        for (const char* role : {"input_norm", "post_attention_norm"}) {
+            add(old_mtp + role, {new_mtp + role});
+        }
+        add_segments(old_mtp + "attention/query_key_gate_value",
+                     {new_mtp + "attention/query", new_mtp + "attention/key",
+                      new_mtp + "attention/gate", new_mtp + "attention/value"});
+        for (const char* role : {"query_norm", "key_norm"}) {
+            add(old_mtp + "attention/" + role, {new_mtp + "attention/" + role});
+        }
+        add_segments(old_mtp + "attention/output", {new_mtp + "attention/output"});
+        add_segments(old_mtp + "mlp/gate_up", {new_mtp + "mlp/gate", new_mtp + "mlp/up"});
+        add_segments(old_mtp + "mlp/down", {new_mtp + "mlp/down"});
+
+        // Every object reachable from a Text, MTP or proposal parameter must have been projected
+        // exactly once; `select` already rejects a second selection.
+        std::set<std::string> required;
+        for (const auto& [name, binding] : directory_.at("bindings").items()) {
+            if (!name.starts_with("text/") && !name.starts_with("mtp/") &&
+                !name.starts_with("proposal/")) {
+                continue;
+            }
+            for (const auto& part : binding_parts(name)) {
+                required.insert(require_string(part.at("object"), "v3 binding object"));
+            }
+        }
+        for (const auto& id : required) {
+            if (!physical_names_.contains(id)) {
+                throw ArtifactError("qwen3.8-27b GGUF v3 object was not projected: " + id);
+            }
+        }
+        return project("gguf-blocks");
+    }
+
+    V3CompatibilityDirectory project(std::string_view weights_id) {
         Json objects = Json::array();
         for (const auto& [old_name, object] : selected_) {
             Json converted{
@@ -436,20 +550,32 @@ public:
                     {"q4_g64_fp16", "Q4G64_F16S"}, {"q5_g64_fp16", "Q5G64_F16S"},
                     {"q6_g64_fp16", "Q6G64_F16S"}, {"q8_g32_fp16", "W8G32_F16S"},
                     {"nvfp4", "NVFP4"}, {"fp8_e4m3fn_row_bf16", "FP8_E4M3FN_ROW_BF16S"},
+                    {"gguf_iq4_xs", "GGUF_IQ4_XS"}, {"gguf_iq3_s", "GGUF_IQ3_S"},
+                    {"gguf_iq3_xxs", "GGUF_IQ3_XXS"}, {"gguf_iq2_xs", "GGUF_IQ2_XS"},
+                    {"gguf_iq2_xxs", "GGUF_IQ2_XXS"}, {"gguf_iq2_s", "GGUF_IQ2_S"},
+                    {"gguf_iq1_m", "GGUF_IQ1_M"}, {"gguf_q2_k", "GGUF_Q2_K"},
+                    {"gguf_q4_k", "GGUF_Q4_K"}, {"gguf_q6_k", "GGUF_Q6_K"},
                 };
                 static const std::map<std::string, std::string, std::less<>> layouts = {
                     {"contiguous_le_v1", "contiguous-le-v1"},
                     {"row_split_k128_v1", "row-split-k128-v1"},
                     {"block_scale_k16_m128x4_v1", "blockscale-k16-m128x4-v1"},
                     {"row_scale_v1", "row-scale-v1"},
+                    {"gguf_blocks_v1", "gguf-blocks-v1"},
                 };
                 converted["shape"] = Json::array();
                 for (const auto& dimension : object->at("shape")) {
                     converted["shape"].push_back(
                         require_v3_unsigned(dimension, "v3 shape dimension", true));
                 }
-                converted["format"] = formats.at(require_string(object->at("format"), "v3 format"));
-                converted["layout"] = layouts.at(require_string(object->at("layout"), "v3 layout"));
+                const auto format = require_string(object->at("format"), "v3 format");
+                const auto layout = require_string(object->at("layout"), "v3 layout");
+                if (!formats.contains(format) || !layouts.contains(layout)) {
+                    throw ArtifactError("unsupported qwen3.8-27b v3 tensor representation: " +
+                                        format + "/" + layout);
+                }
+                converted["format"] = formats.at(format);
+                converted["layout"] = layouts.at(layout);
             } else if (kind == "resource" &&
                        require_string(object->at("encoding"), "v3 resource encoding") ==
                            "raw_bytes_v1") {
@@ -472,13 +598,13 @@ public:
         }
         (*template_it)["bytes"] = template_bytes.size();
         V3CompatibilityDirectory result;
-        result.directory = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
-                            {"objects", std::move(objects)}};
+        result.directory = {
+            {"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", std::string(weights_id)}}},
+            {"objects", std::move(objects)}};
         result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
         return result;
     }
 
-private:
     const Json& object(std::string_view id) const {
         const auto found = objects_.find(id);
         if (found == objects_.end()) { throw ArtifactError("missing v3 object: " + std::string(id)); }
@@ -543,6 +669,101 @@ private:
         if (cursor != elements) { throw ArtifactError(old_name + ": binding coverage is incomplete"); }
         select(old_name, object_id);
         return value;
+    }
+
+    // Selects the physical objects of a GGUF parameter group as ordered row segments. Parts of one
+    // object must be consecutive in the group and cover that object once, in ascending ranges.
+    void add_segments(const std::string& old_name,
+                      std::initializer_list<std::string> logical_names) {
+        std::vector<std::pair<std::string, std::vector<std::pair<std::uint64_t, std::uint64_t>>>>
+            runs;
+        for (const auto& logical : logical_names) {
+            for (const auto& part : binding_parts(logical)) {
+                const auto id = require_string(part.at("object"), "v3 binding object");
+                const auto& range = part.at("range");
+                if (!range.is_array() || range.size() != 2) {
+                    throw ArtifactError(old_name + ": invalid binding range");
+                }
+                if (runs.empty() || runs.back().first != id) { runs.push_back({id, {}}); }
+                runs.back().second.emplace_back(
+                    require_v3_unsigned(range[0], "v3 binding range", false),
+                    require_v3_unsigned(range[1], "v3 binding range", true));
+            }
+        }
+        if (runs.empty() || runs.size() > 4) {
+            throw ArtifactError(old_name + ": a GGUF projection needs one to four row segments");
+        }
+        std::uint64_t columns = 0;
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            const auto& [id, ranges] = runs[i];
+            const auto& value = object(id);
+            if (value.value("layout", "") != "gguf_blocks_v1" || value.at("shape").size() != 2) {
+                throw ArtifactError(old_name + ": segment " + id + " is not a GGUF block matrix");
+            }
+            const auto rows = require_v3_unsigned(value.at("shape")[0], "v3 shape", true);
+            const auto k    = require_v3_unsigned(value.at("shape")[1], "v3 shape", true);
+            if (columns != 0 && k != columns) {
+                throw ArtifactError(old_name + ": GGUF segments disagree on columns");
+            }
+            columns = k;
+            std::uint64_t cursor = 0;
+            for (const auto [begin, end] : ranges) {
+                if (begin != cursor || end <= begin || (end - begin) % k != 0) {
+                    throw ArtifactError(old_name + ": segment " + id +
+                                        " is not covered by consecutive whole rows");
+                }
+                cursor = end;
+            }
+            if (cursor != rows * k) {
+                throw ArtifactError(old_name + ": segment " + id + " is only partly bound");
+            }
+            select(old_name + "#" + std::to_string(i), id);
+        }
+    }
+
+    // llama.cpp stores GDN value heads tiled as [repeat, key_head, 128]; `ssm_out` keeps that
+    // order in its input columns, and the recipe records it as the `input_columns` auxiliary of
+    // every gdn/output Use. The runtime GDN output Op applies exactly this permutation, so the
+    // auxiliary is validated here rather than carried as a device object.
+    std::vector<std::int32_t> gdn_output_input_columns() const {
+        std::vector<std::int32_t> columns(6144);
+        for (std::int32_t c = 0; c < 6144; ++c) {
+            const std::int32_t tiled_head = c / 128;
+            const std::int32_t grouped    = (tiled_head % 16) * 3 + tiled_head / 16;
+            columns[static_cast<std::size_t>(c)] = grouped * 128 + c % 128;
+        }
+        return columns;
+    }
+
+    void require_gdn_output_use(const std::string& parameter,
+                                const std::vector<std::int32_t>& expected) const {
+        std::size_t matches = 0;
+        for (const auto& use : directory_.at("uses")) {
+            if (use.value("parameter", "") != parameter) { continue; }
+            ++matches;
+            if (!use.contains("auxiliaries") || !use.at("auxiliaries").contains("input_columns")) {
+                throw ArtifactError(parameter + ": GGUF GDN output lacks its input_columns");
+            }
+            const auto id = require_string(
+                use.at("auxiliaries").at("input_columns").at("object"), "input_columns object");
+            const auto& value = object(id);
+            const auto bytes  = object_payload(value);
+            if (value.at("format") != "int32" || bytes.size() != expected.size() * 4) {
+                throw ArtifactError(parameter + ": invalid input_columns auxiliary");
+            }
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                std::uint32_t word = 0;
+                for (int b = 0; b < 4; ++b) {
+                    word |= std::uint32_t(std::to_integer<unsigned char>(bytes[i * 4 + b]))
+                            << (8 * b);
+                }
+                if (static_cast<std::int32_t>(word) != expected[i]) {
+                    throw ArtifactError(parameter +
+                                        ": input_columns is not the tiled GDN value-head order");
+                }
+            }
+        }
+        if (matches == 0) { throw ArtifactError(parameter + ": missing GGUF GDN output Use"); }
     }
 
     void add_input_divisor(const std::string& old_name,
@@ -630,6 +851,7 @@ private:
     std::map<std::string, const Json*, std::less<>> objects_;
     std::map<std::string, const Json*, std::less<>> selected_;
     std::map<std::string, std::string, std::less<>> physical_names_;
+    bool gguf_ = false;
 };
 
 } // namespace
@@ -729,7 +951,8 @@ struct Reader::Impl {
                 throw ArtifactError("object " + std::string(name) + " extends beyond the file");
             }
             if (const auto* tensor = std::get_if<TensorDescriptor>(&object);
-                tensor != nullptr && tensor->format == NumericFormat::GGML_K) {
+                tensor != nullptr && tensor->format == NumericFormat::GGML_K &&
+                tensor->layout == StorageLayout::GgmlK256V1) {
                 validate_ggml_k_payload(tensor->shape,
                     std::span<const std::byte>(file.data() + payload_start + offset, bytes));
             }

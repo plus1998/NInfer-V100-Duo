@@ -14,6 +14,7 @@
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/linear/gguf/gguf.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -288,7 +289,21 @@ void validate_policy(LinearPolicy policy) {
     throw std::invalid_argument("gdn_input_proj: invalid compute policy");
 }
 
+// GGML_K and GGUF parents keep their original GGUF block rows; both project through one
+// block-format Op into the [qkv; z] sections with no transient storage besides the wide-T route.
+bool is_block_parent(const Weight& weight) {
+    return weight.qtype == QType::GGML_K || weight.qtype == QType::GGUF;
+}
+
 void require_ggml_k_parent(const Weight& weight, std::int32_t rows, LinearPolicy policy) {
+    if (weight.qtype == QType::GGUF) {
+        detail::validate_gguf_weight(weight, "gdn_input_proj");
+        if (weight.n != rows || weight.k != 5120 ||
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
+            throw std::invalid_argument("gdn_input_proj: invalid GGUF parent or policy");
+        }
+        return;
+    }
     if (policy != LinearPolicy::A16Only || weight.layout != QuantLayout::GgmlK256 ||
         weight.n != rows || weight.k != 5120 || weight.ndim != 2 ||
         weight.qdata == nullptr || !aligned_to(weight.qhigh, 8)) {
@@ -299,7 +314,22 @@ void require_ggml_k_parent(const Weight& weight, std::int32_t rows, LinearPolicy
 void project_ggml_k(const Tensor& x, const Weight& weight, const Tensor& qkv,
                     const Tensor& z, cudaStream_t stream, WorkspaceArena* workspace = nullptr) {
     const Tensor outputs[]{qkv, z};
+    if (weight.qtype == QType::GGUF) {
+        detail::gguf_project(x, weight, outputs, 2, false, false, workspace, stream);
+        return;
+    }
     detail::ggml_k_project_split(x, weight, outputs, 2, false, stream, false, workspace);
+}
+
+std::size_t block_parent_workspace_bytes(QType qtype, std::int32_t rows, std::int32_t k,
+                                         std::int32_t max_tokens) {
+    return qtype == QType::GGUF ? detail::gguf_workspace_bytes(rows, k, max_tokens)
+                                : detail::ggml_k_cutlass_workspace_bytes(rows, k, max_tokens);
+}
+
+bool admits_block_policy(QType qtype, LinearPolicy policy) {
+    return policy == LinearPolicy::A16Only ||
+           (qtype == QType::GGUF && policy == LinearPolicy::AllowA8);
 }
 
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -308,7 +338,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
-    if (weight.qtype == QType::GGML_K) {
+    if (is_block_parent(weight)) {
         require_ggml_k_parent(weight, 16384, policy);
         require_matrix(x, 5120, cols, "x");
         require_matrix(qkv, 10240, cols, "qkv");
@@ -449,7 +479,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
 
-    if (weight.qtype == QType::GGML_K) {
+    if (is_block_parent(weight)) {
         constexpr const char* op = "gdn_input_proj_conv_snapshot";
         require_ggml_k_parent(weight, 16384, policy);
         const ConvGeometry geometry = require_snapshot_input(x, 5120);
@@ -623,7 +653,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    cudaStream_t stream) {
     validate_policy(policy);
 
-    if (weight.qtype == QType::GGML_K) {
+    if (is_block_parent(weight)) {
         constexpr const char* op = "gdn_input_proj_conv_record";
         require_ggml_k_parent(weight, 16384, policy);
         const ConvGeometry geometry = require_record_input(x, 5120);
@@ -826,9 +856,9 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
-    if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
-        policy == LinearPolicy::A16Only) {
-        return detail::ggml_k_cutlass_workspace_bytes(parent_rows, input_rows, max_tokens);
+    if ((parent_qtype == QType::GGML_K || parent_qtype == QType::GGUF) && parent_rows == 16384 &&
+        input_rows == 5120 && admits_block_policy(parent_qtype, policy)) {
+        return block_parent_workspace_bytes(parent_qtype, parent_rows, input_rows, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
         if (parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
@@ -937,12 +967,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
-        policy == LinearPolicy::A16Only) {
+    if ((parent_qtype == QType::GGML_K || parent_qtype == QType::GGUF) && parent_rows == 16384 &&
+        input_rows == 5120 && admits_block_policy(parent_qtype, policy)) {
         return composed_snapshot_capacity(
             10240, batch_size * max_width,
-            detail::ggml_k_cutlass_workspace_bytes(parent_rows, input_rows,
-                                                   batch_size * max_width));
+            block_parent_workspace_bytes(parent_qtype, parent_rows, input_rows,
+                                         batch_size * max_width));
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
@@ -1000,10 +1030,10 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (parent_qtype == QType::GGML_K && parent_rows == 16384 && input_rows == 5120 &&
-        policy == LinearPolicy::A16Only) {
-        return detail::ggml_k_cutlass_workspace_bytes(
-            parent_rows, input_rows, batch_size * max_width);
+    if ((parent_qtype == QType::GGML_K || parent_qtype == QType::GGUF) && parent_rows == 16384 &&
+        input_rows == 5120 && admits_block_policy(parent_qtype, policy)) {
+        return block_parent_workspace_bytes(parent_qtype, parent_rows, input_rows,
+                                            batch_size * max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
@@ -1203,7 +1233,7 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
     require_matrix(z, kShardZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
 
-    if (w.qtype == QType::GGML_K) {
+    if (is_block_parent(w)) {
         require_ggml_k_parent(w, kShardFusedRows, policy);
     } else if (w.qtype == QType::NVFP4) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
@@ -1292,10 +1322,9 @@ std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype,
                                                                      LinearPolicy policy,
                                                                      std::int32_t min_tokens,
                                                                      std::int32_t max_tokens) {
-    if (qtype == QType::GGML_K && policy == LinearPolicy::A16Only && min_tokens > 0 &&
-        max_tokens >= min_tokens) {
-        return detail::ggml_k_cutlass_workspace_bytes(
-            kShardFusedRows, kShardHidden, max_tokens);
+    if ((qtype == QType::GGML_K || qtype == QType::GGUF) && admits_block_policy(qtype, policy) &&
+        min_tokens > 0 && max_tokens >= min_tokens) {
+        return block_parent_workspace_bytes(qtype, kShardFusedRows, kShardHidden, max_tokens);
     }
     if (qtype == QType::NVFP4) {
         return detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_tokens,
@@ -1333,7 +1362,7 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const Weight& w = query_key_value_z_weight[slot];
-        if (w.qtype == QType::GGML_K) {
+        if (is_block_parent(w)) {
             project_ggml_k(x[slot], w, qkv_dst[slot], z_dst[slot], ec.dev[slot]->stream,
                            workspace[slot]);
         } else if (w.qtype == QType::NVFP4) {
@@ -1455,7 +1484,7 @@ ConvGeometry validate_record_shard_rank(const Tensor& x, const Tensor& conv_weig
 
 void validate_fused_shard_weight(const Weight& w, LinearPolicy policy, const char* op) {
     validate_policy(policy);
-    if (w.qtype == QType::GGML_K) {
+    if (is_block_parent(w)) {
         require_ggml_k_parent(w, kShardFusedRows, policy);
     } else if (w.qtype == QType::NVFP4) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
@@ -1478,10 +1507,9 @@ void validate_fused_shard_weight(const Weight& w, LinearPolicy policy, const cha
 std::size_t shard_projection_workspace_bytes(QType qtype, LinearPolicy policy,
                                              std::int32_t min_columns, std::int32_t max_columns,
                                              const char* op) {
-    if (qtype == QType::GGML_K && policy == LinearPolicy::A16Only && min_columns > 0 &&
-        max_columns >= min_columns) {
-        return detail::ggml_k_cutlass_workspace_bytes(
-            kShardFusedRows, kShardHidden, max_columns);
+    if ((qtype == QType::GGML_K || qtype == QType::GGUF) && admits_block_policy(qtype, policy) &&
+        min_columns > 0 && max_columns >= min_columns) {
+        return block_parent_workspace_bytes(qtype, kShardFusedRows, kShardHidden, max_columns);
     }
     if (qtype == QType::NVFP4) {
         return detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_columns,
@@ -1587,7 +1615,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
             arena.alloc(DType::BF16, {kShardConvChannels, geometry[slot].aggregate_columns});
         compose_shard_conv(x[slot], projected, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
-                               if (w.qtype == QType::GGML_K) {
+                               if (is_block_parent(w)) {
                                    project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
@@ -1709,7 +1737,7 @@ void gdn_input_proj_conv_record_column_parallel(
         Tensor record_flat = flatten_columns(record_dst[slot], kShardConvChannels, geometry[slot]);
         compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
-                               if (w.qtype == QType::GGML_K) {
+                               if (is_block_parent(w)) {
                                    project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,

@@ -60,7 +60,7 @@ inline constexpr std::size_t kGdnLayers           = 48;
 //     section split by its own head count, so device r owns three disjoint channel blocks
 //     concatenated in Q|K|V order (see `plan_for`'s `gdn/convolution` branch). `artifact::
 //     tensor_column_slice` admits these ranges for `contiguous-le-v1`, which this object
-//     always is (BF16). Qwen38GgmlK gdn/output also uses three ranges: its original GGUF
+//     always is (BF16). Qwen38GgmlK and Qwen38Gguf gdn/output also use three ranges: its original GGUF
 //     columns are [repeat,key,128], so each rank selects its key heads from each repeat
 //     section. Every range preserves whole K256 blocks. The projection Op maps grouped
 //     activations to the retained tiled column order.
@@ -180,6 +180,10 @@ struct WeightPlan {
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
     std::vector<Shard> shards; // empty => replicated/full on device 0
+    // GGUF-blocks weights: the consecutive row segments `<name>#0..` and their block formats, in
+    // logical row order. `object`/`format` name the first segment. Empty for every other format.
+    std::vector<artifact::ObjectHandle> gguf_segments;
+    std::vector<artifact::NumericFormat> gguf_formats;
 };
 
 struct MlpPlan {
@@ -244,14 +248,14 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;
@@ -267,7 +271,7 @@ struct BindingPlan {
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
-    artifact::ObjectHandle draft_head;
+    WeightPlan draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
 

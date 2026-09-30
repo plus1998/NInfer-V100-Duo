@@ -3,6 +3,7 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/linear_dispatch.h"
 #include "ops/linear/ggml_k/ggml_k.h"
+#include "ops/linear/gguf/gguf.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -95,6 +96,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::GGML_K:
         detail::ggml_k_linear(x, w, out, workspace, stream);
         return;
+    case QType::GGUF:
+        detail::gguf_project(x, w, &out, 1, false, false, workspace, stream);
+        return;
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, workspace, stream);
         return;
@@ -138,6 +142,12 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
             throw std::invalid_argument("linear workspace: invalid GGML K profile");
         }
         return detail::ggml_k_cutlass_workspace_bytes(output_rows, input_rows, max_tokens);
+    case QType::GGUF:
+        if (output_rows <= 0 || input_rows <= 0 || input_rows % 256 != 0 ||
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
+            throw std::invalid_argument("linear workspace: invalid GGUF profile");
+        }
+        return detail::gguf_workspace_bytes(output_rows, input_rows, max_tokens);
     case QType::Q4G64_F16S:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);

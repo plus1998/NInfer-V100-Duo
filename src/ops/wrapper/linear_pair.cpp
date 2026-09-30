@@ -98,7 +98,8 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_matrix(x, x.ne[0], cols, "x");
     require_matrix(first_out, 1024, cols, "first output");
     require_matrix(second_out, 1024, cols, "second output");
-    if (first_weight.qtype == QType::GGML_K && second_weight.qtype == QType::GGML_K) {
+    if ((first_weight.qtype == QType::GGML_K || first_weight.qtype == QType::GGUF) &&
+        first_weight.qtype == second_weight.qtype) {
         linear(x, first_weight, first_out, stream);
         linear(x, second_weight, second_out, stream);
         return;

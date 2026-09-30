@@ -46,6 +46,10 @@ function(ninfer_add_linear_test name source)
     LIBRARIES ninfer_ops)
 endfunction()
 
+ninfer_add_op_test(ninfer_gguf_test
+  SOURCES ops/test_gguf.cpp
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_ggml_k_test
   SOURCES ops/test_ggml_k.cpp
   LIBRARIES ninfer_ops)

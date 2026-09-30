@@ -64,6 +64,7 @@ endif()
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
+  ops/linear/gguf/gguf.cu
   ops/common/allreduce.cu
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
