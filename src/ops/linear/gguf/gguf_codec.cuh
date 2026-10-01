@@ -252,7 +252,7 @@ __device__ __forceinline__ void decode8<GgufType::Q6_K>(const unsigned char* b, 
 // with int8 activations is two dp4a. Every code of the registered formats fits int8.
 
 template <GgufType Type>
-constexpr bool kHasMinimum = Type == GgufType::Q2_K || Type == GgufType::Q4_K ||
+inline constexpr bool kHasMinimum = Type == GgufType::Q2_K || Type == GgufType::Q4_K ||
                              Type == GgufType::IQ1_M;
 
 // Expands four sign bits into byte masks (0x00 or 0xff per byte) and negates the selected bytes of

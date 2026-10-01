@@ -79,6 +79,9 @@ __device__ __forceinline__ void load_bf16x8(const __nv_bfloat16* p, float (&v)[8
 // stage, then prefetches the next stage while decoding the current one. Every registered row length
 // is a multiple of 4 bytes (K/256 is even for every Qwen3.8 shape and every block size is even),
 // and kStageBlocks = 2 keeps each stage 4-byte aligned; gguf_project rejects any other geometry.
+#ifndef NINFER_GGUF_T4_ROWS
+#define NINFER_GGUF_T4_ROWS 1
+#endif
 constexpr int kVectorWarps = 4;
 constexpr int kStageBlocks = 2;
 
@@ -107,13 +110,18 @@ __device__ __forceinline__ void load_activation(const __nv_bfloat16* p, LaneActi
 }
 
 // The A8 operand of one lane: eight int8 codes at stored column `column` and their group's step.
+// The represented sum is needed only by formats with a minimum term.
+template <bool WithSum>
 __device__ __forceinline__ void load_activation(const signed char* codes, const float* steps,
                                                 int column, LaneActivation<true>& a) {
     const uint2 packed = __ldg(reinterpret_cast<const uint2*>(codes + column));
     a.q[0] = static_cast<int>(packed.x);
     a.q[1] = static_cast<int>(packed.y);
     a.step = __ldg(steps + column / 32);
-    a.sum  = a.step * static_cast<float>(__dp4a(a.q[1], 0x01010101, __dp4a(a.q[0], 0x01010101, 0)));
+    if constexpr (WithSum) {
+        a.sum = a.step *
+                static_cast<float>(__dp4a(a.q[1], 0x01010101, __dp4a(a.q[0], 0x01010101, 0)));
+    }
 }
 
 // Quantizes BF16 x [K,T] once per call for the A8 vector route: each 32-value group of stored
@@ -164,11 +172,13 @@ __device__ __forceinline__ LaneWeightI8 decode_lane_i8(const unsigned char* bloc
     return w;
 }
 
+template <GgufType Type>
 __device__ __forceinline__ float lane_dot_i8(const LaneWeightI8& w, const LaneActivation<true>& a,
                                              float acc) {
     const int dot = __dp4a(w.q[1], a.q[1], __dp4a(w.q[0], a.q[0], 0));
     acc = fmaf(w.scale * a.step, static_cast<float>(dot), acc);
-    return fmaf(-w.minimum, a.sum, acc);
+    if constexpr (gguf::kHasMinimum<Type>) { acc = fmaf(-w.minimum, a.sum, acc); }
+    return acc;
 }
 
 // A warp owns Rows consecutive rows; lane j covers values [8j, 8j+8) of every 256-value block.
@@ -183,8 +193,11 @@ __device__ __forceinline__ float lane_dot_i8(const LaneWeightI8& w, const LaneAc
 // A8 reads the call's int8 activation codes (quantize_activation_kernel, stored column order) and
 // dots integer weight codes with dp4a; A16 multiplies decoded FP32 weights by the exact BF16
 // activation.
+template <int MaxTokens, int Rows>
+constexpr int kVectorMinBlocks = MaxTokens == 4 && Rows == 4 ? 6 : 1;
+
 template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
-__global__ void __launch_bounds__(kVectorWarps * 32)
+__global__ void __launch_bounds__(kVectorWarps * 32, (kVectorMinBlocks<MaxTokens, Rows>))
 vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ codes,
               const float* __restrict__ steps, const unsigned char* __restrict__ rows,
               int row_count, int first_row, int k, int tokens, int token_base, Outputs out) {
@@ -236,7 +249,9 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
                 // Padding columns load column 0 (always valid); their sums are never stored.
                 const std::int64_t source = t < tokens ? t : 0;
                 if constexpr (A8) {
-                    load_activation(codes + source * k, steps + source * (k / 32), stored, a[t]);
+                    load_activation<gguf::kHasMinimum<Type>>(codes + source * k,
+                                                             steps + source * (k / 32), stored,
+                                                             a[t]);
                 } else {
                     load_activation(x + source * k + input_column<Tiled>(stored, k), a[t]);
                 }
@@ -247,7 +262,7 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
                 if constexpr (A8) {
                     const LaneWeightI8 w = decode_lane_i8<Type>(block, lane);
 #pragma unroll
-                    for (int t = 0; t < MaxTokens; ++t) { sum[r][t] = lane_dot_i8(w, a[t], sum[r][t]); }
+                    for (int t = 0; t < MaxTokens; ++t) { sum[r][t] = lane_dot_i8<Type>(w, a[t], sum[r][t]); }
                 } else {
                     float w[8];
                     decode8<Type>(block, lane, w);
@@ -301,7 +316,11 @@ void launch_vector_shape(const VectorInput& in, const GgufSegment& segment, int 
 }
 
 // Small segments keep one row per warp so the grid still covers every SM; large ones share each
-// activation slice across several rows. Wider passes trade rows for activation registers.
+// activation slice across several rows. Wider passes trade rows for activation registers. Measured
+// on V100-SXM2 with ninfer_gguf_bench at the TP2 shard shapes: for 2..4 columns two rows beat four
+// on every projection, while vocabulary-height segments (kTallRows) prefer four rows held to six
+// resident CTAs per SM.
+constexpr int kTallRows = 65536;
 template <GgufType Type, bool Tiled, bool A8>
 void launch_vector_type(const VectorInput& x, const GgufSegment& segment, int first_row, int k,
                         int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
@@ -312,7 +331,13 @@ void launch_vector_type(const VectorInput& x, const GgufSegment& segment, int fi
     if (tokens == 1) {
         if (wide) { NINFER_GGUF_SHAPE(1, 4); } else { NINFER_GGUF_SHAPE(1, 1); }
     } else if (tokens <= 4) {
-        if (wide) { NINFER_GGUF_SHAPE(4, 4); } else { NINFER_GGUF_SHAPE(4, 1); }
+        if (segment.rows >= kTallRows) {
+            NINFER_GGUF_SHAPE(4, 4);
+        } else if (wide) {
+            NINFER_GGUF_SHAPE(4, 2);
+        } else {
+            NINFER_GGUF_SHAPE(4, 1);
+        }
     } else if (tokens <= kGgufVectorTokens) {
         if (wide) { NINFER_GGUF_SHAPE(8, 2); } else { NINFER_GGUF_SHAPE(8, 1); }
     } else {
