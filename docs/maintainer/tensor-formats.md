@@ -7,7 +7,7 @@ assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly twenty persistent numeric tensor formats.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -34,6 +34,29 @@ signed eight-bit subblock scales, and six-bit codes: `w = d * scale[subblock16] 
 Packing and byte order are the GGML Q4_K (144 bytes) and Q6_K (210 bytes) codecs. No encoder or
 recomputed scale is implied. `ggml-k256-v1` row descriptors select the codec; the original formats
 of all rows remain part of the fused matrix's represented public input.
+
+The `GGUF_*` block formats preserve the blocks of a per-tensor mixed-precision GGUF (for example
+the GSQ-RCO Qwen3.8-27B releases) without re-quantization. Every block covers 256 consecutive
+values of one row; its represented values are exactly those of the matching `dequantize_row_*`
+function of llama.cpp's `ggml-quants.c`, with the codebooks of `ggml-common.h`:
+
+| Canonical name | ggml type | Block bytes | Bits/weight |
+|---|---|---:|---:|
+| `GGUF_IQ4_XS` | `IQ4_XS` | 136 | 4.25 |
+| `GGUF_IQ3_S` | `IQ3_S` | 110 | 3.44 |
+| `GGUF_IQ3_XXS` | `IQ3_XXS` | 98 | 3.06 |
+| `GGUF_IQ2_XS` | `IQ2_XS` | 74 | 2.31 |
+| `GGUF_IQ2_XXS` | `IQ2_XXS` | 66 | 2.06 |
+| `GGUF_IQ2_S` | `IQ2_S` | 82 | 2.56 |
+| `GGUF_IQ1_M` | `IQ1_M` | 56 | 1.75 |
+| `GGUF_Q2_K` | `Q2_K` | 84 | 2.63 |
+| `GGUF_Q4_K` | `Q4_K` | 144 | 4.50 |
+| `GGUF_Q6_K` | `Q6_K` | 210 | 6.56 |
+
+These ten are the types the registered GGUF-blocks artifact uses; other ggml types are not
+registered. Each represented value is the FP32 product of the block's FP16 super-scale(s), an
+integer sub-scale and an integer or codebook code (minus a minimum term for `Q2_K`, `Q4_K` and the
+`IQ1_M` delta), so an exact FP32 decode exists for every value.
 
 The block-scaled floating-point weight format is:
 
@@ -744,7 +767,8 @@ The registry contains no implicit or reserved support for:
 - asymmetric or affine quantization with zero points;
 - per-channel schemes disguised as an arbitrary group size;
 - codebook formats such as NF4;
-- GGUF K-quant, I-quant, or block layouts as scheme aliases;
+- GGUF K-quant or I-quant types beyond the ten registered `GGUF_*` formats, or GGUF blocks as an
+  alias of another scheme;
 - GPTQ or AWQ serialization dialects as scheme aliases;
 - any other persistent FP8, FP4, microscaling, or shared-exponent format;
   `FP8_E4M3FN_ROW_BF16S` and `NVFP4` register only the exact contracts in Sections 3.4 and 3.3;

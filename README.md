@@ -1,7 +1,9 @@
 # NInfer V100 Duo
 
-Qwen3.8-27B **official NVFP4** inference on **2 × Tesla V100-SXM2 16 GB (NVLink)**,
-TP2, CUDA 12.8. NVFP4 is executed in software on Volta. Based on
+Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB (NVLink)**, TP2, CUDA 12.8:
+the **official NVFP4** artifact (executed in software on Volta) and the
+**GSQ-RCO IQ3_S GGUF-blocks** artifact (Text + MTP, [below](#gsq-rco-iq3_s-gguf-blocks)).
+Based on
 [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 
@@ -106,16 +108,49 @@ Same 180,224-token capacity, TP2, INT8 KV, 4,096-token prefill chunks, and
 
 | Prompt context | First token | Prefill | Decode (1,024 tokens) |
 |---:|---:|---:|---:|
-| 30K | 28.05 s | 1,070 tok/s | 102.30 tok/s |
-| 50K | 49.57 s | 1,009 tok/s | 97.07 tok/s |
-| 100K | 113.16 s | 884 tok/s | 81.07 tok/s |
-| 150K | 192.37 s | 780 tok/s | 70.70 tok/s |
+| 30K | 28.47 s | 1,054 tok/s | 115.88 tok/s |
+| 100K | 114.60 s | 873 tok/s | 82.98 tok/s |
+| 150K | 196.67 s | 763 tok/s | 77.14 tok/s |
 
-Rates and first-token times are two-run means, excluding model load. This
+Rates and first-token times are two-run means, excluding model load, measured
+with the one-shot NVLink all-reduce (2026-10-01). This
 fixed-length code-prompt benchmark **disables stopping** to keep the decode
 window identical; continuations repeat after a natural stopping point, so it
 measures long-context speed, **not useful-answer quality or Agent latency**. See
 [method and individual results](docs/performance.md#v100-duo-context-decay).
+
+## GSQ-RCO IQ3_S (GGUF-blocks)
+
+The NInfer v3 conversion of ISTA-DASLab's GSQ-RCO IQ3_S GGUF
+(`Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`, 15.0 GB file, 5.66 GiB of
+weights per GPU) runs unconverted: every tensor keeps its own ggml block type
+(IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS/XXS/S, IQ1_M, Q2_K, Q4_K, Q6_K). **Text and
+MTP only** — `--vision` is rejected. The full native **262,144-token** context
+fits with INT8 KV and leaves **2.90 GiB** free per GPU:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer \
+  --max-context 262144 --kv-capacity 262144
+```
+
+Same method as the context-decay table above (TP2, INT8 KV, 4,096-token
+chunks, MTP3, two cold requests, 1,024 measured decode tokens), with
+262,144-token capacity:
+
+| Prompt context | First token | Prefill | Decode (1,024 tokens) | MTP accepted |
+|---:|---:|---:|---:|---:|
+| 30K | 17.90 s | 1,676 tok/s | 98.88 tok/s | 80.3% |
+| 100K | 79.34 s | 1,260 tok/s | 76.19 tok/s | 73.7% |
+| 150K | 144.97 s | 1,035 tok/s | 70.24 tok/s | 78.1% |
+| 250K | 341.33 s | 734 tok/s | 57.84 tok/s | 79.6% |
+
+Against NVFP4 at the same occupied context, prefill is 36–59% faster (fewer
+weight bytes through the FP16 tensor-core GEMM) and decode 8–15% slower: its
+i-quant decoders cost more instructions per byte at the 4-column MTP3
+verification width. Decode projections use int8 activations (llama.cpp's
+q8_1 model), so output is not bit-identical to an FP32-activation reference.
+MTP4/MTP5 measured slower (81.4 / 65.3 tok/s at 30K). See
+[method, kernels and verification](docs/performance.md#v100-duo-gsq-rco-iq3_s-gguf-blocks).
 
 ## Concurrent text requests
 

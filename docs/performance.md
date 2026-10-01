@@ -13,7 +13,9 @@ are inherited results for different hardware and weight profiles.
 
 Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
 transfer route with exact byte comparisons in both directions, and rejects startup if verification
-fails. The current `DMA-FQ` host uses CUDA's host-staged copies. This route passes the collective
+fails. The host of this historical Q4_K_M measurement used `DMA-FQ` and therefore CUDA's
+host-staged copies; the current host has no IOMMU translation and runs direct NVLink P2P (see
+[GSQ-RCO IQ3_S](#v100-duo-gsq-rco-iq3_s-gguf-blocks)). This route passes the collective
 suite, including different tensor sizes, guards and 64 consecutive rounds, and the three public
 Engine CUDA Graph measurements below. The INT8 attention test also passes its independent FP64
 oracle at 85K occupied keys for all four queries, all 24 heads and every visible key, with TP1/TP2 comparisons
@@ -35,7 +37,7 @@ parity for all prompts.
 | Prefill chunk | 1,024 tokens |
 | NInfer MTP | Fixed draft window of three; optimized proposal head (`--lm-head-draft`) |
 | Measured output window | 512 decode tokens plus the first token from prefill; three repetitions |
-| TP2 transport | Verified CUDA host-staged copies on the current IOMMU host |
+| TP2 transport | Verified CUDA host-staged copies on the IOMMU host used for this measurement |
 
 NInfer's `--mtp-draft-tokens 3` uses a fixed three-token proposal window, shortened when the remaining
 output or context budget requires it. Verification may accept zero drafts. This is distinct from
@@ -833,6 +835,72 @@ split: even though MTP3 improved from 90.87 to 92.82 tok/s on this fixture, non-
 decode fell from 26.48 to 18.08 tok/s. The shipped split policy is unchanged. These
 numbers describe the local NVFP4 code prompt, not typical agent decode acceptance or
 quality on arbitrary prompts.
+
+## V100 Duo GSQ-RCO IQ3_S GGUF-blocks
+
+On 2026-10-01, the same **2 × V100-SXM2 16 GB** NVLink host, CUDA 12.8, and
+branch `feat/gguf-blocks-v100` measured `out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`
+(identity `qwen3.8-27b/gguf-blocks`, 12.0 GiB uploaded, 5.66 GiB per GPU) with
+TP2, INT8 KV, 262,144-token capacity, 4,096-token chunks, MTP3 with the
+optimized proposal head, CUDA Graph and greedy sampling. Prompts are
+`ninfer_v100_corpus --code-chat` code prompts; each point is two cold requests
+with one prefill token and 1,024 measured decode tokens and model stops
+disabled, so these are fixed-output speed measurements, not answer quality.
+
+| Occupied prompt | TTFT mean | Prefill tok/s | Decode tok/s (mean ± sd) | MTP accepted |
+|---:|---:|---:|---:|---:|
+| 30,000 | 17.90 s | 1,676 | 98.88 ± 0.00 | 80.3% |
+| 100,000 | 79.34 s | 1,260 | 76.19 ± 0.03 | 73.7% |
+| 150,000 | 144.97 s | 1,035 | 70.24 ± 0.14 | 78.1% |
+| 250,000 | 341.33 s | 734 | 57.84 ± 0.07 | 79.6% |
+
+The official NVFP4 artifact on the same build (180,224-token capacity,
+otherwise identical) measured 30K 1,054 / 115.88, 100K 873 / 82.98 and 150K
+763 / 77.14 prefill / decode tok/s.
+
+Decode progression at 30K on this branch (same prompt; tok/s; acceptance
+moves only when output tokens change):
+
+| Change | Decode | MTP accepted | Output vs previous |
+|---|---:|---:|---|
+| First version (FP32 GEMV, byte loads) | 67.20 | 77.7% | — |
+| Shared-memory weight stages, 4 rows/warp | 70.64 | 77.7% | identical |
+| int8 activations (`AllowA8`, dp4a) | 85.72 | 80.3% | differs |
+| 2 rows/warp for 2–4 columns | 88.19 | 80.3% | identical |
+| i-quant codebooks in shared memory | 89.95 | 80.3% | identical |
+| One-shot NVLink all-reduce | 98.88 | 80.3% | identical |
+
+At 30K the 1,024-token window costs about 17.3 ms per MTP round. An nsys
+trace before the all-reduce change showed ~75% of GPU time in the 4-column
+GGUF projections (190–360 GB/s against roughly 800 GB/s achievable) and ~15%
+idle in cross-device event waits; the one-shot all-reduce
+(`src/ops/common/allreduce.cu`) removed most of the latter. Prefill at 16K is
+61% CUTLASS FP16 GEMM, 16% GDN and 8% attention. Rejected variants: deeper
+weight stages (4 and 6 blocks per row) and a 32-value-per-lane sub-block
+kernel were slower end to end; MTP4/MTP5 measured 81.42 / 65.28 tok/s at 30K
+because acceptance falls to 73% / 53%.
+
+Verification: `ninfer_gguf_test` (FP64 decode of all ten formats; A16, A8 and
+tensor-core routes at real fused and TP2 shapes; GDN output permutation),
+`ninfer_allreduce_test` (both routes, 64 chained rounds), and an
+`ninfer-serve` chat completion with thinking enabled. Reproduce:
+
+```bash
+M=out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
+build-v100-duo/bench/ninfer_v100_corpus "$M" /tmp/code-30000.ids \
+  --code-chat 30000 --output-tokens 1024 "${sources[@]}"
+build-v100-duo/bench/ninfer_bench --weights "$M" --tp 2 --devices 0,1 \
+  --kv-dtype int8 --max-ctx 262144 --prefill-chunk 4096 --mtp-draft-tokens 3 \
+  --lm-head-draft --corpus /tmp/code-30000.ids -pg 30000,1024 --warmup 0 -r 2 \
+  -o json --output-file /tmp/gsq-30000.json
+build-v100-duo/bench/ninfer_gguf_bench   # per-format GGUF projection bandwidth
+```
+
+`sources` is the file list of the context-decay recipe above plus
+`src/ops/wrapper/{linear_swiglu,attn_input_proj,linear_add,gdn_gating_proj}.cpp`,
+`src/artifact/{storage_layouts,materializer,reader}.cpp`,
+`src/targets/qwen3_6_27b/impl/{load/bindings,variant}.cpp` and
+`src/ops/linear/ggml_k/ggml_k.cu`.
 
 ## V100 Duo maximum-context capacity sweep
 

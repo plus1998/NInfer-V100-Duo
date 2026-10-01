@@ -199,10 +199,10 @@ The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, `GGML_K` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, `GGML_K`, and the ten `GGUF_*` block formats | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1`, `ggml-k256-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, `qwen3.8-27b/gguf-blocks` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1`, `ggml-k256-v1`, `gguf-blocks-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.
@@ -390,6 +390,26 @@ dictionaries in version 2.
 
 Project-owned formats have no compatibility obligation. A runtime may remove an obsolete framing,
 model, layout, or encoding directly. A `.ninfer` reader never treats `.qus` as a fallback or alias.
+
+### 9.1 Version-3 projection for Qwen3.8-27B
+
+The reader also accepts upstream NInfer version-3 files (magic `4e 49 4e 46 45 52 00 03`, a 32-byte
+header whose `u64` at offset 8 is `json_bytes`, payload at `align_up(32 + json_bytes, 4096)`) for
+`metadata.name = qwen3.8-27b` only. It does not execute the version-3 directory. Instead
+`src/artifact/reader.cpp` projects it into the version-2 directory above: version-3 logical
+`bindings` are resolved to their physical objects, those objects are renamed to the version-2
+names of [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), lower-case version-3 format and
+layout names map to the registered identities, and the chat template from
+`tokenizer_config.json` is served as `frontend/chat_template.jinja`. Two projections exist:
+
+- if no object uses `gguf_blocks_v1`, the file projects to `qwen3.8-27b/nvfp4` with the exact
+  version-2 NVFP4 inventory, including Vision;
+- otherwise it projects to `qwen3.8-27b/gguf-blocks` (Section 15 of the artifact reference). A
+  fused parameter group whose parts span several physical objects becomes ordered row segments
+  `<name>#0..#3`; Vision and DFlash2 objects are not projected.
+
+Projection rejects any binding that is not whole rows of its objects, segments that disagree on
+columns, unregistered formats or layouts, and any Text/MTP/proposal object left unprojected.
 
 ## 10. Explicit exclusions
 

@@ -1,7 +1,7 @@
 # Qwen3.8-27B artifact reference
 
 This reference defines the registered Qwen3.8-27B `.ninfer` storage contracts: the
-`qwen3.8-27b/nvfp4` and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
+`qwen3.8-27b/nvfp4`, preserved `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.8-27b/gguf-blocks` identities, their object inventories,
 shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
 defined in Section 13.
@@ -852,3 +852,46 @@ The local conversion produced an 18,322,586,368-byte artifact. Exact checks cove
 embedding, fused Q/K/gate/V, and MTP source rows. Host tests cover mixed-row tensor materialization
 and TP row/column slicing. Conversion success does not establish decode throughput; performance
 claims require real Engine execution and stated context occupancy.
+
+## 15. GGUF-blocks artifact
+
+`qwen3.8-27b/gguf-blocks` is the projection of an upstream NInfer version-3 artifact whose Text,
+MTP and proposal weights keep the per-tensor block formats of a mixed-precision GGUF, such as
+`Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (converter recipe `qwen3_8_27b_gguf` of the RTX 3090
+NInfer fork). The reader performs the projection
+([`artifact-container.md`](artifact-container.md) Section 9.1); there is no local converter.
+
+### 15.1 Inventory
+
+The projected names, shapes and fused row orders are those of Sections 5 and 6 with these
+differences:
+
+- every projection matrix (`attention/query_key_gate_value`, `attention/output`,
+  `gdn/query_key_value_z`, `gdn/output`, `mlp/gate_up`, `mlp/down`, the MTP equivalents,
+  `mtp/input_projection`, `text/token_embedding`, `text/output_head`, `text/draft_head`) is one to
+  four row segments `<name>#0..#3`, each a `gguf-blocks-v1` object of one `GGUF_*` format; the
+  segments' rows concatenate, in order, to the fused row order of Section 3.2 (for example a GDN
+  parent may be one object, or `query|key|value` plus `z` of different types);
+- `gdn/a_projection` and `gdn/b_projection` stay separate BF16 `[48,5120]` objects (no fused
+  `a_b_projection`);
+- `gdn/output` keeps llama.cpp's tiled value-head input columns `[repeat, key_head, 128]`. The
+  reader verifies that each GDN output Use carries exactly the corresponding `input_columns`
+  permutation, and the GDN output Op applies it;
+- norms, `gdn/a_log`, `gdn/dt_bias`, `gdn/convolution` and `text/draft_head_token_ids` keep the
+  direct formats of Section 5; there are no Vision or DFlash2 objects.
+
+### 15.2 Execution
+
+The `Qwen38Gguf` weights profile binds the segments, splits each by the TP2 shard map restricted
+to its own rows (Rows axis) or by whole 256-column block ranges (Columns axis), and runs every
+projection through the GGUF Op (`src/ops/linear/gguf/`). Text projections use `AllowA8`, as the
+artifact's Uses declare: decode-width passes quantize the activation to int8 per 32 values and
+use dp4a against the integer block codes; prompts above 16 columns dequantize to FP16 and use the
+SM70 tensor-core GEMM. The proposal head is A16. The profile delivers Text and MTP; startup with
+Vision is rejected.
+
+### 15.3 Conformance
+
+`ninfer_gguf_test` decodes every registered format with an FP64 host implementation of the
+`ggml-quants.c` loops and checks the exact FP32/BF16 decode, every projection route (A16, A8,
+tensor-core) at real fused and TP2 shapes, and the GDN output permutation.

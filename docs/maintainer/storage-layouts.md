@@ -16,6 +16,7 @@ The storage registry contains exactly these identities:
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
 | `ggml-k256-v1` | tensor layout | `GGML_K` | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
+| `gguf-blocks-v1` | tensor layout | the ten `GGUF_*` formats | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
@@ -353,6 +354,7 @@ Layout decoding yields only persistent logical words:
   row;
 - `raw-bytes-v1` yields the enclosing resource bytes.
 - `ggml-k256-v1` yields each row's unchanged Q4_K or Q6_K codes and scales.
+- `gguf-blocks-v1` yields each row's unchanged blocks of its single `GGUF_*` format.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
@@ -378,3 +380,21 @@ GGUF GDN output columns when TP2 selects key-head groups from three tiled repeat
 requantizing any block. The materialization plan owns the generated descriptor
 prefix until its host-to-device transfer completes. `Weight.qhigh` points to the descriptor table
 and `Weight.qdata` to the code plane; scales remain inside the raw blocks.
+
+## 9. `gguf-blocks-v1`
+
+This layout accepts one `GGUF_*` format per rank-two `[N,K]` matrix with positive dimensions and
+`K % 256 == 0`. The payload is the rows in logical order, each row its `K/256` blocks in order, each
+block exactly the bytes GGUF stores for it:
+
+```text
+row_bytes     = (K / 256) * block_bytes(format)
+payload_bytes = N * row_bytes
+```
+
+There is no header, padding, plane split or reordering; scales live inside the blocks. A row range
+is therefore one contiguous byte range, and TP row slicing copies whole rows. Column slicing
+accepts any ascending, disjoint ranges whose boundaries are multiples of 256 and concatenates the
+selected whole blocks of every row, which is how TP2 selects each rank's key heads from the three
+tiled repeat sections of the GGUF GDN output projection. Blocks are only two-byte aligned inside a
+row (several block sizes are not multiples of four); consumers load multi-byte fields accordingly.
