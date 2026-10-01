@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -105,27 +106,47 @@ __device__ __forceinline__ void load_activation(const __nv_bfloat16* p, LaneActi
     load_bf16x8(p, a.v);
 }
 
-__device__ __forceinline__ void load_activation(const __nv_bfloat16* p, LaneActivation<true>& a) {
+// The A8 operand of one lane: eight int8 codes at stored column `column` and their group's step.
+__device__ __forceinline__ void load_activation(const signed char* codes, const float* steps,
+                                                int column, LaneActivation<true>& a) {
+    const uint2 packed = __ldg(reinterpret_cast<const uint2*>(codes + column));
+    a.q[0] = static_cast<int>(packed.x);
+    a.q[1] = static_cast<int>(packed.y);
+    a.step = __ldg(steps + column / 32);
+    a.sum  = a.step * static_cast<float>(__dp4a(a.q[1], 0x01010101, __dp4a(a.q[0], 0x01010101, 0)));
+}
+
+// Quantizes BF16 x [K,T] once per call for the A8 vector route: each 32-value group of stored
+// columns (read through the GDN column map when Tiled) becomes int8 codes round(v / step) with
+// step = amax / 127. One thread converts eight values; the four threads of a group are adjacent
+// lanes. Every thread takes part in the shuffles, so the grid need not divide the work evenly.
+template <bool Tiled>
+__global__ void quantize_activation_kernel(const __nv_bfloat16* __restrict__ x, int k, int tokens,
+                                           signed char* __restrict__ codes,
+                                           float* __restrict__ steps) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t total = static_cast<std::int64_t>(tokens) * (k / 8);
+    const bool live          = index < total;
+    const int token          = live ? static_cast<int>(index / (k / 8)) : 0;
+    const int column         = live ? static_cast<int>(index % (k / 8)) * 8 : 0;
     float v[8];
-    load_bf16x8(p, v);
+    load_bf16x8(x + static_cast<std::int64_t>(token) * k + input_column<Tiled>(column, k), v);
     float amax = 0.0F;
 #pragma unroll
     for (int j = 0; j < 8; ++j) { amax = fmaxf(amax, fabsf(v[j])); }
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, 1));
     amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, 2));
-    a.step = amax / 127.0F;
+    if (!live) { return; }
     const float inverse = amax > 0.0F ? 127.0F / amax : 0.0F;
+    unsigned packed[2] = {0, 0};
 #pragma unroll
-    for (int part = 0; part < 2; ++part) {
-        unsigned packed = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int code = __float2int_rn(v[4 * part + j] * inverse);
-            packed |= (static_cast<unsigned>(code) & 255U) << (8 * j);
-        }
-        a.q[part] = static_cast<int>(packed);
+    for (int j = 0; j < 8; ++j) {
+        const int code = __float2int_rn(v[j] * inverse);
+        packed[j / 4] |= (static_cast<unsigned>(code) & 255U) << (8 * (j % 4));
     }
-    a.sum = a.step * static_cast<float>(__dp4a(a.q[1], 0x01010101, __dp4a(a.q[0], 0x01010101, 0)));
+    *reinterpret_cast<uint2*>(codes + static_cast<std::int64_t>(token) * k + column) =
+        make_uint2(packed[0], packed[1]);
+    if ((column & 31) == 0) { steps[static_cast<std::int64_t>(token) * (k / 32) + column / 32] = amax / 127.0F; }
 }
 
 // A8 form needs the decoded codes per column, so the row loop decodes once and reuses them.
@@ -159,13 +180,13 @@ __device__ __forceinline__ float lane_dot_i8(const LaneWeightI8& w, const LaneAc
 // block size is even), and kStageBlocks = 2 keeps each stage 4-byte aligned; vector_project
 // rejects any other geometry.
 //
-// A8 quantizes each 32-value activation group to int8 with step amax/127 inside the kernel (the
-// quantization depends only on the activation, so every row and launch shape sees the same
-// operands) and dots integer weight codes with dp4a; A16 multiplies decoded FP32 weights by the
-// exact BF16 activation.
+// A8 reads the call's int8 activation codes (quantize_activation_kernel, stored column order) and
+// dots integer weight codes with dp4a; A16 multiplies decoded FP32 weights by the exact BF16
+// activation.
 template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
 __global__ void __launch_bounds__(kVectorWarps * 32)
-vector_kernel(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ rows,
+vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ codes,
+              const float* __restrict__ steps, const unsigned char* __restrict__ rows,
               int row_count, int first_row, int k, int tokens, int token_base, Outputs out) {
     constexpr int kBlockBytes = gguf_block_bytes(Type);
     constexpr int kRowWords   = kStageBlocks * kBlockBytes / 4; // 32-bit words per row per stage
@@ -208,13 +229,17 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const unsigned char* __restri
         if (stage_block + kStageBlocks < blocks) { load_stage(stage_block + kStageBlocks); }
 #pragma unroll
         for (int b = 0; b < kStageBlocks; ++b) {
-            const int column = input_column<Tiled>((stage_block + b) * 256 + lane * 8, k);
+            const int stored = (stage_block + b) * 256 + lane * 8;
             LaneActivation<A8> a[MaxTokens];
 #pragma unroll
             for (int t = 0; t < MaxTokens; ++t) {
                 // Padding columns load column 0 (always valid); their sums are never stored.
-                const int source = t < tokens ? t : 0;
-                load_activation(x + static_cast<std::int64_t>(source) * k + column, a[t]);
+                const std::int64_t source = t < tokens ? t : 0;
+                if constexpr (A8) {
+                    load_activation(codes + source * k, steps + source * (k / 32), stored, a[t]);
+                } else {
+                    load_activation(x + source * k + input_column<Tiled>(stored, k), a[t]);
+                }
             }
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
@@ -259,20 +284,26 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const unsigned char* __restri
     }
 }
 
+struct VectorInput {
+    const __nv_bfloat16* x  = nullptr; // A16
+    const signed char* codes = nullptr; // A8
+    const float* steps       = nullptr; // A8
+};
+
 template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
-void launch_vector_shape(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
+void launch_vector_shape(const VectorInput& in, const GgufSegment& segment, int first_row, int k,
                          int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
     constexpr int kRowsPerCta = kVectorWarps * Rows;
     const dim3 grid(static_cast<unsigned>((segment.rows + kRowsPerCta - 1) / kRowsPerCta));
     vector_kernel<Type, MaxTokens, Rows, Tiled, A8><<<grid, kVectorWarps * 32, 0, stream>>>(
-        x, static_cast<const unsigned char*>(segment.data), segment.rows, first_row, k, tokens,
-        token_base, out);
+        in.x, in.codes, in.steps, static_cast<const unsigned char*>(segment.data), segment.rows,
+        first_row, k, tokens, token_base, out);
 }
 
 // Small segments keep one row per warp so the grid still covers every SM; large ones share each
 // activation slice across several rows. Wider passes trade rows for activation registers.
 template <GgufType Type, bool Tiled, bool A8>
-void launch_vector_type(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
+void launch_vector_type(const VectorInput& x, const GgufSegment& segment, int first_row, int k,
                         int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
     const bool wide = segment.rows >= 2048;
 #define NINFER_GGUF_SHAPE(T, R)                                                                 \
@@ -291,7 +322,7 @@ void launch_vector_type(const __nv_bfloat16* x, const GgufSegment& segment, int 
 }
 
 template <bool Tiled, bool A8>
-void launch_vector(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
+void launch_vector(const VectorInput& x, const GgufSegment& segment, int first_row, int k,
                    int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
     switch (segment.type) {
 #define NINFER_GGUF_TYPE_CASE(T)                                                                 \
@@ -458,9 +489,16 @@ void gemm_project(const __nv_bfloat16* x, const Weight& weight, const Outputs& o
     CUDA_CHECK(cudaGetLastError());
 }
 
+std::size_t a8_bytes(std::int32_t k, std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::I8, {k, tokens});
+    (void)layout.alloc(DType::FP32, {k / 32, tokens});
+    return layout.peak_bytes(1);
+}
+
 template <bool Tiled, bool A8>
 void vector_project(const __nv_bfloat16* x, const Weight& weight, const Outputs& out, int tokens,
-                    cudaStream_t stream) {
+                    WorkspaceArena* workspace, cudaStream_t stream) {
     if ((weight.k / 256) % kStageBlocks != 0) {
         throw std::invalid_argument("gguf vector projection requires K to be a multiple of 512");
     }
@@ -469,31 +507,58 @@ void vector_project(const __nv_bfloat16* x, const Weight& weight, const Outputs&
             throw std::invalid_argument("gguf vector projection requires 4-byte aligned segments");
         }
     }
+    const int k = weight.k;
+    std::optional<WorkspaceArena::Scope> scope;
+    Tensor codes;
+    Tensor steps;
+    if constexpr (A8) {
+        const int width = std::min(kGgufVectorTokens, tokens);
+        scope.emplace(workspace->scope());
+        codes = workspace->alloc(DType::I8, {k, width});
+        steps = workspace->alloc(DType::FP32, {k / 32, width});
+    }
     for (int token = 0; token < tokens; token += kGgufVectorTokens) {
         const int width   = std::min(kGgufVectorTokens, tokens - token);
-        const auto* input = x + static_cast<std::int64_t>(token) * weight.k;
-        int first_row     = 0;
+        const auto* input = x + static_cast<std::int64_t>(token) * k;
+        VectorInput in;
+        if constexpr (A8) {
+            const std::int64_t threads = static_cast<std::int64_t>(width) * (k / 8);
+            quantize_activation_kernel<Tiled><<<static_cast<unsigned>((threads + 127) / 128), 128,
+                                                0, stream>>>(
+                input, k, width, static_cast<signed char*>(codes.data),
+                static_cast<float*>(steps.data));
+            CUDA_CHECK(cudaGetLastError());
+            in.codes = static_cast<const signed char*>(codes.data);
+            in.steps = static_cast<const float*>(steps.data);
+        } else {
+            in.x = input;
+        }
+        int first_row = 0;
         for (int s = 0; s < weight.gguf_segment_count; ++s) {
-            launch_vector<Tiled, A8>(input, weight.gguf_segments[s], first_row, weight.k, width,
-                                     token, out, stream);
+            launch_vector<Tiled, A8>(in, weight.gguf_segments[s], first_row, k, width, token, out,
+                                     stream);
             first_row += weight.gguf_segments[s].rows;
         }
     }
 }
 
+// Routes: the FP16 tensor-core GEMM above kVectorMaxTokens columns when its workspace fits;
+// otherwise vector passes, A8 when admitted and its activation buffer fits, else A16.
 template <bool Tiled>
 void project(const __nv_bfloat16* x, const Weight& weight, const Outputs& out, int tokens,
              bool allow_a8, WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::size_t available =
+        workspace == nullptr ? 0 : workspace->capacity() - workspace->used();
     if (tokens > kVectorMaxTokens && workspace != nullptr && gemm_admits(weight, out) &&
-        workspace->capacity() - workspace->used() >=
-            gemm_workspace_bytes(weight.n, weight.k, tokens)) {
+        available >= gemm_workspace_bytes(weight.n, weight.k, tokens)) {
         gemm_project<Tiled>(x, weight, out, tokens, *workspace, stream);
         return;
     }
-    if (allow_a8) {
-        vector_project<Tiled, true>(x, weight, out, tokens, stream);
+    if (allow_a8 && workspace != nullptr &&
+        available >= a8_bytes(weight.k, std::min(kGgufVectorTokens, tokens))) {
+        vector_project<Tiled, true>(x, weight, out, tokens, workspace, stream);
     } else {
-        vector_project<Tiled, false>(x, weight, out, tokens, stream);
+        vector_project<Tiled, false>(x, weight, out, tokens, workspace, stream);
     }
 }
 
@@ -592,7 +657,10 @@ std::size_t gguf_workspace_bytes(std::int32_t n, std::int32_t k, std::int32_t ma
     if (n <= 0 || k <= 0 || k % 256 != 0 || max_tokens <= 0) {
         throw std::invalid_argument("gguf workspace: invalid profile");
     }
-    return max_tokens > kVectorMaxTokens ? gemm_workspace_bytes(n, k, max_tokens) : 0;
+    const std::size_t vector = a8_bytes(k, std::min(kGgufVectorTokens, max_tokens));
+    return max_tokens > kVectorMaxTokens
+               ? std::max(vector, gemm_workspace_bytes(n, k, max_tokens))
+               : vector;
 }
 
 void gguf_embedding(const Tensor& ids, const Weight& weight, Tensor& out, cudaStream_t stream) {

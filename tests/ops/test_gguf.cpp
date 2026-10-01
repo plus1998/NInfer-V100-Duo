@@ -421,7 +421,7 @@ void check_projection(const HostWeight& host, int tokens, int sections, bool add
     }
     const Weight weight = host.weight();
     std::unique_ptr<WorkspaceArena> workspace;
-    if (with_workspace) {
+    if (with_workspace || allow_a8) {
         const std::size_t bytes = ops::detail::gguf_workspace_bytes(n, k, tokens);
         workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(bytes, 256));
     }

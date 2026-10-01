@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -67,13 +68,15 @@ int main() {
                 xd.copy_from_host(x.data(), xd.bytes);
                 Tensor xt(xd.p, DType::BF16, {shape.k, tokens});
                 Tensor yt(yd.p, DType::BF16, {shape.n, tokens});
+                WorkspaceArena workspace(
+                    std::max<std::size_t>(256, ops::detail::gguf_workspace_bytes(shape.n, shape.k, tokens)));
                 for (int i = 0; i < 3; ++i) {
-                    ops::detail::gguf_project(xt, w, &yt, 1, false, false, a8, nullptr, nullptr);
+                    ops::detail::gguf_project(xt, w, &yt, 1, false, false, a8, &workspace, nullptr);
                 }
                 constexpr int kIterations = 20;
                 CUDA_CHECK(cudaEventRecord(start));
                 for (int i = 0; i < kIterations; ++i) {
-                    ops::detail::gguf_project(xt, w, &yt, 1, false, false, a8, nullptr, nullptr);
+                    ops::detail::gguf_project(xt, w, &yt, 1, false, false, a8, &workspace, nullptr);
                 }
                 CUDA_CHECK(cudaEventRecord(stop));
                 CUDA_CHECK(cudaEventSynchronize(stop));

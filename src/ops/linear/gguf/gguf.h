@@ -19,9 +19,9 @@ inline constexpr std::int32_t kGgufVectorTokens = 8;
 // through llama.cpp's tiled GDN value-head column order (K = 6144, or its TP2 half 3072).
 // Decoded weights are the exact ggml-quants values. A16 vector passes accumulate in FP32 against the
 // BF16 activation; `allow_a8` vector passes instead quantize each 32-value activation group to int8
-// with step amax/127 and dot integer weight codes with dp4a (llama.cpp's q8_1 activation model).
-// The tensor-core route, taken above kVectorMaxTokens columns with workspace, rounds weights and
-// activations to FP16 once regardless of `allow_a8`.
+// with step amax/127 into workspace and dot integer weight codes with dp4a (llama.cpp's q8_1
+// activation model); without that workspace they run A16. The tensor-core route, taken above 16
+// columns with workspace, rounds weights and activations to FP16 once regardless of `allow_a8`.
 void gguf_project(const Tensor& x, const Weight& weight, const Tensor* outputs, int count, bool add,
                   bool tiled_gdn_input, bool allow_a8, WorkspaceArena* workspace,
                   cudaStream_t stream);
