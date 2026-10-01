@@ -165,10 +165,11 @@ struct LaneWeightI8 {
 };
 
 template <GgufType Type>
-__device__ __forceinline__ LaneWeightI8 decode_lane_i8(const unsigned char* block, int lane) {
+__device__ __forceinline__ LaneWeightI8 decode_lane_i8(const unsigned char* block, int lane,
+                                                       const void* grid) {
     LaneWeightI8 w;
     w.minimum = 0.0F;
-    gguf::decode_i8<Type>(block, lane, w.q, w.scale, w.minimum);
+    gguf::decode_i8<Type>(block, lane, w.q, w.scale, w.minimum, grid);
     return w;
 }
 
@@ -206,6 +207,19 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
     constexpr int kStageWords = Rows * kRowWords;
     constexpr int kLaneWords  = (kStageWords + 31) / 32;
     __shared__ __align__(16) unsigned stage[kVectorWarps][kStageWords];
+    // A8 i-quant lookups are data-dependent gathers; serve them from a per-CTA shared copy of the
+    // codebook instead of the read-only cache, which serializes divergent addresses.
+    constexpr int kGridWords = A8 ? gguf::kGridBytes<Type> / 4 : 0;
+    __shared__ __align__(16) unsigned grid_copy[kGridWords > 0 ? kGridWords : 1];
+    const void* grid = gguf::global_grid<Type>();
+    if constexpr (kGridWords > 0) {
+        const auto* source = static_cast<const unsigned*>(gguf::global_grid<Type>());
+        for (int i = static_cast<int>(threadIdx.x); i < kGridWords; i += blockDim.x) {
+            grid_copy[i] = __ldg(source + i);
+        }
+        __syncthreads();
+        grid = grid_copy;
+    }
 
     const int warp  = static_cast<int>(threadIdx.x >> 5);
     const int lane  = static_cast<int>(threadIdx.x & 31);
@@ -260,7 +274,7 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
             for (int r = 0; r < Rows; ++r) {
                 const unsigned char* block = staged + r * kRowWords * 4 + b * kBlockBytes;
                 if constexpr (A8) {
-                    const LaneWeightI8 w = decode_lane_i8<Type>(block, lane);
+                    const LaneWeightI8 w = decode_lane_i8<Type>(block, lane, grid);
 #pragma unroll
                     for (int t = 0; t < MaxTokens; ++t) { sum[r][t] = lane_dot_i8<Type>(w, a[t], sum[r][t]); }
                 } else {

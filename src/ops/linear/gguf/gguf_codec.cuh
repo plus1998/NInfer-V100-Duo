@@ -281,13 +281,34 @@ __device__ __forceinline__ int iq4_lookup4(unsigned codes) {
     return static_cast<int>((low & ~pick) | (high & pick));
 }
 
+// Codebook of an i-quant format for decode_i8, and its size in bytes; zero for the others. A
+// kernel may copy it into shared memory and pass that copy as `grid`.
+template <GgufType Type>
+inline constexpr int kGridBytes = Type == GgufType::IQ3_S     ? 512 * 4
+                                  : Type == GgufType::IQ3_XXS ? 256 * 4
+                                  : Type == GgufType::IQ2_XXS ? 256 * 8
+                                  : Type == GgufType::IQ2_XS  ? 512 * 8
+                                  : Type == GgufType::IQ2_S   ? 1024 * 8
+                                                              : 0;
+
+template <GgufType Type>
+__device__ __forceinline__ const void* global_grid() {
+    if constexpr (Type == GgufType::IQ3_S) { return iq3s_grid; }
+    if constexpr (Type == GgufType::IQ3_XXS) { return iq3xxs_grid; }
+    if constexpr (Type == GgufType::IQ2_XXS) { return iq2xxs_grid; }
+    if constexpr (Type == GgufType::IQ2_XS) { return iq2xs_grid; }
+    if constexpr (Type == GgufType::IQ2_S) { return iq2s_grid; }
+    return nullptr;
+}
+
 template <GgufType Type>
 __device__ __forceinline__ void decode_i8(const unsigned char* block, int j8, int (&w)[2],
-                                          float& scale, float& minimum);
+                                          float& scale, float& minimum,
+                                          const void* grid = global_grid<Type>());
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ4_XS>(const unsigned char* b, int j8,
-                                                            int (&w)[2], float& scale, float&) {
+                                                            int (&w)[2], float& scale, float&, const void*) {
     const int ib        = j8 >> 2;
     const unsigned low  = (u8(b, 4 + ib / 2) >> (4 * (ib & 1))) & 15U;
     const unsigned high = (u16(b, 2) >> (2 * ib)) & 3U;
@@ -301,7 +322,7 @@ __device__ __forceinline__ void decode_i8<GgufType::IQ4_XS>(const unsigned char*
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ3_S>(const unsigned char* b, int j8,
-                                                           int (&w)[2], float& scale, float&) {
+                                                           int (&w)[2], float& scale, float&, const void* grid) {
     const int ib32 = j8 >> 2;
     const int l    = j8 & 3;
     scale = f16(b, 0) * static_cast<float>(1 + 2 * ((u8(b, 106 + ib32 / 2) >> (4 * (ib32 & 1))) & 15U));
@@ -309,20 +330,22 @@ __device__ __forceinline__ void decode_i8<GgufType::IQ3_S>(const unsigned char* 
     const unsigned i0    = u8(b, 2 + ib32 * 8 + 2 * l) | ((qh << (8 - 2 * l)) & 256U);
     const unsigned i1    = u8(b, 2 + ib32 * 8 + 2 * l + 1) | ((qh << (7 - 2 * l)) & 256U);
     const unsigned signs = u8(b, 74 + ib32 * 4 + l);
-    w[0] = apply_signs4(table32(iq3s_grid, i0), signs);
-    w[1] = apply_signs4(table32(iq3s_grid, i1), signs >> 4);
+    const auto* g = static_cast<const std::uint32_t*>(grid);
+    w[0] = apply_signs4(g[i0], signs);
+    w[1] = apply_signs4(g[i1], signs >> 4);
 }
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ3_XXS>(const unsigned char* b, int j8,
-                                                             int (&w)[2], float& scale, float&) {
+                                                             int (&w)[2], float& scale, float&, const void* grid) {
     const int ib32       = j8 >> 2;
     const int l          = j8 & 3;
     const unsigned aux   = u32(b, 66 + 4 * ib32);
     scale                = f16(b, 0) * (0.5F + static_cast<float>(aux >> 28)) * 0.5F;
     const unsigned signs = signs7((aux >> (7 * l)) & 127U);
-    w[0] = apply_signs4(table32(iq3xxs_grid, u8(b, 2 + ib32 * 8 + 2 * l)), signs);
-    w[1] = apply_signs4(table32(iq3xxs_grid, u8(b, 2 + ib32 * 8 + 2 * l + 1)), signs >> 4);
+    const auto* g        = static_cast<const std::uint32_t*>(grid);
+    w[0] = apply_signs4(g[u8(b, 2 + ib32 * 8 + 2 * l)], signs);
+    w[1] = apply_signs4(g[u8(b, 2 + ib32 * 8 + 2 * l + 1)], signs >> 4);
 }
 
 __device__ __forceinline__ void grid8_i8(std::uint64_t grid, unsigned signs, int (&w)[2]) {
@@ -332,40 +355,41 @@ __device__ __forceinline__ void grid8_i8(std::uint64_t grid, unsigned signs, int
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ2_XXS>(const unsigned char* b, int j8,
-                                                             int (&w)[2], float& scale, float&) {
+                                                             int (&w)[2], float& scale, float&, const void* grid) {
     const int ib32     = j8 >> 2;
     const int l        = j8 & 3;
     const unsigned aux = u32(b, 2 + 8 * ib32 + 4);
     scale              = f16(b, 0) * (0.5F + static_cast<float>(aux >> 28)) * 0.25F;
-    grid8_i8(table64(iq2xxs_grid, u8(b, 2 + 8 * ib32 + l)), signs7((aux >> (7 * l)) & 127U), w);
+    grid8_i8(static_cast<const std::uint64_t*>(grid)[u8(b, 2 + 8 * ib32 + l)],
+             signs7((aux >> (7 * l)) & 127U), w);
 }
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ2_XS>(const unsigned char* b, int j8,
-                                                            int (&w)[2], float& scale, float&) {
+                                                            int (&w)[2], float& scale, float&, const void* grid) {
     const int ib32     = j8 >> 2;
     const int l        = j8 & 3;
     const unsigned q   = u16(b, 2 + 2 * j8);
     const unsigned sub = (u8(b, 66 + ib32) >> (4 * (l / 2))) & 15U;
     scale              = f16(b, 0) * (0.5F + static_cast<float>(sub)) * 0.25F;
-    grid8_i8(table64(iq2xs_grid, q & 511U), signs7(q >> 9), w);
+    grid8_i8(static_cast<const std::uint64_t*>(grid)[q & 511U], signs7(q >> 9), w);
 }
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ2_S>(const unsigned char* b, int j8,
-                                                           int (&w)[2], float& scale, float&) {
+                                                           int (&w)[2], float& scale, float&, const void* grid) {
     const int ib32     = j8 >> 2;
     const int l        = j8 & 3;
     const unsigned sub = (u8(b, 74 + ib32) >> (4 * (l / 2))) & 15U;
     scale              = f16(b, 0) * (0.5F + static_cast<float>(sub)) * 0.25F;
     const unsigned idx = u8(b, 2 + j8) | ((u8(b, 66 + ib32) << (8 - 2 * l)) & 0x300U);
-    grid8_i8(table64(iq2s_grid, idx), u8(b, 34 + j8), w);
+    grid8_i8(static_cast<const std::uint64_t*>(grid)[idx], u8(b, 34 + j8), w);
 }
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::IQ1_M>(const unsigned char* b, int j8,
                                                            int (&w)[2], float& scale,
-                                                           float& minimum) {
+                                                           float& minimum, const void*) {
     const int ib = j8 >> 2;
     const int l  = j8 & 3;
     const unsigned s0 = u16(b, 48), s1 = u16(b, 50), s2 = u16(b, 52), s3 = u16(b, 54);
@@ -388,7 +412,7 @@ __device__ __forceinline__ void decode_i8<GgufType::IQ1_M>(const unsigned char* 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::Q2_K>(const unsigned char* b, int j8,
                                                           int (&w)[2], float& scale,
-                                                          float& minimum) {
+                                                          float& minimum, const void*) {
     const int i       = 8 * j8;
     const int half    = i >> 7;
     const int rem     = i & 127;
@@ -405,7 +429,7 @@ __device__ __forceinline__ void decode_i8<GgufType::Q2_K>(const unsigned char* b
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::Q4_K>(const unsigned char* b, int j8,
                                                           int (&w)[2], float& scale,
-                                                          float& minimum) {
+                                                          float& minimum, const void*) {
     const int group = j8 >> 2;
     unsigned scale_code;
     unsigned min_code;
@@ -426,7 +450,7 @@ __device__ __forceinline__ void decode_i8<GgufType::Q4_K>(const unsigned char* b
 
 template <>
 __device__ __forceinline__ void decode_i8<GgufType::Q6_K>(const unsigned char* b, int j8,
-                                                          int (&w)[2], float& scale, float&) {
+                                                          int (&w)[2], float& scale, float&, const void*) {
     const int i       = 8 * j8;
     const int half    = i >> 7;
     const int within  = i & 127;
