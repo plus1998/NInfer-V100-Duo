@@ -400,6 +400,19 @@ private:
         add(old_mtp + "mlp/gate_up", {new_mtp + "mlp/gate", new_mtp + "mlp/up"});
         add(old_mtp + "mlp/down", {new_mtp + "mlp/down"});
 
+        add_vision();
+
+        constexpr std::size_t kStructuralObjects = 1012;
+        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
+        if (selected_.size() != expected) {
+            throw ArtifactError("qwen3.8-27b v3 projection produced " +
+                                std::to_string(selected_.size()) + " objects; expected " +
+                                std::to_string(expected));
+        }
+        return project("nvfp4");
+    }
+
+    void add_vision() {
         for (const char* name : {"patch_embedding", "patch_embedding_bias", "position_embedding"}) {
             add("vision/" + std::string(name), {"vision/" + std::string(name)});
         }
@@ -429,22 +442,13 @@ private:
             add("vision/merger/norm/" + std::string(part),
                 {"vision/merger/norm_" + std::string(part)});
         }
-
-        constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
-        if (selected_.size() != expected) {
-            throw ArtifactError("qwen3.8-27b v3 projection produced " +
-                                std::to_string(selected_.size()) + " objects; expected " +
-                                std::to_string(expected));
-        }
-        return project("nvfp4");
     }
 
     // qwen3.8-27b/gguf-blocks: each projection keeps the GGUF block rows of its source tensors.
     // A fused parameter group (GDN q|k|v|z, attention q|k|gate|v, MLP gate|up) may span several
     // physical objects of different block types; its objects become consecutive row segments
-    // named `<parent>#0`, `<parent>#1`, ... in logical row order. Vision and DFlash2 companions
-    // are not projected: this identity delivers Text and MTP only.
+    // named `<parent>#0`, `<parent>#1`, ... in logical row order. The Vision companion uses
+    // the same quantized representation as the v3 NVFP4 artifact; DFlash2 is not projected.
     V3CompatibilityDirectory build_gguf() {
         for (const auto& [role, component] : std::array{
                  std::pair{"tokenizer.json", "text"},
@@ -515,12 +519,14 @@ private:
         add_segments(old_mtp + "mlp/gate_up", {new_mtp + "mlp/gate", new_mtp + "mlp/up"});
         add_segments(old_mtp + "mlp/down", {new_mtp + "mlp/down"});
 
-        // Every object reachable from a Text, MTP or proposal parameter must have been projected
+        add_vision();
+
+        // Every object reachable from a Text, MTP, proposal or Vision parameter must be projected
         // exactly once; `select` already rejects a second selection.
         std::set<std::string> required;
         for (const auto& [name, binding] : directory_.at("bindings").items()) {
             if (!name.starts_with("text/") && !name.starts_with("mtp/") &&
-                !name.starts_with("proposal/")) {
+                !name.starts_with("proposal/") && !name.starts_with("vision/")) {
                 continue;
             }
             for (const auto& part : binding_parts(name)) {

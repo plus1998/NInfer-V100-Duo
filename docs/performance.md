@@ -838,6 +838,95 @@ quality on arbitrary prompts.
 
 ## V100 Duo GSQ-RCO IQ3_S GGUF-blocks
 
+On 2026-10-01 the public `ninfer-serve` route was also checked with the same
+GSQ artifact on two V100-SXM2 16 GB cards. TP2, INT8 KV, MTP3, the optimized
+draft head, CUDA Graph, 4,096-token prefill chunks, greedy sampling and two
+text slots were used. Explicit Main Text KV capacities distinguish a native
+262,144-token *per-request ceiling* from two independent full-context KV
+entitlements:
+
+| Per-request ceiling | Shared KV tokens | Result |
+|---:|---:|---|
+| 262,144 | 524,288 | Startup rejected: runtime reservation 12,063,633,152 B exceeds available 10,154,556,416 B |
+| 262,144 | 262,144 | Started; 2.74 GiB free per GPU; two short requests decoded concurrently |
+| 200,000 | 400,000 | Started; 811 MiB free per GPU; two short requests decoded concurrently |
+
+To find the highest shared KV pool with the **262,144-token per-request
+ceiling fixed**, the same two-slot, 4,096-chunk configuration was started
+repeatedly on 2026-10-01 (one server at a time):
+
+| Shared KV tokens | Mode | Observed result |
+|---:|---|---|
+| 358,016 | `auto` | Started; 1.13 GiB physically free, 1 GiB planned headroom |
+| 409,600 | explicit | Started; 277 MiB physically free; two short HTTP requests each produced 128 tokens |
+| 417,792 | explicit | Started; 137 MiB physically free; two short HTTP requests each produced 128 tokens |
+| 417,856 | explicit | Started; 137 MiB physically free, 0.38 MiB planned slack; two short HTTP requests each produced 128 tokens |
+| 417,920 | explicit | Rejected: 10,154,114,816 B reservation > 10,153,361,408 B available |
+
+The Main pool allocates 64-token pages, so the last two explicit points are
+adjacent allocation sizes. Startup budgets varied slightly between runs; the
+one-page boundary is an **observed ceiling in this run**, not a stable safe
+setting. At 417,856 tokens, the primary GPU had only 137 MiB free after graph
+setup. Prefer `auto` for its 1 GiB sizing headroom, or leave ample explicit
+margin rather than using the measured edge. Two concurrently *occupied* long
+contexts were not measured.
+
+The same hardware, artifact, TP2/MTP3/INT8 KV, 4,096-token chunk and native
+262,144-token per-request ceiling were also measured at **three text slots**
+on 2026-10-01. Only one server was resident at a time:
+
+| Shared KV tokens | Mode | Result |
+|---:|---|---|
+| 344,256 | `auto` | Started; 1.20 GiB physically free; three 31-token prompt / 256-output requests completed in 9.62–9.78 s, with decode batches reaching size 3.00 |
+| 400,000 | explicit | Started; 273 MiB free, 70.32 MiB planned slack; three 31-token prompt / 256-output requests completed in 9.64–9.79 s, with decode batches reaching size 3.00 |
+| 403,968 | explicit | Started; 205 MiB free; three short requests completed |
+| 404,032 | explicit | Started; 203 MiB free; three short requests completed |
+| 404,096 | explicit | Started; 201 MiB free, 0.19 MiB planned slack; three short requests completed in 9.63–9.78 s, decode batches reaching size 3.00 |
+| 404,160 | explicit | Rejected: 10,154,307,328 B reservation > 10,153,361,408 B available |
+| 404,224 | explicit | Rejected: 10,155,456,256 B reservation > 10,154,556,416 B available |
+
+The highest observed working pool, 404,096 tokens, and rejected adjacent
+64-token page are a **run-specific memory boundary**: even the 400,000-token
+explicit profile leaves only 273 MiB physically free. The `auto` capacity
+retains its 1 GiB planning headroom and is the safer starting point when
+the larger shared pool is unnecessary. This checks three *short* concurrent
+requests, not three occupied long contexts or the exact maximum on every startup.
+
+Vision support for this GSQ artifact was verified with the same TP2, INT8 KV,
+MTP3 and three-slot configuration, using the v3 Vision tower and merger weights
+projected without runtime repacking:
+
+| Vision profile (262,144 context ceiling) | Shared KV | Startup/result |
+|---|---:|---|
+| `--prefill-chunk 4096 --vision-max-tokens 2048` | 400,000 | Rejected: 10,100,664,064 B runtime reservation > 9,858,836,992 B available |
+| `--prefill-chunk 1024 --vision-max-tokens 2048 --kv-capacity auto` | 344,832 | Started with 1.20 GiB free per GPU and 1 GiB planned headroom; real-image checks passed |
+| `--prefill-chunk 1024 --vision-max-tokens 2048 --kv-capacity 400000` | 400,000 | Started with 283 MiB free per GPU, 80.33 MiB planned slack; real-image checks passed |
+
+For both successful profiles, `tools/v100/check_vision_http.py` passed all
+six requests via public HTTP serving: red-circle and blue-square 384 × 384
+images, a 1280 × 1280 image spanning prefill chunks, two images in one prompt,
+and two concurrent long-form image responses. It checks scene semantics, not
+pixel-level model accuracy. At 400K shared KV, three additional concurrent
+real-image requests each completed a 384-token continuation and the server
+recorded decode batch size **3.00**; all requests identified the depicted shape
+and color correctly. This does not establish correctness or speed with three
+near-full contexts occupied. The 400K setting has little startup margin; `auto`
+is safer when maximum shared KV capacity is not required.
+
+An HTTP request for a long story, with thinking disabled and 513 output
+tokens, used a 40-token prompt. After one warmup, the 200K/two-entitlement
+profile completed one request in 6.965 s (73.66 aggregate output tok/s) and
+two pairs in 10.327 / 10.032 s (99.35 / 102.27 aggregate output tok/s).
+The native-262K/shared-one-entitlement profile completed two pairs in
+10.666 / 10.023 s (96.20 / 102.36 aggregate output tok/s). Each response
+finished at the output limit; server throughput records reached average decode
+batch size 2.00. Prefix reuse was enabled, so these rates include possible
+cached prompt prefixes and are not controlled cold-prefill measurements.
+No 200K- or 262K-occupied concurrent prefill was run: memory admission and
+short-request batching do not establish long-context performance or completion
+at the full frontier. The startup failures do not establish the exact maximum
+feasible two-entitlement ceiling between 200K and 262K.
+
 On 2026-10-01, the same **2 × V100-SXM2 16 GB** NVLink host, CUDA 12.8, and
 branch `feat/gguf-blocks-v100` measured `out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`
 (identity `qwen3.8-27b/gguf-blocks`, 12.0 GiB uploaded, 5.66 GiB per GPU) with

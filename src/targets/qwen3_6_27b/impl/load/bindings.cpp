@@ -1016,9 +1016,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
     const bool gguf   = weights_profile == WeightsProfile::Qwen38Gguf;
-    if ((ggml_k || gguf) && features.vision) {
+    if (ggml_k && features.vision) {
         throw std::invalid_argument(
-            "qwen3.8-27b GGUF artifacts deliver Text and MTP; start them without --vision");
+            "qwen3.8-27b gguf-q4-k-m artifacts deliver Text and MTP; start them without --vision");
     }
     if (ggml_k) {
         out.draft_format = NumericFormat::GGML_K;
@@ -1099,16 +1099,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                         : artifact::TensorPlacement::ValidateOnly;
     if (ggml_k) {
         binder.validate_unconsumed_matching("vision/gguf/");
-    } else if (gguf) {
-        // The GGUF-blocks projection publishes no Vision objects.
     } else {
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
-    out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
-    out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
+        out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
+        out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+        out.vision_merger_fc2   = artifact::bind_tensor(
+            binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+        out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
     }
 
     // Validate any companion DFlash/DFlash2 tensors present in artifact so they don't consume VRAM

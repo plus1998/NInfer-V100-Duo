@@ -248,6 +248,32 @@ void test_official_qwen38_v3_if_configured() {
     }
 }
 
+void test_gsq_qwen38_v3_vision_if_configured() {
+    const char* path = std::getenv("NINFER_QWEN3_8_27B_GSQ_WEIGHTS");
+    if (path == nullptr || *path == '\0') { return; }
+
+    Reader reader(path);
+    if (reader.identity().model_id != "qwen3.8-27b" ||
+        reader.identity().weights_id != "gguf-blocks") {
+        throw std::runtime_error("GSQ v3 projection identity mismatch");
+    }
+    for (const auto& [name, format] : std::array{
+             std::pair{"vision/patch_embedding", NumericFormat::Q6G64_F16S},
+             std::pair{"vision/layers/0/attention/qkv", NumericFormat::Q4G64_F16S},
+             std::pair{"vision/layers/26/mlp/fc2", NumericFormat::Q5G64_F16S},
+             std::pair{"vision/merger/fc2", NumericFormat::W8G32_F16S},
+         }) {
+        const auto* tensor = std::get_if<TensorDescriptor>(reader.find(name));
+        if (tensor == nullptr || tensor->format != format) {
+            throw std::runtime_error(std::string("GSQ v3 Vision projection omitted ") + name);
+        }
+    }
+    if (reader.find("frontend/preprocessor_config.json") == nullptr ||
+        reader.find("frontend/video_preprocessor_config.json") == nullptr) {
+        throw std::runtime_error("GSQ v3 Vision preprocessing resources are missing");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +282,7 @@ int main() {
         test_normative_fixture();
         test_common_validation();
         test_official_qwen38_v3_if_configured();
+        test_gsq_qwen38_v3_vision_if_configured();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

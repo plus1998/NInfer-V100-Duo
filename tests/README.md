@@ -141,6 +141,11 @@ and two images, and sends two simultaneous streaming requests. It requires overl
 streams and structured-log evidence of an actual multi-row decode batch, not just two HTTP 200s.
 Use a dedicated idle server with a 1,024-token prefill chunk and at least two request slots.
 
+For the GSQ-RCO v3 artifact, `NINFER_QWEN3_8_27B_GSQ_WEIGHTS=/absolute/path/to/artifact.ninfer`
+enables the artifact reader's Vision projection check. The README's GSQ Vision
+three-slot server profile also supports the same real-image HTTP checker, with
+`--base-url` pointing to the selected port.
+
 Run the peer 35B-A3B route independently:
 
 ```bash

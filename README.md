@@ -2,7 +2,7 @@
 
 Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB (NVLink)**, TP2, CUDA 12.8:
 the **official NVFP4** artifact (executed in software on Volta) and the
-**GSQ-RCO IQ3_S GGUF-blocks** artifact (Text + MTP, [below](#gsq-rco-iq3_s-gguf-blocks)).
+**GSQ-RCO IQ3_S GGUF-blocks** artifact (Text + Vision + MTP, [below](#gsq-rco-iq3_s-gguf-blocks)).
 Based on
 [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
@@ -10,12 +10,32 @@ Based on
 ## Start
 
 Build with `tools/v100/build.sh` and download the
-[official Qwen3.8-27B NVFP4 artifact](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
+[official Qwen3.8-27B NVFP4 artifact](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
+or the
+[GSQ-RCO IQ3_S NInfer v3 artifact](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3).
 All commands below use TP2 on two V100s, INT8 KV, MTP3 with an optimized draft
 head, and CUDA Graph. The server listens on `127.0.0.1:8080`; stop it before
 starting another profile.
 
-**Recommended single-request Vision** on 2 × 16 GB (155,648 context tokens):
+On the tested **2 × 16 GB** setup, choose a profile by workload (commands and
+capacity limits are detailed below):
+
+| Workload | Artifact | Startup flags after `model=...` |
+|---|---|---|
+| [Vision, one request](#vision-one-request) | NVFP4 | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 1 --kv-capacity 155648` |
+| [Text concurrency, up to four requests](#concurrent-text-requests) | NVFP4 | `--max-context 131072 --prefill-chunk 1024 --max-concurrency 4 --kv-capacity 131072` |
+| [Vision + concurrency, up to two requests](#vision-with-concurrency) | NVFP4 | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 2 --kv-capacity 155648` |
+| [Native 262K context + two text slots](#gsq-rco-iq3_s-gguf-blocks) | GSQ-RCO | `--max-context 262144 --kv-capacity 262144 --max-concurrency 2` |
+| [Native 262K context + three Vision/text slots](#gsq-rco-iq3_s-gguf-blocks) | GSQ-RCO | `--vision --vision-max-tokens 2048 --max-context 262144 --prefill-chunk 1024 --max-concurrency 3 --kv-capacity 400000` |
+
+Four text slots favor aggregate short-prompt throughput; use the [two-slot
+text profile](#concurrent-text-requests) for a 155K per-request ceiling. Slots
+share a KV pool, so these profiles do not guarantee simultaneous full-context
+requests.
+
+### Vision, one request
+
+Recommended on 2 × 16 GB (155,648 context tokens):
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
@@ -121,17 +141,70 @@ measures long-context speed, **not useful-answer quality or Agent latency**. See
 
 ## GSQ-RCO IQ3_S (GGUF-blocks)
 
-The NInfer v3 conversion of ISTA-DASLab's GSQ-RCO IQ3_S GGUF
+The [NInfer v3 conversion](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3)
+of ISTA-DASLab's GSQ-RCO IQ3_S GGUF
 (`Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`, 15.0 GB file, 5.66 GiB of
-weights per GPU) runs unconverted: every tensor keeps its own ggml block type
-(IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS/XXS/S, IQ1_M, Q2_K, Q4_K, Q6_K). **Text and
-MTP only** — `--vision` is rejected. The full native **262,144-token** context
+weights per GPU for Text/MTP) runs without runtime repacking: every Text tensor
+keeps its own ggml block type (IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS/XXS/S, IQ1_M,
+Q2_K, Q4_K, Q6_K). The artifact also includes quantized Vision weights. The
+full native **262,144-token** context
 fits with INT8 KV and leaves **2.90 GiB** free per GPU:
 
 ```bash
 tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer \
   --max-context 262144 --kv-capacity 262144
 ```
+
+For **two concurrent text slots while preserving the native 262,144-token
+per-request ceiling**, add `--max-concurrency 2` to this command. The
+262,144-token KV pool is **shared**: two short requests can decode together,
+but two full-context requests cannot. Two simultaneous 40-token prompts with
+513 output tokens each formed actual two-row decode batches and completed in
+10.67 s / 10.02 s (96.2 / 102.4 aggregate output tok/s). To enlarge the shared
+pool without changing the native context ceiling, `--kv-capacity auto` resolved
+to **358,016 tokens** with 1 GiB planned headroom. Explicit
+`--kv-capacity 409600` also started and ran two short requests, but left only
+**277 MiB free per GPU**; use `auto` when headroom matters. The observed
+near-OOM limit was **417,856** tokens (137 MiB free); **417,920** failed memory
+admission on the next page. This is a measured boundary, **not** a safe default
+or a two-long-request qualification. For **two separate
+200,000-token KV entitlements** instead, use:
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer \
+  --max-context 200000 --kv-capacity 400000 --max-concurrency 2
+```
+
+This started with 811 MiB free per GPU and ran two-row decode batches on
+short prompts; generation with two fully occupied 200K contexts has **not**
+been tested. The native 262K ceiling with a 524,288-token KV pool for two
+full-context entitlements failed startup memory admission. These are tested
+capacity profiles, **not an exhaustive search for the maximum feasible shared
+KV pool**. See [concurrent GSQ measurements](docs/performance.md#v100-duo-gsq-rco-iq3_s-gguf-blocks).
+
+For **three concurrent text slots** at the same native 262,144-token ceiling,
+use `--max-concurrency 3 --kv-capacity 400000`. This sits below the observed
+404,096-token text-only startup limit, but leaves little GPU headroom; for a
+1 GiB planning margin use `--kv-capacity auto` (344,256 tokens measured).
+The shared pool cannot hold two, let alone three, full 262K requests.
+
+For **Vision with three concurrent slots** on 2 × 16 GB, reduce the prefill
+chunk and bound the per-prompt visual tokens (2,048 is not a text limit):
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer \
+  --vision --vision-max-tokens 2048 \
+  --max-context 262144 --prefill-chunk 1024 \
+  --max-concurrency 3 --kv-capacity 400000
+```
+
+This profile started with **283 MiB free per GPU**, correctly described test
+images and formed three-row Vision decode batches. It preserves the *single*
+request's 262K context ceiling, not three full-context KV entitlements. It
+has little memory margin: `--kv-capacity auto` instead resolved **344,832**
+tokens with 1 GiB planned headroom and also passed Vision checks. At 4,096-token
+prefill chunks, the 400K Vision configuration failed memory admission.
+See [real-image and capacity checks](docs/performance.md#v100-duo-gsq-rco-iq3_s-gguf-blocks).
 
 Same method as the context-decay table above (TP2, INT8 KV, 4,096-token
 chunks, MTP3, two cold requests, 1,024 measured decode tokens), with

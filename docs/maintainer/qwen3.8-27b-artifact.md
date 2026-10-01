@@ -878,7 +878,8 @@ differences:
   reader verifies that each GDN output Use carries exactly the corresponding `input_columns`
   permutation, and the GDN output Op applies it;
 - norms, `gdn/a_log`, `gdn/dt_bias`, `gdn/convolution` and `text/draft_head_token_ids` keep the
-  direct formats of Section 5; there are no Vision or DFlash2 objects.
+  direct formats of Section 5; Vision objects have the Section 7 formats and shapes, while
+  DFlash2 companions are not projected.
 
 ### 15.2 Execution
 
@@ -887,8 +888,10 @@ to its own rows (Rows axis) or by whole 256-column block ranges (Columns axis), 
 projection through the GGUF Op (`src/ops/linear/gguf/`). Text projections use `AllowA8`, as the
 artifact's Uses declare: decode-width passes quantize the activation to int8 per 32 values and
 use dp4a against the integer block codes; prompts above 16 columns dequantize to FP16 and use the
-SM70 tensor-core GEMM. The proposal head is A16. The profile delivers Text and MTP; startup with
-Vision is rejected.
+SM70 tensor-core GEMM. The proposal head is A16. The profile also binds the
+quantized Vision tower and merger through the shared Qwen3.8 Vision route.
+At TP2, Vision weights are placed on the primary device only; `--vision` enables
+image/video input and allocates its workspace.
 
 ### 15.3 Conformance
 

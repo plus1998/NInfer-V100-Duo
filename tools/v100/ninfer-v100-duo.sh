@@ -35,6 +35,12 @@ The KV pool is shared: each request can reach its context ceiling individually, 
 full-length requests need not fit together. Increase the visual-token budget only if needed;
 the text-only defaults do not fit with Vision. See README.md for four-slot and vision-concurrent
 profiles and measured throughput.
+
+For the GSQ-RCO IQ3_S v3 artifact on 2 x 16 GB, native context and three Vision/text slots,
+pass --vision --vision-max-tokens 2048 --max-context 262144 --prefill-chunk 1024
+--max-concurrency 3 --kv-capacity 400000 (only about 283 MiB free per GPU at startup).
+Use --kv-capacity auto for about 1 GiB of planned margin; the shared KV pool does not
+provide three full 262144-token entitlements.
 EOF
     exit 0
 fi
