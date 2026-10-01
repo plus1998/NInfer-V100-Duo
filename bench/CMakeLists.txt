@@ -35,6 +35,7 @@ ninfer_add_op_bench(ninfer_argmax_bench SOURCES ops/argmax_bench.cu)
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES ops/causal_conv1d_silu_bench.cu)
 ninfer_add_op_bench(ninfer_linear_bench SOURCES ops/linear_bench.cu)
 ninfer_add_op_bench(ninfer_ggml_k_bench SOURCES ops/ggml_k_bench.cu)
+ninfer_add_op_bench(ninfer_gguf_bench SOURCES ops/gguf_bench.cu)
 ninfer_add_op_bench(ninfer_output_stage_bench SOURCES ops/output_stage_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES ops/gdn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench

@@ -363,8 +363,34 @@ int tiled_input(int column, int k) {
 }
 
 // Projects through `sections` output tensors and checks every sampled row against FP64.
+// The A8 vector route's represented activation: each consecutive 32-value group of the BF16 input
+// (in stored column order) becomes step * round(v / step) with step = amax / 127, rounded half to
+// even as the device's __float2int_rn does. Defined from the Op contract, not the kernel.
+std::vector<double> represented_a8(const std::vector<__nv_bfloat16>& input, int k, int tokens,
+                                   bool tiled) {
+    std::vector<double> out(input.size());
+    for (int t = 0; t < tokens; ++t) {
+        for (int group = 0; group < k; group += 32) {
+            float amax = 0.0F;
+            for (int j = group; j < group + 32; ++j) {
+                const int index = tiled ? tiled_input(j, k) : j;
+                amax = std::max(amax, std::abs(__bfloat162float(input[t * k + index])));
+            }
+            const float step    = amax / 127.0F;
+            const float inverse = amax > 0.0F ? 127.0F / amax : 0.0F;
+            for (int j = group; j < group + 32; ++j) {
+                const int index = tiled ? tiled_input(j, k) : j;
+                const float v   = __bfloat162float(input[t * k + index]);
+                out[t * k + j]  = double(step) * std::nearbyint(v * inverse);
+            }
+        }
+    }
+    return out;
+}
+
 void check_projection(const HostWeight& host, int tokens, int sections, bool add, bool tiled,
-                      bool with_workspace, std::mt19937& rng, const std::string& label) {
+                      bool with_workspace, std::mt19937& rng, const std::string& label,
+                      bool allow_a8 = false) {
     const int n = host.n, k = host.k;
     std::vector<__nv_bfloat16> input(std::size_t(k) * tokens);
     for (auto& value : input) { value = __float2bfloat16_rn(float(int(rng() % 2001) - 1000) / 500.0F); }
@@ -400,11 +426,14 @@ void check_projection(const HostWeight& host, int tokens, int sections, bool add
         workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(bytes, 256));
     }
     Tensor xt(x.p, DType::BF16, {k, tokens});
-    ops::detail::gguf_project(xt, weight, outputs.data(), sections, add, tiled, workspace.get(),
-                              nullptr);
+    ops::detail::gguf_project(xt, weight, outputs.data(), sections, add, tiled, allow_a8,
+                              workspace.get(), nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     const bool gemm_route = tokens > 16 && with_workspace;
+    const bool a8_route   = allow_a8 && !gemm_route;
+    const std::vector<double> quantized =
+        a8_route ? represented_a8(input, k, tokens, tiled) : std::vector<double>{};
     double error2 = 0, reference2 = 0, worst = 0;
     const int samples = std::min(n, 64);
     for (int sample = 0; sample < samples; ++sample) {
@@ -419,7 +448,9 @@ void check_projection(const HostWeight& host, int tokens, int sections, bool add
             double magnitude = 0.0;
             for (int j = 0; j < k; ++j) {
                 const int index = tiled ? tiled_input(j, k) : j;
-                const double product = decoded[j] * double(__bfloat162float(input[t * k + index]));
+                const double activation = a8_route ? quantized[t * k + j]
+                                                   : double(__bfloat162float(input[t * k + index]));
+                const double product = decoded[j] * activation;
                 reference += product;
                 magnitude += std::abs(product);
             }
@@ -428,10 +459,11 @@ void check_projection(const HostWeight& host, int tokens, int sections, bool add
             error2 += (actual - reference) * (actual - reference);
             reference2 += reference * reference;
             worst = std::max(worst, std::abs(actual - reference));
-            // One BF16 rounding of the result, FP32 accumulation over K products, and on the
-            // tensor-core route one FP16 rounding of each weight and activation operand.
+            // One BF16 rounding of the result, FP32 accumulation over K products (and, on the A8
+            // route, the FP32 product of the two scales per 8-value term), and on the tensor-core
+            // route one FP16 rounding of each weight and activation operand.
             const double tolerance = std::ldexp(std::abs(reference), -8) +
-                                     (gemm_route ? std::ldexp(magnitude, -10) : 1e-5 * magnitude) +
+                                     (gemm_route ? std::ldexp(magnitude, -10) : 2e-5 * magnitude) +
                                      (add ? std::ldexp(std::abs(reference), -8) : 0.0);
             if (std::abs(actual - reference) > tolerance) {
                 throw std::runtime_error(label + ": row " + std::to_string(row) + " column " +
@@ -444,6 +476,7 @@ void check_projection(const HostWeight& host, int tokens, int sections, bool add
     const double relative = std::sqrt(error2 / reference2);
     std::cout << label << " N=" << n << " K=" << k << " T=" << tokens << " sections=" << sections
               << " add=" << add << " tiled=" << tiled << " ws=" << with_workspace
+              << " a8=" << a8_route
               << " relative_l2=" << relative << '\n';
     if (!(relative < 4e-3)) { throw std::runtime_error(label + ": FP64 oracle mismatch"); }
 }
@@ -504,6 +537,7 @@ int main() {
             check_embedding(host, name(type));
             for (const int tokens : {1, 3, 8, 9}) {
                 check_projection(host, tokens, 1, false, false, false, rng, name(type));
+                check_projection(host, tokens, 1, false, false, false, rng, name(type), true);
             }
             check_projection(host, 40, 1, false, false, true, rng, name(type));
         }
@@ -515,6 +549,7 @@ int main() {
                 {{GgufType::IQ3_S, 5120}, {GgufType::IQ3_XXS, 3072}}, 5120, rng);
             for (const int tokens : {1, 4, 64}) {
                 check_projection(gdn, tokens, 2, false, false, tokens > 16, rng, "gdn qkv|z");
+                check_projection(gdn, tokens, 2, false, false, tokens > 16, rng, "gdn qkv|z", true);
             }
             const HostWeight attention = make_weight({{GgufType::Q2_K, 1536},
                                                       {GgufType::IQ4_XS, 256},
@@ -524,11 +559,20 @@ int main() {
             for (const int tokens : {2, 33}) {
                 check_projection(attention, tokens, 4, false, false, tokens > 16, rng, "attention");
             }
+            // Large segments take the multi-row vector kernels, at every vector width.
+            const HostWeight wide = make_weight({{GgufType::IQ3_S, 2304}, {GgufType::Q4_K, 4096}},
+                                                5120, rng);
+            for (const int tokens : {1, 4, 7}) {
+                check_projection(wide, tokens, 2, true, false, false, rng, "wide");
+                check_projection(wide, tokens, 2, true, false, false, rng, "wide", true);
+            }
             const HostWeight output = make_weight({{GgufType::IQ4_XS, 512}}, 6144, rng);
             const HostWeight shard = make_weight({{GgufType::Q4_K, 512}}, 3072, rng);
             for (const int tokens : {1, 5, 24}) {
                 check_projection(output, tokens, 1, true, true, tokens > 16, rng, "gdn output");
                 check_projection(shard, tokens, 1, true, true, tokens > 16, rng, "gdn output tp2");
+                check_projection(shard, tokens, 1, true, true, tokens > 16, rng, "gdn output tp2",
+                                 true);
             }
             // A 17-column request without workspace falls back to vector passes.
             check_projection(output, 17, 1, true, false, false, rng, "no workspace");

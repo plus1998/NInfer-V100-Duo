@@ -71,76 +71,233 @@ __device__ __forceinline__ void load_bf16x8(const __nv_bfloat16* p, float (&v)[8
     }
 }
 
-// One warp per row; lane j decodes values [8j, 8j+8) of every 256-value block of its row, so a
-// block is decoded exactly once and reused by every column of the pass.
-template <GgufType Type, int Tokens, bool Tiled>
-__global__ void __launch_bounds__(128)
+// A warp owns Rows consecutive rows; lane j decodes values [8j, 8j+8) of every 256-value block.
+// The block loop is outermost, so each lane loads its activation slice of a block once and reuses
+// it for all Rows rows. Weights move in stages of kStageBlocks blocks per row: the warp loads the
+// stage's bytes with coalesced 32-bit loads into registers, publishes them to its shared-memory
+// stage, then prefetches the next stage while decoding the current one. Every registered row length
+// is a multiple of 4 bytes (K/256 is even for every Qwen3.8 shape and every block size is even),
+// and kStageBlocks = 2 keeps each stage 4-byte aligned; gguf_project rejects any other geometry.
+constexpr int kVectorWarps = 4;
+constexpr int kStageBlocks = 2;
+
+// Activation operand of one lane for one 256-value block and one column: its eight values, either
+// as BF16-exact floats (A16) or as int8 codes with the FP32 step of their 32-value group (A8; the
+// four lanes of a group share the step). The A8 represented activation is step * code, so the
+// minimum term of K-quant and IQ1_M weights multiplies the sum of the represented values,
+// step * sum(codes), and every format computes exactly sum(weight * represented activation).
+template <bool A8>
+struct LaneActivation;
+
+template <>
+struct LaneActivation<false> {
+    float v[8];
+};
+
+template <>
+struct LaneActivation<true> {
+    int q[2];
+    float step;
+    float sum;
+};
+
+__device__ __forceinline__ void load_activation(const __nv_bfloat16* p, LaneActivation<false>& a) {
+    load_bf16x8(p, a.v);
+}
+
+__device__ __forceinline__ void load_activation(const __nv_bfloat16* p, LaneActivation<true>& a) {
+    float v[8];
+    load_bf16x8(p, v);
+    float amax = 0.0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { amax = fmaxf(amax, fabsf(v[j])); }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffU, amax, 2));
+    a.step = amax / 127.0F;
+    const float inverse = amax > 0.0F ? 127.0F / amax : 0.0F;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+        unsigned packed = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int code = __float2int_rn(v[4 * part + j] * inverse);
+            packed |= (static_cast<unsigned>(code) & 255U) << (8 * j);
+        }
+        a.q[part] = static_cast<int>(packed);
+    }
+    a.sum = a.step * static_cast<float>(__dp4a(a.q[1], 0x01010101, __dp4a(a.q[0], 0x01010101, 0)));
+}
+
+// A8 form needs the decoded codes per column, so the row loop decodes once and reuses them.
+struct LaneWeightI8 {
+    int q[2];
+    float scale;
+    float minimum;
+};
+
+template <GgufType Type>
+__device__ __forceinline__ LaneWeightI8 decode_lane_i8(const unsigned char* block, int lane) {
+    LaneWeightI8 w;
+    w.minimum = 0.0F;
+    gguf::decode_i8<Type>(block, lane, w.q, w.scale, w.minimum);
+    return w;
+}
+
+__device__ __forceinline__ float lane_dot_i8(const LaneWeightI8& w, const LaneActivation<true>& a,
+                                             float acc) {
+    const int dot = __dp4a(w.q[1], a.q[1], __dp4a(w.q[0], a.q[0], 0));
+    acc = fmaf(w.scale * a.step, static_cast<float>(dot), acc);
+    return fmaf(-w.minimum, a.sum, acc);
+}
+
+// A warp owns Rows consecutive rows; lane j covers values [8j, 8j+8) of every 256-value block.
+// The block loop is outermost, so each lane prepares its activation slice of a block once and
+// reuses it for all Rows rows. Weights move in stages of kStageBlocks blocks per row: the warp
+// loads a stage's bytes with coalesced 32-bit loads into registers, publishes them to its
+// shared-memory stage, then prefetches the next stage while decoding the current one. Every
+// registered row length is a multiple of 4 bytes (K/256 is even for every Qwen3.8 shape and every
+// block size is even), and kStageBlocks = 2 keeps each stage 4-byte aligned; vector_project
+// rejects any other geometry.
+//
+// A8 quantizes each 32-value activation group to int8 with step amax/127 inside the kernel (the
+// quantization depends only on the activation, so every row and launch shape sees the same
+// operands) and dots integer weight codes with dp4a; A16 multiplies decoded FP32 weights by the
+// exact BF16 activation.
+template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
+__global__ void __launch_bounds__(kVectorWarps * 32)
 vector_kernel(const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ rows,
-              int row_count, int first_row, int k, int token_base, Outputs out) {
-    const int local = blockIdx.x * 4 + static_cast<int>(threadIdx.x >> 5);
-    if (local >= row_count) { return; }
-    const int lane             = static_cast<int>(threadIdx.x & 31);
-    constexpr int kBlockBytes  = gguf_block_bytes(Type);
-    const unsigned char* row   = rows + static_cast<std::int64_t>(local) * (k / 256) * kBlockBytes;
-    float sum[Tokens]          = {};
-    for (int block = 0; block < k / 256; ++block) {
-        float w[8];
-        decode8<Type>(row + block * kBlockBytes, lane, w);
-        const int column = input_column<Tiled>(block * 256 + lane * 8, k);
+              int row_count, int first_row, int k, int tokens, int token_base, Outputs out) {
+    constexpr int kBlockBytes = gguf_block_bytes(Type);
+    constexpr int kRowWords   = kStageBlocks * kBlockBytes / 4; // 32-bit words per row per stage
+    constexpr int kStageWords = Rows * kRowWords;
+    constexpr int kLaneWords  = (kStageWords + 31) / 32;
+    __shared__ __align__(16) unsigned stage[kVectorWarps][kStageWords];
+
+    const int warp  = static_cast<int>(threadIdx.x >> 5);
+    const int lane  = static_cast<int>(threadIdx.x & 31);
+    const int first = (blockIdx.x * kVectorWarps + warp) * Rows;
+    if (first >= row_count) { return; }
+    const int live_rows           = min(Rows, row_count - first);
+    const int blocks              = k / 256;
+    const std::int64_t row_stride = static_cast<std::int64_t>(blocks) * kBlockBytes / 4;
+    const auto* base = reinterpret_cast<const unsigned*>(rows) + first * row_stride;
+
+    unsigned prefetch[kLaneWords];
+    const auto load_stage = [&](int stage_block) {
 #pragma unroll
-        for (int t = 0; t < Tokens; ++t) {
-            float a[8];
-            load_bf16x8(x + static_cast<std::int64_t>(t) * k + column, a);
-#pragma unroll
-            for (int j = 0; j < 8; ++j) { sum[t] = fmaf(w[j], a[j], sum[t]); }
+        for (int i = 0; i < kLaneWords; ++i) {
+            const int word = lane + 32 * i;
+            const int r    = word / kRowWords;
+            const int w    = word - r * kRowWords;
+            prefetch[i]    = word < kStageWords && r < live_rows
+                                 ? __ldg(base + r * row_stride + stage_block * kBlockBytes / 4 + w)
+                                 : 0U;
         }
+    };
+
+    float sum[Rows][MaxTokens] = {};
+    const auto* staged = reinterpret_cast<const unsigned char*>(stage[warp]);
+    load_stage(0);
+    for (int stage_block = 0; stage_block < blocks; stage_block += kStageBlocks) {
+#pragma unroll
+        for (int i = 0; i < kLaneWords; ++i) {
+            const int word = lane + 32 * i;
+            if (word < kStageWords) { stage[warp][word] = prefetch[i]; }
+        }
+        __syncwarp();
+        if (stage_block + kStageBlocks < blocks) { load_stage(stage_block + kStageBlocks); }
+#pragma unroll
+        for (int b = 0; b < kStageBlocks; ++b) {
+            const int column = input_column<Tiled>((stage_block + b) * 256 + lane * 8, k);
+            LaneActivation<A8> a[MaxTokens];
+#pragma unroll
+            for (int t = 0; t < MaxTokens; ++t) {
+                // Padding columns load column 0 (always valid); their sums are never stored.
+                const int source = t < tokens ? t : 0;
+                load_activation(x + static_cast<std::int64_t>(source) * k + column, a[t]);
+            }
+#pragma unroll
+            for (int r = 0; r < Rows; ++r) {
+                const unsigned char* block = staged + r * kRowWords * 4 + b * kBlockBytes;
+                if constexpr (A8) {
+                    const LaneWeightI8 w = decode_lane_i8<Type>(block, lane);
+#pragma unroll
+                    for (int t = 0; t < MaxTokens; ++t) { sum[r][t] = lane_dot_i8(w, a[t], sum[r][t]); }
+                } else {
+                    float w[8];
+                    decode8<Type>(block, lane, w);
+#pragma unroll
+                    for (int t = 0; t < MaxTokens; ++t) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) { sum[r][t] = fmaf(w[j], a[t].v[j], sum[r][t]); }
+                    }
+                }
+            }
+        }
+        __syncwarp();
     }
 #pragma unroll
-    for (int t = 0; t < Tokens; ++t) {
+    for (int r = 0; r < Rows; ++r) {
 #pragma unroll
-        for (int delta = 16; delta > 0; delta >>= 1) {
-            sum[t] += __shfl_xor_sync(0xffffffffU, sum[t], delta);
+        for (int t = 0; t < MaxTokens; ++t) {
+#pragma unroll
+            for (int delta = 16; delta > 0; delta >>= 1) {
+                sum[r][t] += __shfl_xor_sync(0xffffffffU, sum[r][t], delta);
+            }
         }
     }
-    if (lane == 0) {
+    if (lane < live_rows) {
 #pragma unroll
-        for (int t = 0; t < Tokens; ++t) { out.store(first_row + local, token_base + t, sum[t]); }
+        for (int r = 0; r < Rows; ++r) {
+            if (r == lane) {
+#pragma unroll
+                for (int t = 0; t < MaxTokens; ++t) {
+                    if (t < tokens) { out.store(first_row + first + r, token_base + t, sum[r][t]); }
+                }
+            }
+        }
     }
 }
 
-template <GgufType Type, bool Tiled>
+template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
+void launch_vector_shape(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
+                         int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
+    constexpr int kRowsPerCta = kVectorWarps * Rows;
+    const dim3 grid(static_cast<unsigned>((segment.rows + kRowsPerCta - 1) / kRowsPerCta));
+    vector_kernel<Type, MaxTokens, Rows, Tiled, A8><<<grid, kVectorWarps * 32, 0, stream>>>(
+        x, static_cast<const unsigned char*>(segment.data), segment.rows, first_row, k, tokens,
+        token_base, out);
+}
+
+// Small segments keep one row per warp so the grid still covers every SM; large ones share each
+// activation slice across several rows. Wider passes trade rows for activation registers.
+template <GgufType Type, bool Tiled, bool A8>
 void launch_vector_type(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
                         int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>((segment.rows + 3) / 4));
-    const auto* rows = static_cast<const unsigned char*>(segment.data);
-    switch (tokens) {
-#define NINFER_GGUF_VECTOR_CASE(T)                                                             \
-    case T:                                                                                    \
-        vector_kernel<Type, T, Tiled><<<grid, 128, 0, stream>>>(x, rows, segment.rows,          \
-                                                                first_row, k, token_base, out); \
-        break;
-        NINFER_GGUF_VECTOR_CASE(1)
-        NINFER_GGUF_VECTOR_CASE(2)
-        NINFER_GGUF_VECTOR_CASE(3)
-        NINFER_GGUF_VECTOR_CASE(4)
-        NINFER_GGUF_VECTOR_CASE(5)
-        NINFER_GGUF_VECTOR_CASE(6)
-        NINFER_GGUF_VECTOR_CASE(7)
-        NINFER_GGUF_VECTOR_CASE(8)
-#undef NINFER_GGUF_VECTOR_CASE
-    default:
+    const bool wide = segment.rows >= 2048;
+#define NINFER_GGUF_SHAPE(T, R)                                                                 \
+    launch_vector_shape<Type, T, R, Tiled, A8>(x, segment, first_row, k, tokens, token_base, out, \
+                                               stream)
+    if (tokens == 1) {
+        if (wide) { NINFER_GGUF_SHAPE(1, 4); } else { NINFER_GGUF_SHAPE(1, 1); }
+    } else if (tokens <= 4) {
+        if (wide) { NINFER_GGUF_SHAPE(4, 4); } else { NINFER_GGUF_SHAPE(4, 1); }
+    } else if (tokens <= kGgufVectorTokens) {
+        if (wide) { NINFER_GGUF_SHAPE(8, 2); } else { NINFER_GGUF_SHAPE(8, 1); }
+    } else {
         throw std::logic_error("gguf vector pass: invalid column count");
     }
+#undef NINFER_GGUF_SHAPE
 }
 
-template <bool Tiled>
+template <bool Tiled, bool A8>
 void launch_vector(const __nv_bfloat16* x, const GgufSegment& segment, int first_row, int k,
                    int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
     switch (segment.type) {
-#define NINFER_GGUF_TYPE_CASE(T)                                                              \
-    case GgufType::T:                                                                         \
-        launch_vector_type<GgufType::T, Tiled>(x, segment, first_row, k, tokens, token_base,  \
-                                               out, stream);                                  \
+#define NINFER_GGUF_TYPE_CASE(T)                                                                 \
+    case GgufType::T:                                                                            \
+        launch_vector_type<GgufType::T, Tiled, A8>(x, segment, first_row, k, tokens, token_base, \
+                                                   out, stream);                                 \
         break;
         NINFER_GGUF_TYPE_CASE(IQ4_XS)
         NINFER_GGUF_TYPE_CASE(IQ3_S)
@@ -301,16 +458,24 @@ void gemm_project(const __nv_bfloat16* x, const Weight& weight, const Outputs& o
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool Tiled>
+template <bool Tiled, bool A8>
 void vector_project(const __nv_bfloat16* x, const Weight& weight, const Outputs& out, int tokens,
                     cudaStream_t stream) {
+    if ((weight.k / 256) % kStageBlocks != 0) {
+        throw std::invalid_argument("gguf vector projection requires K to be a multiple of 512");
+    }
+    for (int s = 0; s < weight.gguf_segment_count; ++s) {
+        if (reinterpret_cast<std::uintptr_t>(weight.gguf_segments[s].data) % 4 != 0) {
+            throw std::invalid_argument("gguf vector projection requires 4-byte aligned segments");
+        }
+    }
     for (int token = 0; token < tokens; token += kGgufVectorTokens) {
         const int width   = std::min(kGgufVectorTokens, tokens - token);
         const auto* input = x + static_cast<std::int64_t>(token) * weight.k;
         int first_row     = 0;
         for (int s = 0; s < weight.gguf_segment_count; ++s) {
-            launch_vector<Tiled>(input, weight.gguf_segments[s], first_row, weight.k, width, token,
-                                 out, stream);
+            launch_vector<Tiled, A8>(input, weight.gguf_segments[s], first_row, weight.k, width,
+                                     token, out, stream);
             first_row += weight.gguf_segments[s].rows;
         }
     }
@@ -318,14 +483,18 @@ void vector_project(const __nv_bfloat16* x, const Weight& weight, const Outputs&
 
 template <bool Tiled>
 void project(const __nv_bfloat16* x, const Weight& weight, const Outputs& out, int tokens,
-             WorkspaceArena* workspace, cudaStream_t stream) {
+             bool allow_a8, WorkspaceArena* workspace, cudaStream_t stream) {
     if (tokens > kVectorMaxTokens && workspace != nullptr && gemm_admits(weight, out) &&
         workspace->capacity() - workspace->used() >=
             gemm_workspace_bytes(weight.n, weight.k, tokens)) {
         gemm_project<Tiled>(x, weight, out, tokens, *workspace, stream);
         return;
     }
-    vector_project<Tiled>(x, weight, out, tokens, stream);
+    if (allow_a8) {
+        vector_project<Tiled, true>(x, weight, out, tokens, stream);
+    } else {
+        vector_project<Tiled, false>(x, weight, out, tokens, stream);
+    }
 }
 
 __global__ void embedding_kernel(const std::int32_t* __restrict__ ids, Weight weight,
@@ -400,7 +569,8 @@ void validate_gguf_weight(const Weight& weight, const char* label) {
 }
 
 void gguf_project(const Tensor& x, const Weight& weight, const Tensor* outputs, int count, bool add,
-                  bool tiled_gdn_input, WorkspaceArena* workspace, cudaStream_t stream) {
+                  bool tiled_gdn_input, bool allow_a8, WorkspaceArena* workspace,
+                  cudaStream_t stream) {
     validate_gguf_weight(weight, "gguf projection");
     if (x.dtype != DType::BF16 || !x.is_contiguous() || x.ne[0] != weight.k || x.ne[1] <= 0 ||
         x.ne[2] != 1 || x.ne[3] != 1 || reinterpret_cast<std::uintptr_t>(x.data) % 16 != 0) {
@@ -412,9 +582,9 @@ void gguf_project(const Tensor& x, const Weight& weight, const Tensor* outputs, 
     const Outputs out = make_outputs(weight, x, outputs, count, add);
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     if (tiled_gdn_input) {
-        project<true>(input, weight, out, x.ne[1], workspace, stream);
+        project<true>(input, weight, out, x.ne[1], allow_a8, workspace, stream);
     } else {
-        project<false>(input, weight, out, x.ne[1], workspace, stream);
+        project<false>(input, weight, out, x.ne[1], allow_a8, workspace, stream);
     }
 }
 

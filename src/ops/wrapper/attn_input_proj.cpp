@@ -96,7 +96,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
     if (weight.qtype == QType::GGUF) {
         const Tensor outputs[]{q, k, gate, v};
-        detail::gguf_project(x, weight, outputs, 4, false, false, workspace, stream);
+        detail::gguf_project(x, weight, outputs, 4, false, false, policy == LinearPolicy::AllowA8,
+                             workspace, stream);
         return;
     }
     if (weight.qtype == QType::BF16_CTRL) {
@@ -459,7 +460,8 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                          ec.dev[slot]->stream, false, workspace[slot]);
         } else if (w.qtype == QType::GGUF) {
             const Tensor outputs[]{q_dst[slot], k_dst[slot], gate_dst[slot], v_dst[slot]};
-            detail::gguf_project(x[slot], w, outputs, 4, false, false, workspace[slot],
+            detail::gguf_project(x[slot], w, outputs, 4, false, false, policy == LinearPolicy::AllowA8,
+                                 workspace[slot],
                                  ec.dev[slot]->stream);
         } else if (w.qtype == QType::NVFP4) {
             detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],

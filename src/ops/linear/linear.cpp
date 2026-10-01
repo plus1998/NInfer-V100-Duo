@@ -97,7 +97,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::ggml_k_linear(x, w, out, workspace, stream);
         return;
     case QType::GGUF:
-        detail::gguf_project(x, w, &out, 1, false, false, workspace, stream);
+        detail::gguf_project(x, w, &out, 1, false, false, policy == LinearPolicy::AllowA8, workspace,
+                             stream);
         return;
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, workspace, stream);

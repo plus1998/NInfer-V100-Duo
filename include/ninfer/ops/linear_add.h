@@ -75,18 +75,19 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
-// Exact GDN input permutation fused into a GGML_K projection. The represented input
+// Exact GDN input permutation fused into a GGML_K or GGUF projection. The represented input
 // is BF16 [128,3,H,T] (H=16, or H=8 per TP2 rank); the packed weight columns are
 // [128,H,3]. No weight is requantized: ideal is residual + W @ transpose_heads(x).
 // FP64 decodes W's original scales/codes and applies this permutation before the dot.
-// Wide prefill uses caller workspace for the GGML_K SM70 tensor-core route. Split form adds the
-// residual on rank 0 once and all-reduces both partial projections, following
+// GGML_K admits A16Only; GGUF also admits AllowA8 (int8 activation groups of 32, see
+// gguf_project). Wide prefill uses caller workspace for the SM70 tensor-core route. Split form
+// adds the residual on rank 0 once and all-reduces both partial projections, following
 // linear_add_row_parallel.
-void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                        WorkspaceArena& workspace, cudaStream_t stream);
 void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                        const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
+                       const std::array<Tensor, 2>& staging, LinearPolicy policy,
                        const std::array<WorkspaceArena*, 2>& workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events);

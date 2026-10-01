@@ -116,7 +116,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         auto scope = ws.scope();
         Tensor projected = ws.alloc(DType::BF16, {gate_up_weight.n, t}, 256);
         if (gate_up_weight.qtype == QType::GGUF) {
-            detail::gguf_project(x, gate_up_weight, &projected, 1, false, false, &ws, stream);
+            detail::gguf_project(x, gate_up_weight, &projected, 1, false, false,
+                                 policy == LinearPolicy::AllowA8, &ws, stream);
         } else {
             detail::ggml_k_project_split(x, gate_up_weight, &projected, 1, false,
                                          stream, false, &ws);
@@ -272,7 +273,8 @@ void validate_swiglu_split_pair(const std::array<Tensor, 2>& x, const std::array
 // the same fallback Q4's OWN tp1 "Materialized" route already takes above T=48
 // (src/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp).
 void q4_column_parallel_rank(const Tensor& x, const Weight& w, Tensor& out,
-                             WorkspaceArena* workspace, cudaStream_t stream) {
+                             WorkspaceArena* workspace, cudaStream_t stream,
+                             LinearPolicy policy = LinearPolicy::A16Only) {
     if (workspace == nullptr) {
         throw std::invalid_argument("linear_swiglu column-parallel: Q4 requires caller workspace");
     }
@@ -285,7 +287,8 @@ void q4_column_parallel_rank(const Tensor& x, const Weight& w, Tensor& out,
     if (w.qtype == QType::GGML_K) {
         detail::ggml_k_project_split(x, w, &projected, 1, false, stream, false, workspace);
     } else if (w.qtype == QType::GGUF) {
-        detail::gguf_project(x, w, &projected, 1, false, false, workspace, stream);
+        detail::gguf_project(x, w, &projected, 1, false, false, policy == LinearPolicy::AllowA8,
+                             workspace, stream);
     } else {
         linear(x, w, projected, stream);
     }
@@ -324,7 +327,8 @@ void issue_swiglu_column_rank(int rank, const std::array<Tensor, 2>& x,
         detail::fp8_linear_swiglu_dispatch_shard(x[slot], w[slot], out[slot], policy,
                                                  workspace[slot], ec.dev[slot]->stream);
     } else {
-        q4_column_parallel_rank(x[slot], w[slot], out[slot], workspace[slot], ec.dev[slot]->stream);
+        q4_column_parallel_rank(x[slot], w[slot], out[slot], workspace[slot], ec.dev[slot]->stream,
+                                policy);
     }
 }
 

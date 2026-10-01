@@ -96,7 +96,8 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
         return;
     }
     if (w.qtype == QType::GGUF) {
-        detail::gguf_project(x, w, &residual_out, 1, true, false, ws, stream);
+        detail::gguf_project(x, w, &residual_out, 1, true, false, policy == LinearPolicy::AllowA8, ws,
+                             stream);
         return;
     }
     if (w.qtype == QType::BF16_CTRL) {
@@ -434,23 +435,28 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
 
 namespace {
 void block_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, bool add,
-                      WorkspaceArena* workspace, cudaStream_t stream) {
+                      LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    validate_policy(policy);
+    if (w.qtype != QType::GGUF && policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("GGML_K GDN output admits only A16");
+    }
     if (w.qtype == QType::GGUF) {
-        detail::gguf_project(x, w, &residual, 1, add, true, workspace, stream);
+        detail::gguf_project(x, w, &residual, 1, add, true, policy == LinearPolicy::AllowA8, workspace,
+                             stream);
     } else {
         detail::ggml_k_project_split(x, w, &residual, 1, add, stream, true, workspace);
     }
 }
 } // namespace
 
-void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual,
+void ggml_k_gdn_output(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                        WorkspaceArena& workspace, cudaStream_t stream) {
-    block_gdn_output(x, w, residual, true, &workspace, stream);
+    block_gdn_output(x, w, residual, true, policy, &workspace, stream);
 }
 
 void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
                        const std::array<Tensor, 2>& residual,
-                       const std::array<Tensor, 2>& staging,
+                       const std::array<Tensor, 2>& staging, LinearPolicy policy,
                        const std::array<WorkspaceArena*, 2>& workspace,
                        const ExecutionContext& ec,
                        const PeerEvents& events) {
@@ -458,7 +464,7 @@ void ggml_k_gdn_output(const std::array<Tensor, 2>& x, const std::array<Weight, 
     validate_add_split_residency(x, w, residual, ec);
     detail::for_each_rank(ec, [&](int rank) {
         Tensor target = residual[rank];
-        block_gdn_output(x[rank], w[rank], target, rank == 0, workspace[rank],
+        block_gdn_output(x[rank], w[rank], target, rank == 0, policy, workspace[rank],
                          ec.dev[rank]->stream);
     });
     allreduce_sum(residual, staging, ec, events);

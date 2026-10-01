@@ -312,10 +312,12 @@ void require_ggml_k_parent(const Weight& weight, std::int32_t rows, LinearPolicy
 }
 
 void project_ggml_k(const Tensor& x, const Weight& weight, const Tensor& qkv,
-                    const Tensor& z, cudaStream_t stream, WorkspaceArena* workspace = nullptr) {
+                    const Tensor& z, cudaStream_t stream, WorkspaceArena* workspace = nullptr,
+                    LinearPolicy policy = LinearPolicy::A16Only) {
     const Tensor outputs[]{qkv, z};
     if (weight.qtype == QType::GGUF) {
-        detail::gguf_project(x, weight, outputs, 2, false, false, workspace, stream);
+        detail::gguf_project(x, weight, outputs, 2, false, false,
+                             policy == LinearPolicy::AllowA8, workspace, stream);
         return;
     }
     detail::ggml_k_project_split(x, weight, outputs, 2, false, stream, false, workspace);
@@ -344,7 +346,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, 10240, cols, "qkv");
         require_matrix(z, 6144, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        project_ggml_k(x, weight, qkv, z, stream, workspace);
+        project_ggml_k(x, weight, qkv, z, stream, workspace, policy);
         return;
     }
 
@@ -496,7 +498,7 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, 2048, 2048, 6144, geometry, workspace, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                project_ggml_k(x_flat, weight, projected, z_flat, stream, &workspace);
+                project_ggml_k(x_flat, weight, projected, z_flat, stream, &workspace, policy);
             });
         return;
     }
@@ -669,7 +671,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                        conv_record, query, key, value, z, geometry, workspace, stream,
                        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                           project_ggml_k(x_flat, weight, record_flat, z_flat, stream, &workspace);
+                           project_ggml_k(x_flat, weight, record_flat, z_flat, stream, &workspace,
+                                          policy);
                        });
         return;
     }
@@ -1364,7 +1367,7 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
         const Weight& w = query_key_value_z_weight[slot];
         if (is_block_parent(w)) {
             project_ggml_k(x[slot], w, qkv_dst[slot], z_dst[slot], ec.dev[slot]->stream,
-                           workspace[slot]);
+                           workspace[slot], policy);
         } else if (w.qtype == QType::NVFP4) {
             detail::nvfp4_gdn_input_dispatch_shard(x[slot], w, qkv_dst[slot], z_dst[slot], policy,
                                                    workspace[slot], ec.dev[slot]->stream);
@@ -1616,7 +1619,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
         compose_shard_conv(x[slot], projected, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                if (is_block_parent(w)) {
-                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
+                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena, policy);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
                                                                           policy, &arena, stream);
@@ -1738,7 +1741,7 @@ void gdn_input_proj_conv_record_column_parallel(
         compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                if (is_block_parent(w)) {
-                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena);
+                                   project_ggml_k(x_flat, w, out, z_flat, stream, &arena, policy);
                                } else if (w.qtype == QType::NVFP4) {
                                    detail::nvfp4_gdn_input_dispatch_shard(x_flat, w, out, z_flat,
                                                                           policy, &arena, stream);

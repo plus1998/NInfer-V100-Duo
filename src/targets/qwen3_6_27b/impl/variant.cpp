@@ -279,7 +279,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     if (weight.qtype == QType::GGML_K || weight.qtype == QType::GGUF) {
-        ops::ggml_k_gdn_output(hidden, weight, residual, workspace, stream);
+        ops::ggml_k_gdn_output(hidden, weight, residual, text_policy(weight), workspace, stream);
         return;
     }
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
@@ -719,7 +719,8 @@ void Variant::gdn_output_projection(const std::array<Tensor, 2>& hidden,
                                     const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec, const ops::PeerEvents& ev) {
     if (weight[0].qtype == QType::GGML_K || weight[0].qtype == QType::GGUF) {
-        ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
+        ops::ggml_k_gdn_output(hidden, weight, residual, staging, text_policy(weight[0]),
+                               workspace, ec, ev);
         return;
     }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),
