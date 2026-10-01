@@ -82,6 +82,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops {
 
@@ -116,7 +117,9 @@ bool enable_peer_access(const ExecutionContext& ec);
 // moved-from instance holds no events and must not be passed to a collective (the ops reject it).
 class PeerEvents {
 public:
-    explicit PeerEvents(const ExecutionContext& ec);
+    // `direct_peer` must be the result of enable_peer_access(ec): true only when direct P2P was
+    // qualified for this pair. It additionally allocates the one-shot all-reduce channel below.
+    explicit PeerEvents(const ExecutionContext& ec, bool direct_peer = false);
     ~PeerEvents();
 
     PeerEvents(const PeerEvents&)            = delete;
@@ -138,9 +141,26 @@ public:
                pull_done_[0] != nullptr && pull_done_[1] != nullptr;
     }
 
+    // Device storage of the one-shot all-reduce, one set per rank, all on that rank's device and
+    // zero-initialized: two receive slots the PEER writes, one arrival flag per CTA the peer
+    // writes, and one sequence counter per CTA that only this rank writes. Null without direct P2P.
+    struct DirectChannel {
+        std::array<void*, 2> receive{};
+        std::array<unsigned*, 2> flags{};
+        std::array<unsigned*, 2> sequence{};
+    };
+
+    [[nodiscard]] const DirectChannel* direct() const noexcept {
+        return direct_.receive[0] != nullptr ? &direct_ : nullptr;
+    }
+
 private:
+    void release_direct() noexcept;
+
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
+    std::array<int, 2> devices_{-1, -1};
+    DirectChannel direct_{};
 };
 
 /**
@@ -163,6 +183,20 @@ private:
  * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
  * host synchronization between them.
  */
+//
+// ONE-SHOT ROUTE. With a direct-P2P `events` (constructed with direct_peer = true) and a payload of
+// at most kDirectAllreduceMaxElements elements whose count is a multiple of 8 and whose buffers are
+// 16-byte aligned, the call is one kernel per rank instead of the event/copy/combine sequence
+// above: each CTA stores its slice of buffer[r] into the peer's receive slot over NVLink, publishes
+// a per-CTA sequence number in the peer's flag word, waits for the peer's matching number in its
+// own flag word, and combines in place. `staging` is validated but unused. The combine is the same
+// FP32 sum and single BF16 rounding, so the result is bit-identical to the copy route. Sequence
+// numbers live in device memory, so the route needs no host state and replays inside captured
+// graphs; receive slots alternate by sequence parity, which is what lets a rank start its next
+// call while the peer is still reading the previous one. The route assumes both ranks issue the
+// same sequence of collectives, which every TP2 caller does by construction.
+inline constexpr std::int64_t kDirectAllreduceMaxElements = 64 * 2048;
+
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events);
 

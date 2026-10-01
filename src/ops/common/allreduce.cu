@@ -23,6 +23,9 @@
 // expressed through the API that CUDA graph capture accepts.
 #include "ninfer/ops/allreduce.h"
 
+#include "ops/common/bf16_vector.cuh"
+
+#include <cuda_bf16.h>
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
 #include <cstddef>
@@ -31,6 +34,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -247,6 +251,83 @@ void require_disjoint(const void* first, std::size_t first_bytes, const void* se
 }
 #endif
 
+// --- One-shot direct all-reduce (see allreduce.h, ONE-SHOT ROUTE) ---------------------------------
+//
+// CTA c owns elements [c*kDirectSlice, (c+1)*kDirectSlice) of every call, whatever the payload
+// size, so its receive region and its sequence counter are its own. Write-after-read safety: a
+// rank's CTA c can begin call s+1 only after its call s finished, which needed the peer's flag s;
+// the peer publishes flag s before reading its call-s data, so it may still be reading slot s&1
+// while this rank writes call s+1 -- into slot (s+1)&1. It cannot write slot s&1 again (call s+2)
+// before the peer's flag s+1, which the peer publishes only after finishing call s.
+constexpr int kDirectThreads   = 256;
+constexpr int kDirectSlicePacks = kDirectThreads;             // one 8-element pack per thread
+constexpr int kDirectMaxCtas   = static_cast<int>(kDirectAllreduceMaxElements / (8 * kDirectSlicePacks));
+constexpr std::size_t kDirectSlotBytes = static_cast<std::size_t>(kDirectAllreduceMaxElements) * 2;
+static_assert(kDirectMaxCtas * 8 * kDirectSlicePacks == kDirectAllreduceMaxElements);
+// About ten seconds of spinning at V100 clocks: far beyond any legitimate skew between the two
+// ranks, so reaching it means the peer will never arrive (a caller broke the paired-call rule).
+constexpr long long kDirectSpinCycles = 15'000'000'000LL;
+
+// The copy route's combine (residual_add_pair in ops/kernel/residual_add.cuh): x + y in FP32 with
+// one BF16 round-to-nearest-even. That header defines kernels, so the two lines are restated here.
+__device__ __forceinline__ __nv_bfloat162 combine_pair(__nv_bfloat162 y, __nv_bfloat162 x) {
+    return __floats2bfloat162_rn(__low2float(x) + __low2float(y), __high2float(x) + __high2float(y));
+}
+
+__device__ __forceinline__ unsigned load_volatile(const unsigned* p) {
+    return *static_cast<const volatile unsigned*>(p);
+}
+
+__launch_bounds__(kDirectThreads) __global__ void direct_allreduce_kernel(
+    Bf16x8Pack* __restrict__ x, std::int64_t packs, const Bf16x8Pack* own_receive,
+    Bf16x8Pack* peer_receive, const unsigned* own_flags, unsigned* peer_flags,
+    unsigned* sequence) {
+    __shared__ unsigned call;
+    const int cta = static_cast<int>(blockIdx.x);
+    if (threadIdx.x == 0) { call = sequence[cta] + 1U; }
+    __syncthreads();
+    const unsigned s    = call;
+    const std::int64_t i = static_cast<std::int64_t>(cta) * kDirectSlicePacks + threadIdx.x;
+    const std::int64_t slot = static_cast<std::int64_t>(s & 1U) * (kDirectAllreduceMaxElements / 8);
+    const bool live = i < packs;
+    Bf16x8Pack own{};
+    if (live) {
+        own = x[i];
+        peer_receive[slot + i] = own;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *static_cast<volatile unsigned*>(peer_flags + cta) = s;
+        const long long started = clock64();
+        while (static_cast<int>(load_volatile(own_flags + cta) - s) < 0) {
+            if (clock64() - started > kDirectSpinCycles) { __trap(); }
+        }
+        __threadfence();
+        sequence[cta] = s;
+    }
+    __syncthreads();
+    if (live) {
+        const uint4 raw = __ldcg(reinterpret_cast<const uint4*>(own_receive + slot + i));
+        Bf16x8Pack peer;
+        static_assert(sizeof(peer) == sizeof(raw));
+        memcpy(&peer, &raw, sizeof(raw));
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            own.pair[pair] = combine_pair(peer.pair[pair], own.pair[pair]);
+        }
+        x[i] = own;
+    }
+}
+
+bool direct_admits(const std::array<Tensor, 2>& buffer, std::int64_t count) {
+    if (count <= 0 || count % 8 != 0 || count > kDirectAllreduceMaxElements) { return false; }
+    for (const Tensor& t : buffer) {
+        if ((reinterpret_cast<std::uintptr_t>(t.data) & 15U) != 0) { return false; }
+    }
+    return true;
+}
+
 } // namespace
 
 bool enable_peer_access(const ExecutionContext& ec) {
@@ -306,7 +387,7 @@ bool enable_peer_access(const ExecutionContext& ec) {
     }
 }
 
-PeerEvents::PeerEvents(const ExecutionContext& ec) {
+PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer) {
     require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
     const CurrentDeviceGuard guard;
     // Create through a local table so a mid-way failure destroys what was already created instead
@@ -327,9 +408,54 @@ PeerEvents::PeerEvents(const ExecutionContext& ec) {
     }
     inputs_ready_ = {created[0], created[1]};
     pull_done_    = {created[2], created[3]};
+    devices_      = {ec.dev[0]->device, ec.dev[1]->device};
+    if (!direct_peer) { return; }
+    // Setup-time allocation, before any capture: two receive slots, then flags and counters.
+    const std::size_t words = 2 * static_cast<std::size_t>(kDirectMaxCtas);
+    const std::size_t bytes = 2 * kDirectSlotBytes + words * sizeof(unsigned);
+    try {
+        for (int rank = 0; rank < 2; ++rank) {
+            CurrentDeviceGuard::set(devices_[static_cast<std::size_t>(rank)]);
+            void* storage = nullptr;
+            CUDA_CHECK(cudaMalloc(&storage, bytes));
+            direct_.receive[static_cast<std::size_t>(rank)] = storage;
+            auto* words_base = reinterpret_cast<unsigned*>(static_cast<std::uint8_t*>(storage) +
+                                                           2 * kDirectSlotBytes);
+            direct_.flags[static_cast<std::size_t>(rank)]    = words_base;
+            direct_.sequence[static_cast<std::size_t>(rank)] = words_base + kDirectMaxCtas;
+            CUDA_CHECK(cudaMemset(storage, 0, bytes));
+            // The compute streams are non-blocking; retire the legacy-stream fill before use.
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    } catch (...) {
+        release_direct();
+        for (cudaEvent_t event : created) { (void)cudaEventDestroy(event); }
+        inputs_ready_ = {nullptr, nullptr};
+        pull_done_    = {nullptr, nullptr};
+        throw;
+    }
+}
+
+void PeerEvents::release_direct() noexcept {
+    for (int rank = 0; rank < 2; ++rank) {
+        void*& storage = direct_.receive[static_cast<std::size_t>(rank)];
+        if (storage == nullptr) { continue; }
+        int previous = 0;
+        (void)cudaGetDevice(&previous);
+        (void)cudaSetDevice(devices_[static_cast<std::size_t>(rank)]);
+        const cudaError_t status = cudaFree(storage);
+        if (status != cudaSuccess) {
+            std::fprintf(stderr, "CUDA cleanup failed during cudaFree: %s: %s\n",
+                         cudaGetErrorName(status), cudaGetErrorString(status));
+        }
+        (void)cudaSetDevice(previous);
+        storage = nullptr;
+    }
+    direct_ = DirectChannel{};
 }
 
 PeerEvents::~PeerEvents() {
+    release_direct();
     for (std::array<cudaEvent_t, 2>* group : {&inputs_ready_, &pull_done_}) {
         for (cudaEvent_t& event : *group) {
             if (event == nullptr) { continue; }
@@ -344,9 +470,11 @@ PeerEvents::~PeerEvents() {
 }
 
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
-    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_) {
+    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_), devices_(other.devices_),
+      direct_(other.direct_) {
     other.inputs_ready_ = {nullptr, nullptr};
     other.pull_done_    = {nullptr, nullptr};
+    other.direct_       = DirectChannel{};
 }
 
 PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
@@ -354,6 +482,8 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     // held, in exactly one place.
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
+    std::swap(devices_, other.devices_);
+    std::swap(direct_, other.direct_);
     return *this;
 }
 
@@ -377,6 +507,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 
     const std::size_t bytes = buffer[0].bytes();
     if (bytes == 0) { return; }
+    const std::int64_t count = buffer[0].numel();
 
 #ifndef NDEBUG
     for (int rank = 0; rank < 2; ++rank) {
@@ -390,6 +521,24 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 #endif
 
     const CurrentDeviceGuard guard;
+
+    if (const PeerEvents::DirectChannel* direct = events.direct();
+        direct != nullptr && direct_admits(buffer, count)) {
+        const std::int64_t packs = count / 8;
+        const unsigned ctas =
+            static_cast<unsigned>((packs + kDirectSlicePacks - 1) / kDirectSlicePacks);
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            direct_allreduce_kernel<<<ctas, kDirectThreads, 0, ec.dev[rank]->stream>>>(
+                static_cast<Bf16x8Pack*>(buffer[r].data), packs,
+                static_cast<const Bf16x8Pack*>(direct->receive[r]),
+                static_cast<Bf16x8Pack*>(direct->receive[1 - r]), direct->flags[r],
+                direct->flags[1 - r], direct->sequence[r]);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
 
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < 2; ++rank) {

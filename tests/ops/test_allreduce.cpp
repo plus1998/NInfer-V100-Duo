@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <optional>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -388,9 +390,23 @@ int main() {
                               : "unavailable (CUDA stages the device-to-device copies through "
                                 "host memory)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents copy_events(ec);
 
     int failures = 0;
+    // Every case runs against the event/copy route and, with direct P2P, the one-shot route too.
+    std::vector<std::pair<const char*, const ops::PeerEvents*>> routes{{"copy", &copy_events}};
+    std::optional<ops::PeerEvents> direct_events;
+    if (peer_access) {
+        direct_events.emplace(ec, true);
+        if (direct_events->direct() == nullptr) {
+            std::cerr << "direct PeerEvents allocated no one-shot channel\n";
+            return 1;
+        }
+        routes.push_back({"one-shot", &*direct_events});
+    }
+    for (const auto& [route, events_ptr] : routes) {
+    const ops::PeerEvents& events = *events_ptr;
+    std::cout << "== route " << route << '\n';
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
     failures += run_allreduce_case("allreduce_sum [5120]", 5120, 1, 101u, ec, events);
     // The real row-parallel residual: a full 48-token prefill chunk, 2-D.
@@ -406,8 +422,12 @@ int main() {
     failures += run_allgather_case("allgather_rows [5120,3] uneven", 2, 1, 5120, 203u, ec, events);
     failures += run_allgather_case("allgather_rows [7,2] minimal", 1, 1, 7, 204u, ec, events);
 
+    // Payloads around the one-shot limit: largest admitted, one pack beyond it (copy route).
+    failures += run_allreduce_case("allreduce_sum [5120,25]", 5120, 25, 107u, ec, events);
+    failures += run_allreduce_case("allreduce_sum [131080]", 131080, 1, 108u, ec, events);
     failures += run_chained_case(ec, events);
     failures += run_microbenchmark(ec, events);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " allreduce\n";
     return failures ? 1 : 0;

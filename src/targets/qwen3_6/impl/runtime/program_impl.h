@@ -305,8 +305,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             throw;
         }
         CUDA_CHECK(cudaSetDevice(previous));
-        (void)ops::enable_peer_access(execution);
-        peer_events.emplace(execution);
+        const bool direct_peer = ops::enable_peer_access(execution);
+        peer_events.emplace(execution, direct_peer);
         if (plan.use_cuda_graph) {
             // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
             // capturable, and the fork/join pair must outlive every capture.
