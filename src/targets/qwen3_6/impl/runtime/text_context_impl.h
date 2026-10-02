@@ -1425,6 +1425,18 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                         finalize_at_end);
 }
 
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              TP2FeatureSink& sink) {
+    if (!tp2() || begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("TP2 feature prefill chunk is invalid");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill,
+                            finalize_at_end, nullptr, &sink);
+}
+
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end) {
@@ -1441,6 +1453,20 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
     NullTap tap;
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
                         finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
+                                              std::uint32_t begin, std::uint32_t nominal_length,
+                                              VisionPrefillSession& vision, bool finalize_at_end,
+                                              TP2FeatureSink& sink) {
+    if (!tp2() || begin >= input.token_ids.size() || nominal_length == 0 ||
+        nominal_length > input.token_ids.size() - begin) {
+        throw std::invalid_argument("TP2 multimodal feature prefill chunk is invalid");
+    }
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    return prefill_impl_tp2(tokens.subspan(begin, nominal_length), TextPrefill{tokens, begin},
+                            finalize_at_end, &multimodal, &sink);
 }
 
 
@@ -1847,8 +1873,9 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
 }
 
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
-                                 const std::array<Tensor, 2>& staging) {
+                                 const std::array<Tensor, 2>& staging, TP2FeatureSink* sink) {
     const bool prefill = ph == Phase::Prefill;
+    if (sink != nullptr) { sink->begin(x); }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const auto fidx     = static_cast<std::size_t>(ModelConfig::full_idx(layer));
@@ -1896,6 +1923,11 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                 auto scope_1 = tp_->work->scope();
                 mlp_tail_tp2(a.post_attn_norm, b.post_attn_norm, a.mlp, b.mlp, x, ph, staging);
             }
+        }
+        if (sink != nullptr && std::binary_search(sink->layers.begin(), sink->layers.end(), layer)) {
+            for_each_rank(ec(), [&](int rank) {
+                sink->capture_layer(rank, layer, x[static_cast<std::size_t>(rank)], stream_for(rank));
+            });
         }
     }
 }
@@ -1960,7 +1992,8 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end,
-                                                 const MultimodalPrefill* multimodal) {
+                                                 const MultimodalPrefill* multimodal,
+                                                 TP2FeatureSink* sink) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -2098,7 +2131,13 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging);
+        run_layers_tp2(x, Phase::Prefill, staging, sink);
+        if (sink != nullptr) {
+            for_each_rank(execution, [&](int rank) {
+                sink->capture_positions(rank, positions[static_cast<std::size_t>(rank)],
+                                        stream_for(rank));
+            });
+        }
 
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2254,6 +2293,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
             state_for(rank).copy_slot(linear_state_current_slot_,
                                       linear_state_rewrite_checkpoint_slot_, stream_for(rank));
         });
+    }
+
+    if (sink != nullptr) {
+        sink->consume_prefill_chunk(checkpoint_rel > 0 && len == checkpoint_rel);
     }
 
     prefill_rewrite_checkpoint_frontier_ = -1;
@@ -2631,7 +2674,8 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
                                       ops::GqaExecutionEnvelope envelope,
                                       const std::array<Tensor, 2>& hidden,
                                       const std::array<Tensor, 2>& logits,
-                                      const std::array<Tensor, 2>& target_tokens) {
+                                      const std::array<Tensor, 2>& target_tokens,
+                                      TP2FeatureSink* sink) {
     if (!tp2()) { throw std::logic_error("tensor-parallel target verify requires a peer"); }
     const ExecutionContext& execution       = ec();
     const std::array<WorkspaceArena*, 2> ws = workspaces();
@@ -2699,7 +2743,14 @@ void TextContext::target_verify_batch(const std::array<Tensor, 2>& ids,
             Tensor flat_ids = ids[r].view({columns});
             ops::embedding(flat_ids, rank == 0 ? *embed_ : *embed_peer_, x[r], stream_for(rank));
         });
-        run_layers_tp2(x, Phase::Verify, staging);
+        run_layers_tp2(x, Phase::Verify, staging, sink);
+        if (sink != nullptr) {
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                Tensor flattened = cache_positions[r].view({columns});
+                sink->capture_positions(rank, flattened, stream_for(rank));
+            });
+        }
 
         std::array<Tensor, 2> flat_hidden;
         std::array<Tensor, 2> flat_logits;

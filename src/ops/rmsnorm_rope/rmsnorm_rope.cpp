@@ -67,8 +67,14 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     if (batch < 1 || batch > kMaximumBatch) {
         throw std::invalid_argument("rmsnorm_rope: pair B must be 1..8");
     }
-    require_tensor(q, DType::BF16, {kHeadDim, kQueryHeads, width, batch}, "q");
-    require_tensor(k, DType::BF16, {kHeadDim, kKeyHeads, width, batch}, "k");
+    const std::int32_t query_heads = q.ne[1];
+    const std::int32_t key_heads = k.ne[1];
+    if (!((query_heads == kQueryHeads && key_heads == kKeyHeads) ||
+          (query_heads == kQueryHeads / 2 && key_heads == kKeyHeads / 2))) {
+        throw std::invalid_argument("rmsnorm_rope: pair head counts must be 32/8 or 16/4");
+    }
+    require_tensor(q, DType::BF16, {kHeadDim, query_heads, width, batch}, "q");
+    require_tensor(k, DType::BF16, {kHeadDim, key_heads, width, batch}, "k");
     require_tensor(q_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "q norm weight");
     require_tensor(k_norm_weight, DType::BF16, {kHeadDim, 1, 1, 1}, "k norm weight");
     require_tensor(positions, DType::I32, {width, batch, 1, 1}, "positions");
@@ -77,8 +83,8 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     // sm_70 port: plain per-head RMSNorm (eps 1e-6, no offset) then full-128 split-half 1-D
     // RoPE (theta 1e7), all in place -- the header formula, unfused.
     const std::int32_t columns = width * batch;
-    Tensor q_view              = q.view({kHeadDim, kQueryHeads, columns});
-    Tensor k_view              = k.view({kHeadDim, kKeyHeads, columns});
+    Tensor q_view              = q.view({kHeadDim, query_heads, columns});
+    Tensor k_view              = k.view({kHeadDim, key_heads, columns});
     Tensor position_view       = positions.view({columns});
     detail::dflash2_rmsnorm_rope_launch(q_view, q_norm_weight, position_view, 1.0e-6F, 1.0e7F,
                                         stream);

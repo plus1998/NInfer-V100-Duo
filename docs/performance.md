@@ -913,6 +913,331 @@ and color correctly. This does not establish correctness or speed with three
 near-full contexts occupied. The 400K setting has little startup margin; `auto`
 is safer when maximum shared KV capacity is not required.
 
+### V100 DFlash2 Op measurements (not end-to-end)
+
+On 2026-10-01, one Tesla V100-SXM2-16GB (CUDA 12.8, `sm_70`) measured the
+production public Ops using cold-cache CUDA Graph launches, 256 MiB cache flush,
+30 repetitions, three requests, seven proposals per request (`W=8`, `T=24`):
+
+| Op | Shape | Median latency |
+|---|---|---:|
+| candidate selector | 16 candidates, 7 steps, greedy | 89.088 µs |
+| candidate selector | 16 candidates, 7 steps, stochastic | 102.400 µs |
+| dynamic grouped conv prepare | 5120 hidden, 1280 BF16 control rows | 123.904 µs |
+| dynamic grouped conv add | 4096 input channels, W8 | 105.472 µs |
+| dynamic grouped conv add | 17408 input channels, W8 | 525.312 µs |
+| symmetric SWA (TP2 rank) | 16Q/4KV, 2048 window, FP16 context V | 1,338.368 µs |
+| draft QKV (TP2 rank) | W8 `[3072,5120]` → Q2048/K512/V512, T=24 | 294.912 µs |
+| draft QKV (TP2 rank) | same, T=48 | 324.608 µs |
+| feature projection (TP2 rank) | W8 `[5120,12800]`, T=24 | 388.096 µs |
+| attention output projection (TP2 rank) | W8 `[5120,2048]`, T=24 | 58.368 µs |
+
+Reproduction: `build-v100-duo/bench/ninfer_candidate_selector_bench --steps 7
+--batch 3 --repeat 30`, `build-v100-duo/bench/ninfer_dynamic_grouped_conv_prepare_bench
+--width 8 --batch 3 --repeat 30`, and
+`build-v100-duo/bench/ninfer_linear_dynamic_grouped_conv_add_bench --width 8
+--batch 3 --k 4096 --repeat 30` (repeat for `--k 17408`). The BF16 control
+projection now reuses its weight rows across groups of eight columns rather
+than using a separate matvec per column; its full numerical test passes.
+The SWA value is `build-v100-duo/bench/ninfer_swa_dflash2_bench --width 8
+--batch 3 --context 2048` with the same cold-cache protocol; at a 96-token
+context it measures 108.544 µs and at 2048 it uses two graph nodes. A
+64-way rather than 32-way KV split measured 1,388.544 µs and was discarded.
+For the dedicated DFlash2 route, reducing the 2048-context split capacity
+from 32 to 16 or 8 measured 1,348.608 / 1,338.368 µs (W=8/B=3), while
+4 splits regressed to 1,566.720 µs. The 8-split variant measured
+2,595.840 µs at W=16/B=3/context2048, 623.616 µs at
+W=8/B=3/context1024, and 99.328 µs at context96. Earlier 32-split
+W=16/B=3/context2048 measured 2,476.032 µs, so the 8-split
+configuration is not universally faster; only W=8/B=3 selects eight splits.
+The W=16/B=3 route retains 32 splits (remeasured 2,478.080 µs), and
+W=8/B=1 and B=8 retain 32 splits (450.560 / 3,240.960 µs at context2048).
+All choices need a full-round speed check once Program exists.
+QKV values use `build-v100-duo/bench/ninfer_dflash2_tp2_attn_input_bench`
+with the same cold-cache protocol; T=1/8/32 measured 45.056/106.496/347.136 µs.
+T=24 uses one fused SIMT launch; T=32/48 use three section-local Tensor Core
+launches. The initial all-SIMT T=48 route measured 574.464 µs and was replaced;
+the three-launch Tensor Core route at T=24 measured 343.040 µs and was discarded.
+These are single-rank Op results, not an inference-speed comparison.
+The last two Linear values use `build-v100-duo/bench/ninfer_linear_bench
+--qtype w8 --n 5120 --k 12800 --t 24 --warmup 4 --repeat 30` (change
+`--k` to `2048` for attention output). Feature T=1/8/48 measured
+147.456/219.136/380.928 µs; attention output T=48 measured 71.680 µs.
+The benchmark prints RTX 5090 reference-bandwidth columns; only the actual
+V100 device and directly measured latency are applicable here. TP2 collective
+costs and the five-layer schedule are not part of these Linear measurements.
+These figures do **not** include the five-layer draft, context KV, TP2
+collectives, target verification, prefill, or request scheduling; they cannot
+establish DFlash2-versus-MTP throughput.
+
+The real GSQ v3 companion's 66 tensors contain 2,226,792,960 payload bytes;
+its standalone TP2 shard plan places 1,307,650,560 bytes per rank, including
+replicated selector codebooks required for arbitrary candidate-ID lookup.
+The real two-GPU binding test also loaded complete Vision + Text + optimized
+proposal + DFlash2 weights **without MTP**, checked both rank-local model views
+and compared its weight-arena footprint against the identical Vision + Text +
+optimized proposal + MTP profile:
+
+| Weight arena | Rank 0 | Rank 1 |
+|---|---:|---:|
+| MTP selected | 6,741,169,664 B | 6,445,450,240 B |
+| DFlash2 selected | 7,874,585,600 B | 7,578,866,176 B |
+| Increase | 1,133,415,936 B | 1,133,415,936 B |
+
+These are **weight-only** figures, not the memory of a running DFlash2 Engine.
+DFlash2 now loads the companion and runs TP2 decode; the earlier Vision + MTP +
+400K KV profile (283 MiB free per rank) is **not** a DFlash2 memory profile and
+must not be reused without a separate capacity measurement.
+
+#### DFlash2 versus MTP3: one-request decode
+
+Measured October 2, 2026 on 2 × V100-SXM2 16 GB, CUDA 12.8, GSQ-RCO IQ3_S v3,
+TP2, INT8 KV, CUDA Graph, optimized proposal head, 2304 max context and 256
+prefill chunk. The same counting-prompt fixture produces 128 output tokens,
+including one prefill token; the reported decode interval measures 127 output
+tokens. The independent three-repetition unprofiled probe yields **96.4 tok/s
+for MTP3** and **43.7 tok/s for DFlash2-K7**. The single-request probes below
+measure `GenerationTimings.decode_seconds` and report the corresponding
+accepted-draft counts; Nsight tracing perturbs elapsed time, so their rates are
+diagnostic rather than the published steady-state comparison.
+
+| Graph route | Decode seconds, 127 tokens | Rounds | Accepted / drafted | First position accepted / rounds |
+|---|---:|---:|---:|---:|
+| MTP3 | 1.318 | 42 | 85 / 125 | 40 / 42 |
+| DFlash2-K1 | 2.789 | 81 | 45 / 81 | 45 / 81 |
+| DFlash2-K3 | 2.534 | 67 | 59 / 201 | 38 / 67 |
+| DFlash2-K7 | 2.911 (traced) | 59 | 68 / 396 | not recorded |
+| DFlash2-K15 | 4.305 (traced) | 49 | 78 / 677 | not recorded |
+
+The bottleneck is **both** acceptance and cost per round. K3 requires 67
+target verify rounds versus MTP3's 42, while its mean decode round takes
+about 37.8 ms versus MTP3's 31.4 ms. Position one is accepted in 38/67 DFlash2
+rounds versus 40/42 MTP rounds; widening the block leaves much of its target
+verification and five-layer draft computation unused after early rejection.
+Nsight Systems node-level tracing of K3 shows the global top-16 kernel at
+approximately 3.67 ms per rank per round (136 calls across two devices) and
+many GGUF small-column vector kernels in the five-layer draft and target.
+These GPU kernel sums include both ranks and cannot be added to get wall time.
+No measured DFlash2 speedup over MTP is established. The scope here is one
+short counting prompt, not general model quality or three-request throughput.
+
+On October 2, 2026, a 1024-row tiled, parallel-reduction top-16 implementation
+passed the independent `ninfer_linear_topk_test` and the real Engine K15/B3
+Graph + Vision regression. On the same artifact and K3/B1 Graph fixture, its
+single 127-token decode interval was **2.292 s** (67 rounds, 59/201 accepted),
+down from 2.534 s before this change. A separate three-repetition, unprofiled
+decode-only comparison measured **55.45 tok/s for DFlash2-K3** and **96.36 tok/s
+for MTP3**. These are different K settings from the earlier K7 comparison; the
+older table and kernel trace describe the pre-optimization implementation.
+The improvement does not overcome the lower DFlash2 acceptance or other
+per-round costs; it establishes no DFlash2 speed advantage over MTP3.
+
+On October 2, 2026, a separate unprofiled B=3 probe on the same two V100-SXM2
+16 GB GPUs, CUDA 12.8 and GSQ v3 artifact used INT8 KV, Graph, the optimized
+proposal head, a 2304-token per-request context and three repetitions of three
+simultaneously submitted 128-output-token requests. Wall-clock aggregate output
+rates were **66.12 tok/s for DFlash2-K3** (612 request-rounds, 522/1836 accepted
+drafts) and **21.57 tok/s for DFlash2-K7** (519 request-rounds, 615/3543
+accepted drafts). These rates include request submission and prefill, unlike
+the B=1 decode-only comparison; K7 saves rounds but pays substantially more
+per round on this workload. The planned paired B=3 MTP3 Graph control did not
+start: its Graph preparation consumed 41,943,040 bytes on device 0 against a
+37,748,736-byte planned allowance. Consequently this B=3 probe compares K3
+and K7 only; it establishes neither a B=3 DFlash2-versus-MTP3 ratio nor
+general behavior on longer prompts or contexts.
+
+#### NVFP4 companion: one-request DFlash2 versus ordinary and MTP3
+
+Measured October 2, 2026 on 2 × V100-SXM2 16 GB, CUDA 12.8, the explicit
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` v3 artifact with its embedded
+DFlash2 companion, TP2, INT8 KV, Graph, optimized proposal head, 2304 max
+context, 256 prefill chunk and the same counting-prompt fixture. Each route
+warmed up for 16 tokens and generated 128 output tokens three times; rates
+count only the 127-token decode interval per repetition, not loading or prefill.
+The real Engine test also compared the 24-token greedy DFlash2 result to the
+ordinary route and exercised B1 integration state/reuse checks.
+
+| Route | Three-repeat decode tok/s | Versus ordinary | Versus MTP3 |
+|---|---:|---:|---:|
+| Ordinary (no speculation) | 42.20–42.21 | 1.00× | 0.34× |
+| DFlash2-K3 | 69.81 | **1.65×** | 0.57× |
+| DFlash2-K7 | 68.26 | **1.62×** | 0.56× |
+| MTP3 | 122.45–122.48 | **2.90×** | 1.00× |
+
+NVFP4 thus delivers a real DFlash2 gain over ordinary decode on this fixture,
+but K3 and K7 remain slower than MTP3. K7 does not recover the difference.
+This is a short greedy B1 result, not a long-context or concurrent-service
+speed claim. Unlike GSQ's GGUF output head, the NVFP4 artifact's optimized
+proposal uses Q4G64; the current TP2 DFlash2 top-16 path only supports that
+optimized head for this profile, not its FP8 full vocabulary head. Its DFlash2
+companion matrices remain W8, not NVFP4.
+
+On the same dual-V100 GSQ v3 counting-prompt fixture, a further unprofiled
+three-repetition, 127-token decode-only sweep of startup-fixed K=1,2,3 with
+Graph, B1, optimized head and INT8 target KV measured **51.19 / 55.01 /
+55.42 tok/s**, respectively; the paired MTP3 controls were 96.32 / 96.37 /
+96.40 tok/s. The real Engine integration checks passed for all three K.
+Reducing draft width to one or two does not improve this one-request workload
+over K3, so merely shortening the five-layer proposal is not a demonstrated
+remedy for its end-to-end throughput. The earlier traced K3 run attributes
+roughly 3.16 s summed across both devices to 51,682 GGUF vector launches;
+that sum is not elapsed wall time or an isolated draft cost. Further GGUF
+kernel changes need a matched whole-inference speed measurement, not just a
+single-Op microbenchmark.
+
+On the same 2 × V100-SXM2 16 GB / CUDA 12.8 GSQ v3 artifact and K3/B1 Graph
+counting-prompt fixture, a specialized Q4_K A16 vector route uses two warps
+instead of four for vocabulary-height segments with 2–4 columns; other GGUF
+formats and the A8 route retain their existing dispatch. At the Q4_K
+`[124160,5120]` TP2 output-head benchmark shape and T=4, A16 projection
+fell from **1978.42 to 1487.51 µs** (one-rank Op timing); the neighboring
+IQ3_S `[17408,5120]` T=4 A8 path measured 141.41 / 141.77 µs.
+Independent stored-block decode with an FP64 dot oracle on the actual
+`[65536,5120]` optimized-head shard at T=2/3/4 passed, as did the real
+K3/B3 Graph + Vision integration check. Same-command three-repetition
+unprofiled K3/B1 decode-only measurements were **55.4185 before** and
+**57.0249 tok/s after**, with MTP3 controls of 96.3662 and 98.3277 tok/s.
+Both routes sped up in the latter session; the ~2.9% raw DFlash2 change is
+not wholly attributable to the kernel. The ratio to the MTP3 control moved
+from 0.5751 to 0.5799, or roughly 0.8% relative. This is a small
+workload-specific improvement, not a general DFlash2-versus-MTP advantage;
+larger or long-context workloads need their own verification.
+
+Further one-rank Q4_K A16 T4 launch-geometry controls on the same V100 used
+2 warps × 8 rows (1570.00 µs) and 1 warp × 4 rows (1389.67 µs), versus
+the retained 2 warps × 4 rows (1487.51 µs). The 2 × 8 variant was discarded.
+The 1 × 4 variant keeps the stored-block decode and arithmetic unchanged;
+the independent FP64 GGUF oracle passes at the real `[65536,5120]` optimized
+head shape for T=2/3/4, and K3/B3 Graph + Vision passes. An unprofiled
+K3/B1 three-repeat decode-only run measured 57.3214 tok/s versus 57.0249
+tok/s for the earlier 2 × 4 route, with paired MTP3 controls of 98.6012
+and 98.3277 tok/s, respectively. The relative-control difference is under
+0.3%; no robust inference-speed improvement over the 2 × 4 route is
+established from these sessions, despite the reproducible Op improvement.
+Holding the 1 × 4 launch fixed and prefetching four Q4_K blocks per stage
+instead of two measured **1703.32 µs** at the same T4 head shape; it was
+rejected and the two-block code restored. A rebuild and `ninfer_gguf_test`
+passed after the restore. This Op result does not justify another full decode
+speed claim.
+Reading Q4_K blocks directly from global memory instead of the shared-memory
+weight stage also lost at the same T4 head shape (1554.59 µs versus
+1389.67 µs with staging), so that experiment was removed as well.
+
+A same-prompt K3/B1 Graph control with the **full** proposal head produced
+55/212 accepted drafts in 71 rounds, with 37/71 at position one; its
+127-token decode interval was 2.497 s. The optimized head produced 59/201 in
+67 rounds, with 38/67 at position one (2.292 s). Thus removing the 131072-row
+shortlist does not recover the missing first-position acceptance on this
+fixture; the head also costs more to evaluate. This comparison does not
+establish why the draft disagrees with the target.
+
+Nsight Systems node traces on the optimized-head K3 route show the tiled
+top-16 kernel falling from 3.663 ms to 0.057 ms per rank call; the new finish
+stage adds 0.019 ms per rank call. Across both GPUs and 67 rounds, the sum of
+top-16 GPU-kernel durations falls from 499.6 to 11.8 ms. The sum of GGUF
+vector-kernel durations remains about 3.16 s across 51,682 launches in both
+traces. GPU sums from two cards are **not** wall time and must not be read as
+the elapsed cost of an isolated stage; the unprofiled 55.45 tok/s comparison
+above establishes the end-to-end result. The five-layer draft has no
+independent real-checkpoint numerical oracle yet, so low acceptance cannot
+be assigned to model quality, quantization, or a specific implementation error.
+
+Additional same-prompt controls after the top-16 change (single 127-token
+decode, K3/B1 Graph) give 70 rounds and 56/210 accepted drafts with BF16
+target KV, versus 67 rounds and 59/201 with INT8 target KV; first-position
+acceptance was 38 rounds in either case. These are separate generated
+trajectories, not matched-token numerical comparisons. An INT8-KV K7 run
+needed 58 rounds and accepted 68/396 drafts, with per-position acceptances
+`34,14,5,5,4,3,3`: the extra positions save nine verify rounds relative to
+K3, but add five-layer draft and target verification work every round. Its
+single decode interval was 2.702 s under the profiling fixture, versus
+2.292 s for K3. Neither changing KV storage nor increasing K establishes
+the cause of the low first-position acceptance.
+
+The artifact's conversion report records 21 DFlash2 `q8_g32_fp16`
+`grouped_absmax` matrices derived from the companion checkpoint and 45
+direct BF16 companion objects. The target Text GGUF matrices retain their
+mixed IQ/GGUF formats. Compared with a BF16-companion/BF16-target run this
+is a distinct numerical pairing; it is a plausible source of lower draft
+agreement, **not** a demonstrated cause. The original BF16 companion files
+are not available on this host, and no matched-input, layer-by-layer
+real-checkpoint oracle has been run. Do not attribute a correctness bug or
+quantization loss from the acceptance figures alone.
+
+The same K3/INT8-KV optimized-head fixture run **eager** instead of Graph
+gave 68 rounds, 58/204 accepted drafts and 37/68 first-position accepts
+(2.301 s); Graph gave 67 rounds, 59/201 and 38/67 (2.292 s). These are
+separate trajectories; the similar result is evidence against a Graph-only
+acceptance regression, not a per-token Graph/eager equivalence proof.
+
+For an unprofiled three-repetition K7/B1 Graph decode-only comparison after
+the top-16 change, the same 127-token counting-prompt fixture measured
+**47.05 tok/s DFlash2-K7** versus **96.30 tok/s MTP3**. The K3 result above
+is therefore faster than K7 on this fixture even after removing the earlier
+top-16 bottleneck; K7's extra verify/draft columns do not pay for themselves.
+
+With the opt-in `NINFER_DFLASH2_INSPECT_FIRST=1` readback on the same K3/B1
+Graph INT8-KV counting prompt, excluding the four warmup rounds leaves 67
+measured rounds. The target first-position greedy argmax appears in the
+draft's unary top-16 on **62/67** rounds; the selector chooses it on **38/67**.
+Of the 29 first-position misses, **24** have the target token in the top-16,
+and **5** do not. Target argmax is the highest unary-score candidate in 32
+rounds; the selector chooses that token on all 32 and adds six successful
+non-top-1 choices. Thus simply replacing the selector with unary top-1 would
+reduce, not improve, first-position matches on this trajectory. The 24
+in-support misses motivate comparing edge scores and target preferences on
+the **same hidden states**; top-16 membership alone is not an oracle for
+which path the companion ought to prefer. This is one greedy counting prompt,
+not an acceptance estimate for other workloads. Device readback is diagnostic
+only and is excluded from the throughput numbers.
+
+An additional **eager** K3/B1 run on the same counting prompt enabled both
+`NINFER_DFLASH2_INSPECT_FIRST=1` and `NINFER_DFLASH2_INSPECT_EDGE=1`.
+Excluding its four warmup rounds leaves 68 rounds, 58/204 accepted drafts,
+37/68 first-position matches, and 63/68 first-position target tokens in the
+unary top-16. For every measured round, a CPU FP64 sum of the stored BF16
+predecessor codebook, projected hidden, and successor codebook, added to the
+emitted FP32 unary score, selected the **same first token** as the GPU
+selector (68/68). In the 26 in-support first-position misses, the selected
+token's recomputed edge exceeded the target token's edge by 0.0614 / 1.3797 /
+6.9768 (minimum / median / maximum), whereas the BF16 target logit favored
+the target token by 3.375 / 5.125 / 30.125. This argues against a gross
+candidate-ID, codebook orientation, or first-position selector-reduction
+error; it does **not** independently validate the draft's five-layer hidden,
+W8 companion weights, or agreement with a BF16 companion. The eager and Graph
+runs are separate generated trajectories, and both diagnostics synchronize
+and read device data: their elapsed times are not speed measurements. The
+next numerical question is whether the draft hidden and unary logits agree
+with an independent companion calculation on matched features; no original
+BF16 companion checkpoint is present locally.
+
+As a **recorded-first-position counterfactual only**, multiplying the
+reconstructed edge interaction by 2 instead of 1 selects the target greedy
+argmax on 42/68 rather than 37/68 counting-prompt rounds. A separate eager
+K3/B1 128-output run with the fixed prompt “Write a short story about a
+lighthouse keeper on a stormy night.” had 64 measured rounds after six warmup
+rounds, 63/191 accepted drafts and 37/64 first-position matches; the target
+was in the unary top-16 on 60/64, and the CPU recomputation reproduced the
+GPU first choice on all 64. On those recorded rows, doubling the interaction
+still matches only 37/64, while unary-only matches 40/64. These are
+**different prompts** and fixed-prefix what-ifs: changing an earlier draft
+would change later states and verification, so none of these counts predicts
+end-to-end acceptance or speed. The opposite directions rule out adopting a
+global edge multiplier from this small sample; 1Cat-vLLM's selector-alignment
+study similarly separates candidate support from actual proposal/target
+overlap rather than treating an in-sample argmax sweep as a speed result.
+
+A separate English lighthouse-story prompt (same artifact, K3/B1 Graph,
+INT8 KV, 128 generated tokens) produced 55 measured rounds after its
+six-round warmup, with 72/165 accepted drafts and 32/55 first-position
+accepts. The first target argmax was in the unary top-16 on **51/55** rounds;
+**19** first-position misses had it in support and **4** did not. The target
+argmax was unary rank zero in 32 rounds, while the selector gained one
+non-rank-zero match and lost one rank-zero match. These diagnostics show the
+same broad in-support disagreement on a second prompt, not that changing the
+selector would improve acceptance; both traces read back GPU tensors and
+their elapsed times are not throughput comparisons.
+
 An HTTP request for a long story, with thinking disabled and 513 output
 tokens, used a 40-token prompt. After one warmup, the 200K/two-entitlement
 profile completed one request in 6.965 s (73.66 aggregate output tok/s) and
@@ -990,6 +1315,109 @@ build-v100-duo/bench/ninfer_gguf_bench   # per-format GGUF projection bandwidth
 `src/artifact/{storage_layouts,materializer,reader}.cpp`,
 `src/targets/qwen3_6_27b/impl/{load/bindings,variant}.cpp` and
 `src/ops/linear/ggml_k/ggml_k.cu`.
+
+## V100 Duo October 2026 rebuild: two-artifact comparison
+
+October 2, 2026: `cmake --build build-v100-duo -j` completed (381 actions) on
+2 × V100-SXM2 16 GB, CUDA 12.8. The explicit artifacts were
+`/home/gareth/models/qwen3_8_27b_nvfp4.ninfer` and
+`out/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`. This is a **same-build,
+cross-artifact** comparison after the DFlash2 reader/runtime additions; no
+pre-change binary was retained for a matched old/new regression measurement.
+Do not interpret a difference from an older table as a causal effect of these
+changes. Both artifacts' Text/MTP paths run with DFlash2 residency **off**.
+The rebuilt artifact-reader test checked both artifact projections; the real
+DFlash2 K3/B1/Graph/INT8 Engine integration test passed on **each** artifact.
+
+Selected MTP3 production-server startup checks after the rebuild (CUDA Graph,
+TP2, INT8 KV, 2 × 16 GB; reported `free-after-startup` is the primary GPU):
+
+| Artifact / profile | Shared KV resolved | Primary free | Scope |
+|---|---:|---:|---|
+| NVFP4, Vision, C2, 155,648 max context, 1,024 chunk, 2,048 visual budget | 155,648 | 713 MiB | Started; not a new full-context image decode test |
+| NVFP4, text, C1, 200,000 max context, 1,024 chunk | 200,000 | 153 MiB | Near-OOM startup boundary; not a serving recommendation |
+| GSQ-RCO, Vision, C3, native 262,144 max context, 1,024 chunk, 2,048 visual budget, KV auto | 344,832 | 1.20 GiB | Started; not a three-full-context qualification |
+
+Earlier real-image and concurrent request checks are in the
+[Vision](#v100-duo-vision-and-concurrency) and
+[GSQ](#v100-duo-gsq-rco-iq3_s-gguf-blocks) sections; these three new startup
+checks do not repeat them or prove end-to-end speed for those profiles.
+
+### Matched code prompts
+
+`ninfer_v100_corpus --code-chat` rendered the same 512, 10,000 and 30,000
+token tasks with each artifact's tokenizer; the paired `.ids` files matched
+byte for byte. Each point used the public `ninfer_bench` Engine, TP2, INT8 KV,
+CUDA Graph, optimized MTP3, 131,072 max context, 4,096 prefill chunk,
+`-pg LENGTH,512 --warmup 0 -r 2`, two independent requests without prompt
+reuse and 512 measured decode outputs after the prefill token. A graph-prime
+request precedes the measured requests. Rates are the benchmark's two-rep
+arithmetic means; model load and graph preparation are excluded. The benchmark
+disables default stops and does not judge answer quality.
+
+| Model | Prompt | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| NVFP4 | 512 | 878.00 | 128.60 |
+| GSQ-RCO | 512 | 1,358.11 | 110.03 |
+| NVFP4 | 10,000 | 1,123.35 | 120.12 |
+| GSQ-RCO | 10,000 | 1,857.14 | 107.61 |
+| NVFP4 | 30,000 | 1,061.93 | 119.22 |
+| GSQ-RCO | 30,000 | 1,683.49 | 104.55 |
+
+### First SDK request capture
+
+The local-only capture harness (`tools/v100/agent_prefill/capture.mjs`) captured
+first-turn Pi, Codex and Claude Agent SDK payloads, without forwarding to a
+model service. Each artifact's tokenizer generated the same IDs for each
+captured prompt: 1,298, 11,720 and 16,368 tokens respectively. The Codex
+capture differs by two tokens from the older September capture. Run the public
+benchmark with the same 131,072-context configuration, `-pg TOKENS,8
+--warmup 0 -r 1`; the measured request has no previous prefix reuse. TTFT
+is `reps[0].timings.first_token_seconds`: first Engine output token, excluding
+load, SDK startup, network and any Agent tool actions.
+
+| Model | Agent | TTFT s | Prefill tok/s |
+|---|---|---:|---:|
+| NVFP4 | Pi | 1.248 | 1,040.13 |
+| GSQ-RCO | Pi | 0.912 | 1,423.59 |
+| NVFP4 | Codex | 10.452 | 1,121.37 |
+| GSQ-RCO | Codex | 6.213 | 1,886.42 |
+| NVFP4 | Claude | 14.759 | 1,109.08 |
+| GSQ-RCO | Claude | 8.978 | 1,823.25 |
+
+### Natural-completion MTP sweep
+
+`tools/v100/ninfer-v100-duo.sh` ran one resident server per model/window with
+`--max-context 131072 --prefill-chunk 4096 --no-thinking --no-prefix-reuse`,
+optimized proposal, Graph, TP2, INT8 KV and MTP `draft-tokens=3|4|5`.
+Each server handled three identical single-user Chat Completions requests:
+the 74-token pelican/SVG/HTML prompt in [the earlier sweep](#v100-duo-decode-pelican-html),
+`reasoning_effort:none`, `temperature:0`, `seed:42`, `max_tokens:12288`.
+All 18 responses ended with a stop token and had zero prefix-cache hits.
+The peak is the highest 5-second logged decode throughput interval with one
+running request, not a whole-request maximum. The average is the arithmetic
+mean of the three `(completion_tokens - 1) / timings_seconds.decode` rates;
+both exclude load and prefill. Different models/windows produce *different
+completions*, so this is not a fixed-output speed or quality comparison.
+
+| Model | MTP | Output tokens per run | Peak 5-second tok/s | Mean whole-request tok/s |
+|---|---:|---:|---:|---:|
+| NVFP4 | 3 | 9,668 | 148.2 | 138.058 |
+| NVFP4 | 4 | 9,324 | 156.4 | 142.871 |
+| NVFP4 | 5 | 9,881 | 176.0 | 151.448 |
+| GSQ-RCO | 3 | 6,986 | 121.0 | 109.607 |
+| GSQ-RCO | 4 | 5,887 | 110.4 | 95.164 |
+| GSQ-RCO | 5 | 6,531 | 119.6 | 93.754 |
+
+For NVFP4, MTP5 increases this prompt's mean but the older output inspection
+favored MTP3 for the requested pelican leg animation. GSQ favors MTP3 by
+mean; GSQ-MTP5's three full-request rates ranged 86.798–97.260 tok/s, so
+its mean is less stable than the other rows. No independent output-quality
+judgment was made for the new GSQ responses. To reproduce the server sweep,
+replace the artifact path and window `N` in the command under
+[V100 Duo decode: pelican HTML](#v100-duo-decode-pelican-html), adding
+`--max-context 131072 --prefill-chunk 4096`; use the same JSON request and
+extract `request_done` timings and five-second throughput intervals as there.
 
 ## V100 Duo maximum-context capacity sweep
 

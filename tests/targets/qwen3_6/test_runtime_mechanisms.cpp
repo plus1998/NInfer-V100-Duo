@@ -143,6 +143,26 @@ void test_round_layout() {
            "K=15 DFlash storage is backend-owned");
     expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
+
+    ninfer::LayoutBuilder dflash2_builder;
+    q36::RoundStateLayout dflash2 = q36::begin_round_state_layout(
+        dflash2_builder,
+        q36::RoundStateSpec{.hidden = 32, .output_rows = 128, .batch_capacity = 3,
+                            .draft_window = 15, .enable_dflash2 = true});
+    q36::complete_round_state_layout(dflash2_builder, dflash2);
+    const auto dflash2_bytes = dflash2_builder.finish(256);
+    expect(dflash2.dflash2_decode.has_value() &&
+               dflash2.dflash2_decode->target_hidden.shape[2] == 3 &&
+               dflash2.dflash2_decode->target_logits.shape[1] == 16 &&
+               !dflash2.dflash_decode && !dflash2.ordinary,
+           "DFlash2 verification layout must be independent of DFlash1");
+    ninfer::DeviceBuffer dflash2_backing(dflash2_bytes);
+    q36::RoundState bound_dflash2(
+        ninfer::DeviceSpan{dflash2_backing.p, dflash2_backing.bytes}, dflash2);
+    expect(bound_dflash2.dflash2_decode.has_value() &&
+               bound_dflash2.dflash2_decode->licensed_tokens.ne[0] == 16 &&
+               bound_dflash2.dflash2_decode->target_positions.ne[1] == 3,
+           "DFlash2 target verification frame failed to bind");
 }
 
 void test_mtp_alignment() {

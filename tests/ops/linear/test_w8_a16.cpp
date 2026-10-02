@@ -15,6 +15,31 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+#ifdef NINFER_VOLTA_BUILD
+    constexpr std::array kN5120K25600{
+        a16(1), a16(7), a16(8), a16(9), a16(16), a16(21), a16(56), a16(128),
+    };
+    failures += run_shape("W8_A16_DFlash2", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {5120, 25600, 193U, Comparison::Sampled, false, kN5120K25600});
+
+    constexpr std::array kN5120K12800{
+        a16(1), a16(8), a16(9), a16(16), a16(17), a16(24), a16(48),
+    };
+    failures += run_shape("W8_A16_DFlash2_TP2", ActivationCompute::A16,
+                          make_w8g32_f16s_weight,
+                          {5120, 12800, 195U, Comparison::Sampled, false, kN5120K12800});
+
+    constexpr std::array kN5120K4096{a16(1), a16(8), a16(9), a16(16), a16(24), a16(48)};
+    failures += run_shape("W8_A16_DFlash2_Attn", ActivationCompute::A16,
+                          make_w8g32_f16s_weight,
+                          {5120, 4096, 199U, Comparison::Sampled, false, kN5120K4096});
+
+    constexpr std::array kN5120K2048{a16(1), a16(8), a16(9), a16(16), a16(24), a16(48)};
+    failures += run_shape("W8_A16_DFlash2_Attn_TP2", ActivationCompute::A16,
+                          make_w8g32_f16s_weight,
+                          {5120, 2048, 201U, Comparison::Sampled, false, kN5120K2048});
+#endif
+
     constexpr std::array kN248320K5120{
         a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
         a16(34), a16(48), a16(49), a16(64), a16(65),

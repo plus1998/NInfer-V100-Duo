@@ -138,6 +138,7 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     std::int32_t rope_delta = 0;
+    TP2FeatureSink* tp2_feature_sink = nullptr;
 };
 
 struct OrdinaryBatchContext {
@@ -170,6 +171,17 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeState& frame;
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
+    Tensor& continuation_hidden_store;
+};
+
+struct DFlash2BatchContext {
+    ExecutionCore execution;
+    const qwen3_6::PagedKVCache& text_cache;
+    std::array<typename qwen3_6::detail::TP2DFlashExtension<Variant>::State*, 2> states;
+    qwen3_6::DFlash2DecodeState& frame;
+    const qwen3_6::DFlash2DecodeIngress& host_ingress;
+    const qwen3_6::DFlash2DecodeIngress& peer_host_ingress;
+    qwen3_6::DFlash2DecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
 };
 
@@ -211,6 +223,8 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    Tensor proposal_ids;
+    Tensor proposal_q;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -227,7 +241,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
 // egress transfer stay on rank 0 alone.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope);
+                          TargetVerifyFrameView peer, ops::GqaExecutionEnvelope envelope,
+                          TP2FeatureSink* feature_sink = nullptr);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
@@ -272,6 +287,15 @@ void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, s
                               MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                       MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
+
+void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
+                                   ops::SwaContextExecutionEnvelope context_envelope,
+                                   ops::GqaExecutionEnvelope target_envelope,
+                                   DecodeGraphDefinition& definition);
+void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
+                          ops::SwaContextExecutionEnvelope context_envelope,
+                          ops::GqaExecutionEnvelope target_envelope,
+                          DecodeGraphExecutable* executable);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});

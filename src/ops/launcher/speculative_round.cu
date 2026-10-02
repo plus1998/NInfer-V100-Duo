@@ -47,22 +47,25 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                             const Tensor& drafts, const Tensor& current_extents,
-                                             Tensor& lengths, Tensor& anchors,
-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
-                                             Tensor& accepted, std::int32_t token_domain,
-                                             const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream) {
+template <bool Sparse>
+void speculative_accept_launch(const Tensor& target_tokens, const Tensor& logits,
+                               const Tensor& drafts, const Tensor* proposal_ids,
+                               const Tensor* proposal_q, const Tensor& current_extents,
+                               Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                               Tensor& licensed_counts, Tensor& accepted,
+                               std::int32_t token_domain, const SamplingConfig* configs,
+                               DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = drafts.ne[0] + 1;
     const std::int32_t batch             = drafts.ne[1];
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     if (!layout.multiblock) {
-        speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+        speculative_accept_greedy_drafts_kernel<Sparse><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data),
+            Sparse ? static_cast<const std::int32_t*>(proposal_ids->data) : nullptr,
+            Sparse ? static_cast<const float*>(proposal_q->data) : nullptr,
             static_cast<const std::int32_t*>(current_extents.data),
             static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
             static_cast<std::int32_t*>(licensed_tokens.data),
@@ -86,16 +89,43 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
                                   static_cast<unsigned int>(batch));
-    speculative_sampling_group_finalize_kernel<<<batched_group_grid, kSamplerGroupBlock, 0,
-                                                 stream>>>(
+    speculative_sampling_group_finalize_kernel<Sparse><<<batched_group_grid,
+                                                          kSamplerGroupBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),
         static_cast<const std::int32_t*>(drafts.data),
+        Sparse ? static_cast<const std::int32_t*>(proposal_ids->data) : nullptr,
+        Sparse ? static_cast<const float*>(proposal_q->data) : nullptr,
         static_cast<const std::int32_t*>(current_extents.data),
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
         configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                             const Tensor& drafts, const Tensor& current_extents,
+                                             Tensor& lengths, Tensor& anchors,
+                                             Tensor& licensed_tokens, Tensor& licensed_counts,
+                                             Tensor& accepted, std::int32_t token_domain,
+                                             const SamplingConfig* configs, DeviceSpan workspace,
+                                             cudaStream_t stream) {
+    speculative_accept_launch<false>(target_tokens, logits, drafts, nullptr, nullptr,
+                                      current_extents, lengths, anchors, licensed_tokens,
+                                      licensed_counts, accepted, token_domain, configs, workspace,
+                                      stream);
+}
+
+void speculative_accept_sparse_drafts_launch(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& proposal_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, std::int32_t token_domain, const SamplingConfig* configs,
+    DeviceSpan workspace, cudaStream_t stream) {
+    speculative_accept_launch<true>(target_tokens, logits, drafts, &proposal_ids, &proposal_q,
+                                     current_extents, lengths, anchors, licensed_tokens,
+                                     licensed_counts, accepted, token_domain, configs, workspace,
+                                     stream);
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,

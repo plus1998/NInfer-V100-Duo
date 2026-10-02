@@ -100,6 +100,17 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
 
+/**
+ * V100 TP2 DFlash2 QKV shard. Each rank owns a W8G32_F16S RowSplit [3072,5120] parent
+ * in Q[2048]|K[512]|V[512] order and independently projects BF16 x [5120,T] to three
+ * contiguous BF16 outputs [2048,T], [512,T], [512,T]. T must be positive; no collective,
+ * temporary allocation, Q/K normalization, or RoPE is performed. T<32 uses a single fused
+ * launch; wider blocks use three section-local Tensor Core launches. The A16 output criterion
+ * applies to naive FP64 projections of the exact stored W8 codes/FP16 scales and BF16 inputs.
+ */
+void dflash2_tp2_attn_input_proj(const Tensor& x, const Weight& query_key_value_weight,
+                                 Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream);
+
 // --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
 //
 // attn_input_proj is a COLUMN-parallel (output-split), head-aligned op only: it never allreduces.

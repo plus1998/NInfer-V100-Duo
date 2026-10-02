@@ -2,6 +2,8 @@
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -146,6 +148,78 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
         licensed_counts, accepted, token_domain, configs, scratch, stream);
+}
+
+void speculative_accept_sparse_drafts(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& proposal_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, std::int32_t token_domain, const SamplingConfig* configs,
+    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_sparse_drafts";
+    const int steps = drafts.ne[0];
+    const int batch = drafts.ne[1];
+    if (steps < 1 || steps > 15 || batch < 1 || batch > 8) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: invalid K/B");
+    }
+    require_matrix(target_tokens, DType::I32, steps + 1, batch, op, "target_tokens");
+    require_dtype(logits, DType::BF16, op, "logits");
+    if (logits.ne[0] < token_domain || token_domain <= 0 || logits.ne[1] != steps + 1 ||
+        logits.ne[2] != batch || logits.ne[3] != 1) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: invalid logits");
+    }
+    require_matrix(drafts, DType::I32, steps, batch, op, "drafts");
+    require_dtype(proposal_ids, DType::I32, op, "proposal_ids");
+    require_dtype(proposal_q, DType::FP32, op, "proposal_q");
+    if (proposal_ids.ne[0] != 16 || proposal_ids.ne[1] != steps ||
+        proposal_ids.ne[2] != batch || proposal_ids.ne[3] != 1 ||
+        proposal_q.ne[0] != 16 || proposal_q.ne[1] != steps ||
+        proposal_q.ne[2] != batch || proposal_q.ne[3] != 1) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: invalid proposal shape");
+    }
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(lengths, DType::I32, batch, op, "lengths");
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(licensed_tokens, DType::I32, steps + 1, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    if (!configs) { throw std::invalid_argument("speculative_accept_sparse_drafts: null configs"); }
+    auto scope = workspace.scope();
+    const std::size_t bytes = speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        token_domain, steps, steps, batch, batch);
+    const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+    struct Operand {
+        const void* data;
+        std::size_t bytes;
+    };
+    const std::array<Operand, 12> operands{{
+        {target_tokens.data, target_tokens.bytes()}, {logits.data, logits.bytes()},
+        {drafts.data, drafts.bytes()}, {proposal_ids.data, proposal_ids.bytes()},
+        {proposal_q.data, proposal_q.bytes()}, {current_extents.data, current_extents.bytes()},
+        {lengths.data, lengths.bytes()}, {anchors.data, anchors.bytes()},
+        {licensed_tokens.data, licensed_tokens.bytes()},
+        {licensed_counts.data, licensed_counts.bytes()}, {accepted.data, accepted.bytes()},
+        {configs, static_cast<std::size_t>(batch) * sizeof(SamplingConfig)},
+    }};
+    const auto overlapping = [](Operand first, Operand second) {
+        const auto lhs = reinterpret_cast<std::uintptr_t>(first.data);
+        const auto rhs = reinterpret_cast<std::uintptr_t>(second.data);
+        return lhs < rhs + second.bytes && rhs < lhs + first.bytes;
+    };
+    for (std::size_t first = 0; first < operands.size(); ++first) {
+        for (std::size_t second = first + 1; second < operands.size(); ++second) {
+            if (overlapping(operands[first], operands[second])) {
+                throw std::invalid_argument("speculative_accept_sparse_drafts: operands overlap");
+            }
+        }
+        if (bytes != 0 && overlapping(operands[first], {scratch.data, scratch.bytes})) {
+            throw std::invalid_argument("speculative_accept_sparse_drafts: workspace overlaps input");
+        }
+    }
+    detail::speculative_accept_sparse_drafts_launch(
+        target_tokens, logits, drafts, proposal_ids, proposal_q, current_extents,
+        lengths, anchors, licensed_tokens, licensed_counts, accepted, token_domain,
+        configs, scratch, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

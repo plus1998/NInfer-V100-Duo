@@ -197,8 +197,8 @@ __device__ __forceinline__ float lane_dot_i8(const LaneWeightI8& w, const LaneAc
 template <int MaxTokens, int Rows>
 constexpr int kVectorMinBlocks = MaxTokens == 4 && Rows == 4 ? 6 : 1;
 
-template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
-__global__ void __launch_bounds__(kVectorWarps * 32, (kVectorMinBlocks<MaxTokens, Rows>))
+template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8, int Warps>
+__global__ void __launch_bounds__(Warps * 32, (kVectorMinBlocks<MaxTokens, Rows>))
 vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ codes,
               const float* __restrict__ steps, const unsigned char* __restrict__ rows,
               int row_count, int first_row, int k, int tokens, int token_base, Outputs out) {
@@ -206,7 +206,7 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
     constexpr int kRowWords   = kStageBlocks * kBlockBytes / 4; // 32-bit words per row per stage
     constexpr int kStageWords = Rows * kRowWords;
     constexpr int kLaneWords  = (kStageWords + 31) / 32;
-    __shared__ __align__(16) unsigned stage[kVectorWarps][kStageWords];
+    __shared__ __align__(16) unsigned stage[Warps][kStageWords];
     // A8 i-quant lookups are data-dependent gathers; serve them from a per-CTA shared copy of the
     // codebook instead of the read-only cache, which serializes divergent addresses.
     constexpr int kGridWords = A8 ? gguf::kGridBytes<Type> / 4 : 0;
@@ -223,7 +223,7 @@ vector_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict
 
     const int warp  = static_cast<int>(threadIdx.x >> 5);
     const int lane  = static_cast<int>(threadIdx.x & 31);
-    const int first = (blockIdx.x * kVectorWarps + warp) * Rows;
+    const int first = (blockIdx.x * Warps + warp) * Rows;
     if (first >= row_count) { return; }
     const int live_rows           = min(Rows, row_count - first);
     const int blocks              = k / 256;
@@ -319,12 +319,12 @@ struct VectorInput {
     const float* steps       = nullptr; // A8
 };
 
-template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8>
+template <GgufType Type, int MaxTokens, int Rows, bool Tiled, bool A8, int Warps = kVectorWarps>
 void launch_vector_shape(const VectorInput& in, const GgufSegment& segment, int first_row, int k,
                          int tokens, int token_base, const Outputs& out, cudaStream_t stream) {
-    constexpr int kRowsPerCta = kVectorWarps * Rows;
+    constexpr int kRowsPerCta = Warps * Rows;
     const dim3 grid(static_cast<unsigned>((segment.rows + kRowsPerCta - 1) / kRowsPerCta));
-    vector_kernel<Type, MaxTokens, Rows, Tiled, A8><<<grid, kVectorWarps * 32, 0, stream>>>(
+    vector_kernel<Type, MaxTokens, Rows, Tiled, A8, Warps><<<grid, Warps * 32, 0, stream>>>(
         in.x, in.codes, in.steps, static_cast<const unsigned char*>(segment.data), segment.rows,
         first_row, k, tokens, token_base, out);
 }
@@ -333,7 +333,7 @@ void launch_vector_shape(const VectorInput& in, const GgufSegment& segment, int 
 // activation slice across several rows. Wider passes trade rows for activation registers. Measured
 // on V100-SXM2 with ninfer_gguf_bench at the TP2 shard shapes: for 2..4 columns two rows beat four
 // on every projection, while vocabulary-height segments (kTallRows) prefer four rows held to six
-// resident CTAs per SM.
+// resident CTAs per SM. The Q4_K A16 head uses the same four rows with one warp per CTA instead.
 constexpr int kTallRows = 65536;
 template <GgufType Type, bool Tiled, bool A8>
 void launch_vector_type(const VectorInput& x, const GgufSegment& segment, int first_row, int k,
@@ -346,7 +346,12 @@ void launch_vector_type(const VectorInput& x, const GgufSegment& segment, int fi
         if (wide) { NINFER_GGUF_SHAPE(1, 4); } else { NINFER_GGUF_SHAPE(1, 1); }
     } else if (tokens <= 4) {
         if (segment.rows >= kTallRows) {
-            NINFER_GGUF_SHAPE(4, 4);
+            if constexpr (Type == GgufType::Q4_K && !A8) {
+                launch_vector_shape<Type, 4, 4, Tiled, A8, 1>(
+                    x, segment, first_row, k, tokens, token_base, out, stream);
+            } else {
+                NINFER_GGUF_SHAPE(4, 4);
+            }
         } else if (wide) {
             NINFER_GGUF_SHAPE(4, 2);
         } else {

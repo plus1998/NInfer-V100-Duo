@@ -261,6 +261,34 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlash2ConvPlan {
+    artifact::ObjectHandle base_kernel;
+    artifact::ObjectHandle kernel_projection;
+};
+
+struct DFlash2LayerPlan {
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle post_attention_norm;
+    WeightPlan query_key_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    WeightPlan attention_output;
+    WeightPlan gate_up;
+    WeightPlan down;
+    DFlash2ConvPlan attention_conv;
+    DFlash2ConvPlan mlp_conv;
+};
+
+struct DFlash2Plan {
+    WeightPlan feature_projection;
+    artifact::ObjectHandle context_norm;
+    artifact::ObjectHandle final_norm;
+    std::array<DFlash2LayerPlan, 5> layers;
+    artifact::ObjectHandle hidden_projection;
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -274,6 +302,7 @@ struct BindingPlan {
     WeightPlan draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    std::optional<DFlash2Plan> dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -350,10 +379,43 @@ struct MtpAttentionPayload {
     Weight value;
 };
 
-using RuntimeModelView =
+struct DFlash2ConvWeights {
+    Tensor base_kernel;
+    Weight kernel_projection;
+};
+
+struct DFlash2LayerWeights {
+    Tensor input_norm;
+    Tensor post_attention_norm;
+    Weight query_key_value;
+    Weight query;
+    Weight key;
+    Weight value;
+    Tensor query_norm;
+    Tensor key_norm;
+    Weight attention_output;
+    Weight gate_up;
+    Weight down;
+    DFlash2ConvWeights attention_conv;
+    DFlash2ConvWeights mlp_conv;
+};
+
+struct DFlash2Weights {
+    Weight feature_projection;
+    Tensor context_norm;
+    Tensor final_norm;
+    std::array<DFlash2LayerWeights, 5> layers;
+    Weight hidden_projection;
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
+};
+
+struct RuntimeModelView :
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
                        MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers>;
+                       kFullAttentionLayers, kGdnLayers> {
+    std::optional<DFlash2Weights> dflash2;
+};
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

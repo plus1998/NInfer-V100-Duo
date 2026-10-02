@@ -6,6 +6,11 @@
 
 namespace ninfer::ops::detail {
 
+#ifdef NINFER_VOLTA_BUILD
+void w8_dflash2_tp2_attn_input_volta_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                             Tensor& k, Tensor& v, cudaStream_t stream);
+#endif
+
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream);
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,

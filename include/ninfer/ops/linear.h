@@ -66,7 +66,8 @@ enum class LinearPolicy : std::uint8_t {
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Text and
  * MTP packed-weight problems accept every positive column extent T. Registered Vision problems
  * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
- * not inherently represent a text token. FP32_CTRL is unsupported.
+ * not inherently represent a text token. The V100 selector additionally registers BF16_CTRL
+ * `[256,5120]` at every positive T. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.

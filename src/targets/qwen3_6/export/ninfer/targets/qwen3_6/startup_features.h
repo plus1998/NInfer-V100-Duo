@@ -19,6 +19,10 @@ struct StartupFeatures {
 
     [[nodiscard]] bool dflash() const noexcept { return speculative == SpeculativeBackend::DFlash; }
 
+    [[nodiscard]] bool dflash2() const noexcept {
+        return speculative == SpeculativeBackend::DFlash2;
+    }
+
     [[nodiscard]] bool optimized_proposal() const noexcept {
         return speculative_enabled() && proposal_head == ProposalHead::Optimized;
     }

@@ -879,7 +879,9 @@ differences:
   permutation, and the GDN output Op applies it;
 - norms, `gdn/a_log`, `gdn/dt_bias`, `gdn/convolution` and `text/draft_head_token_ids` keep the
   direct formats of Section 5; Vision objects have the Section 7 formats and shapes, while
-  DFlash2 companions are not projected.
+  DFlash2 companions are projected when present and checked against their tensor shapes and
+  formats at binding, but remain validation-only until the 27B target and TP2 execution route
+  are implemented.
 
 ### 15.2 Execution
 

@@ -7,6 +7,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
+#include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -292,6 +293,31 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
 
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+}
+
+void dflash2_tp2_attn_input_proj(const Tensor& x, const Weight& query_key_value_weight,
+                                 Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream) {
+    const std::int32_t cols = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("DFlash2 TP2 QKV: T must be positive"); }
+    require_matrix(x, 5120, cols, "DFlash2 TP2 x");
+    require_matrix(q, 2048, cols, "DFlash2 TP2 q");
+    require_matrix(k, 512, cols, "DFlash2 TP2 k");
+    require_matrix(v, 512, cols, "DFlash2 TP2 v");
+    const Weight& weight = query_key_value_weight;
+    if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
+        weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
+        weight.ndim != 2 || weight.n != 3072 || weight.k != 5120 ||
+        weight.shape[0] != 3072 || weight.shape[1] != 5120 ||
+        weight.padded_shape[0] != 3072 || weight.padded_shape[1] != 5120 ||
+        weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        throw std::invalid_argument("DFlash2 TP2 QKV: invalid shard weight");
+    }
+#ifdef NINFER_VOLTA_BUILD
+    detail::w8_dflash2_tp2_attn_input_volta_launch(x, weight, q, k, v, stream);
+#else
+    throw std::invalid_argument("DFlash2 TP2 QKV: V100 kernel not available");
+#endif
 }
 
 // --- Tensor-parallel split form (tp == 2) -------------------------------------------------------

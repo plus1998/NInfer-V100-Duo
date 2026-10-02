@@ -2,6 +2,9 @@
 
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6_27b/impl/tp2_dflash_context.h"
+#include "targets/qwen3_6_27b/impl/tp2_dflash_proposal.h"
+#include "targets/qwen3_6/impl/runtime/tp2_dflash_extension.h"
 #include "ninfer/ops/allreduce.h" // ExecutionContext, ops::PeerEvents (tp2 split forms)
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -238,3 +241,163 @@ struct Variant {
 };
 
 } // namespace ninfer::targets::qwen3_6_27b::detail
+
+namespace ninfer::targets::qwen3_6::detail {
+
+template <>
+struct TP2DFlashExtension<qwen3_6_27b::detail::Variant> {
+    static constexpr bool supported = true;
+    using Layout = qwen3_6_27b::detail::TP2DFlashContextLayout;
+    using State = qwen3_6_27b::detail::TP2DFlashContextState;
+
+    [[nodiscard]] static std::optional<Layout> plan(LayoutBuilder& builder,
+                                                     std::int32_t prefill_chunk,
+                                                     std::int32_t concurrency,
+                                                     std::int32_t verify_width, bool enabled) {
+        if (!enabled) { return std::nullopt; }
+        return Layout::plan(builder, prefill_chunk, concurrency, verify_width);
+    }
+
+    static void bind(std::optional<State>& state, DeviceSpan backing,
+                     const std::optional<Layout>& layout) {
+        if (layout) { state.emplace(backing, *layout); }
+    }
+
+    [[nodiscard]] static TP2FeatureSink make_prefill_sink(
+        const std::array<State*, 2>& state,
+        const std::array<const qwen3_6_27b::detail::RuntimeModelView*, 2>& models,
+        const ExecutionContext& execution, const ops::PeerEvents& events, std::int32_t lane) {
+        if (!state[0] || !state[1] || !models[0] || !models[1] ||
+            !models[0]->dflash2 || !models[1]->dflash2) {
+            throw std::logic_error("DFlash2 prefill needs two bound model and state replicas");
+        }
+        qwen3_6_27b::detail::TP2DFlashContextBuffers buffers{
+            .projected = {state[0]->prefill_projected, state[1]->prefill_projected},
+            .staging = {state[0]->prefill_staging, state[1]->prefill_staging},
+            .normalized = {state[0]->prefill_normalized, state[1]->prefill_normalized}};
+        return qwen3_6_27b::detail::make_tp2_dflash_prefill_sink(
+            state, {&*models[0]->dflash2, &*models[1]->dflash2}, buffers,
+            {&state[0]->prefill_workspace, &state[1]->prefill_workspace}, execution, events,
+            lane);
+    }
+
+    [[nodiscard]] static std::size_t kv_payload_bytes(
+        const std::optional<Layout>& layout) noexcept {
+        return layout ? layout->cache.payload_bytes() +
+                            layout->rewrite_checkpoint.payload_bytes() : 0;
+    }
+
+    [[nodiscard]] static std::size_t proposal_workspace_capacity(
+        std::int32_t width, std::int32_t batch, std::uint32_t max_context,
+        ProposalHead head, qwen3_6_27b::detail::WeightsProfile profile) {
+        QType head_type;
+        switch (profile) {
+        case qwen3_6_27b::detail::WeightsProfile::Qwen38Gguf:
+            head_type = QType::GGUF;
+            break;
+        case qwen3_6_27b::detail::WeightsProfile::Qwen38Nvfp4:
+            if (head != ProposalHead::Optimized) {
+                throw std::invalid_argument("DFlash2 NVFP4 requires the optimized proposal head");
+            }
+            head_type = QType::Q4G64_F16S;
+            break;
+        default:
+            throw std::invalid_argument("DFlash2 TP2 proposal requires GGUF or NVFP4 weights");
+        }
+        const auto draft = qwen3_6_27b::detail::tp2_dflash_draft_workspace_capacity(
+            width, batch, {0, max_context});
+        const auto proposal = qwen3_6_27b::detail::tp2_dflash_proposal_capacity(
+            head_type, head == ProposalHead::Optimized ? 65536 : 124160, width, batch);
+        std::size_t capacity = 0;
+        for (int rank = 0; rank < 2; ++rank) {
+            const std::size_t roots = std::max(draft.roots, proposal.roots[rank]);
+            const std::size_t scratch = std::max(draft.ops, proposal.topk);
+            capacity = std::max(capacity, roots + scratch + 512);
+        }
+        return capacity;
+    }
+
+    static void run_proposal(
+        const std::array<State*, 2>& state,
+        const std::array<const qwen3_6_27b::detail::RuntimeModelView*, 2>& models,
+        const std::array<qwen3_6::DFlash2DecodeState*, 2>& frames,
+        const std::array<WorkspaceArena*, 2>& work, int batch, ProposalHead head,
+        ops::SwaContextExecutionEnvelope envelope, const ExecutionContext& execution,
+        const ops::PeerEvents& events) {
+        if (!work[0] || !work[1] || !frames[0] || !frames[1] || !models[0] || !models[1] ||
+            !models[0]->dflash2 || !models[1]->dflash2 || !state[0] || !state[1]) {
+            throw std::logic_error("DFlash2 proposal requires two loaded replicas");
+        }
+        const int width = state[0]->draft_ids.ne[0];
+        const auto draft = qwen3_6_27b::detail::tp2_dflash_draft_workspace_capacity(
+            width, batch, envelope);
+        const std::array<const qwen3_6_27b::detail::DFlash2Weights*, 2> weights = {
+            &*models[0]->dflash2, &*models[1]->dflash2};
+        std::array<Weight, 2> heads;
+        std::array<Tensor, 2> maps;
+        for (int rank = 0; rank < 2; ++rank) {
+            if (head == ProposalHead::Optimized) {
+                if (!models[rank]->optimized_proposal) {
+                    throw std::logic_error("DFlash2 optimized proposal head is unavailable");
+                }
+                heads[rank] = models[rank]->optimized_proposal->head;
+                maps[rank] = models[rank]->optimized_proposal->token_ids;
+            } else {
+                heads[rank] = models[rank]->output_head;
+            }
+        }
+        const auto proposal = qwen3_6_27b::detail::tp2_dflash_proposal_capacity(
+            heads[0].qtype, heads[0].n, width, batch);
+        auto primary_scope = work[0]->scope();
+        auto peer_scope = work[1]->scope();
+        std::array<std::optional<WorkspaceArena>, 2> roots, scratch;
+        std::array<WorkspaceArena*, 2> root_views, scratch_views;
+        std::array<Tensor, 2> anchors, frontiers, valid, lanes;
+        for (int rank = 0; rank < 2; ++rank) {
+            roots[rank].emplace(work[rank]->alloc_bytes(
+                std::max(draft.roots, proposal.roots[rank])));
+            scratch[rank].emplace(work[rank]->alloc_bytes(
+                std::max(draft.ops, proposal.topk)));
+            root_views[rank] = &*roots[rank];
+            scratch_views[rank] = &*scratch[rank];
+            anchors[rank] = frames[rank]->anchors.slice(0, 0, batch);
+            frontiers[rank] = frames[rank]->execution_frontiers.slice(0, 0, batch);
+            valid[rank] = frames[rank]->target_valid_columns.slice(0, 0, batch);
+            lanes[rank] = frames[rank]->lanes.slice(0, 0, batch);
+        }
+        qwen3_6_27b::detail::tp2_dflash_run_proposal(
+            state, models, weights, anchors, frontiers, valid, lanes, frontiers[0],
+            frames[0]->sampling, heads, head == ProposalHead::Optimized ? &maps : nullptr,
+            batch, envelope, root_views, scratch_views, root_views, scratch_views, execution,
+            events);
+    }
+
+    static void catch_up(
+        const std::array<State*, 2>& state,
+        const std::array<const qwen3_6_27b::detail::RuntimeModelView*, 2>& models,
+        const std::array<qwen3_6::DFlash2DecodeState*, 2>& frames,
+        const ExecutionContext& execution, const ops::PeerEvents& events, int batch) {
+        if (!models[0] || !models[1] || !models[0]->dflash2 || !models[1]->dflash2) {
+            throw std::logic_error("DFlash2 context catch-up requires two model replicas");
+        }
+        qwen3_6_27b::detail::catch_up_tp2_dflash_context(
+            state, {&*models[0]->dflash2, &*models[1]->dflash2}, frames,
+            execution, events, batch);
+    }
+
+    [[nodiscard]] static TP2FeatureSink make_verify_sink(const std::array<State*, 2>& state,
+                                                          int batch) {
+        return qwen3_6_27b::detail::make_tp2_dflash_verify_sink(state, batch);
+    }
+
+    [[nodiscard]] static TP2DFlashProposalView proposal_view(State& state, int batch) {
+        if (batch <= 0 || batch > state.draft_tokens.ne[1]) {
+            throw std::invalid_argument("DFlash2 proposal view has invalid batch size");
+        }
+        return {state.draft_tokens.slice(1, 0, batch),
+                state.proposal_ids.slice(2, 0, batch),
+                state.proposal_q.slice(2, 0, batch)};
+    }
+};
+
+} // namespace ninfer::targets::qwen3_6::detail

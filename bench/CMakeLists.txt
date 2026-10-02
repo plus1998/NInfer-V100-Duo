@@ -64,6 +64,18 @@ ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_bench(ninfer_swa_dflash2_bench
+    SOURCES ops/swa_dflash2_bench.cu)
+  ninfer_add_op_bench(ninfer_dflash2_tp2_attn_input_bench
+    SOURCES ops/dflash2_tp2_attn_input_bench.cu)
+  ninfer_add_op_bench(ninfer_candidate_selector_bench
+    SOURCES ops/candidate_selector_bench.cu)
+  ninfer_add_op_bench(ninfer_dynamic_grouped_conv_prepare_bench
+    SOURCES ops/dynamic_grouped_conv_prepare_bench.cu)
+  ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
+    SOURCES ops/linear_dynamic_grouped_conv_add_bench.cu)
+endif()
 
 # End-to-end product benchmark: public Engine API and native .ninfer artifacts only.
 add_executable(ninfer_bench targets/qwen3_6_27b/ninfer_bench.cpp targets/qwen3_6_27b/ninfer_bench_support.cpp)

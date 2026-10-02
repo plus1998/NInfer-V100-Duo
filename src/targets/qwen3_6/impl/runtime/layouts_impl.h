@@ -142,7 +142,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp) {
+        if (tp != 1 && plan.speculative_backend != SpeculativeBackend::Mtp &&
+            plan.speculative_backend != SpeculativeBackend::DFlash2) {
             throw std::invalid_argument(
                 "DFlash speculative decoding has no tensor-parallel path in this build");
         }
@@ -210,13 +211,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
 
+    out.tp2_dflash = qwen3_6::detail::TP2DFlashExtension<Variant>::plan(
+        builder, effective_prefill_chunk, static_cast<std::int32_t>(plan.max_concurrency),
+        static_cast<std::int32_t>(plan.draft_window + 1U),
+        plan.features.dflash2() && tp == 2);
+
     out.round = qwen3_6::begin_round_state_layout(
         builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
-                                         .enable_dflash  = plan.features.dflash()});
+                                         .enable_dflash  = plan.features.dflash(),
+                                         .enable_dflash2 = plan.features.dflash2()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
@@ -240,7 +247,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         "rewrite checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
-        out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
+        out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0) +
+        qwen3_6::detail::TP2DFlashExtension<Variant>::kv_payload_bytes(out.tp2_dflash);
     return out;
 }
 
@@ -595,6 +603,28 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (plan.features.dflash2()) {
+        out.dflash2_proposal =
+            qwen3_6::detail::TP2DFlashExtension<Variant>::proposal_workspace_capacity(
+                static_cast<std::int32_t>(plan.draft_window + 1),
+                static_cast<std::int32_t>(plan.max_concurrency), plan.capacity,
+                plan.proposal_head, plan.weights_profile);
+        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+             ++batch) {
+            const std::int32_t verify = static_cast<std::int32_t>(plan.draft_window + 1);
+            const std::int32_t aggregate = batch * verify;
+            WorkspaceLayoutBuilder target;
+            matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            tp_call_roots(target, aggregate, aggregate);
+            target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
+                        GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
+            const std::size_t accept =
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                    TextConfig::token_domain, verify - 1, verify - 1, batch, batch);
+            out.dflash2_verify = std::max({out.dflash2_verify, finish(target), accept});
+        }
+    }
+
     if (plan.features.vision) {
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
@@ -603,7 +633,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                             out.dflash_context, out.dflash_round, out.vision_encode});
+                             out.dflash_context, out.dflash_round, out.dflash2_proposal,
+                             out.dflash2_verify, out.vision_encode});
     return out;
 }
 
@@ -677,6 +708,14 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
+    case SpeculativeBackend::DFlash2:
+        if constexpr (!qwen3_6::detail::TP2DFlashExtension<Variant>::supported) {
+            throw std::invalid_argument("DFlash2 is not supported by this target");
+        }
+        if (options.tp != 2 || options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens > kDFlashDecodeMaximumDrafts) {
+            throw std::invalid_argument("DFlash2 requires --tp 2 and --draft-tokens in [1,15]");
+        }
     }
     if (options.tp != 1 && options.tp != 2) {
         throw std::invalid_argument("tensor-parallel width must be 1 or 2");
@@ -774,6 +813,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
                                                       "MTP exact-b graph allowance");
+        } else if (impl->speculative_backend == SpeculativeBackend::DFlash2) {
+            const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
+            const std::size_t per_batch = graph_topology_allowance(
+                profiles, [](GraphExecutionProfile) { return 160ULL * kMiB; },
+                "DFlash2 graph allowance");
+            impl->graph_allowance_bytes = checked_mul(
+                per_batch, impl->max_concurrency, "DFlash2 exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =

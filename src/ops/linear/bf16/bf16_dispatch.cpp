@@ -9,6 +9,9 @@
 namespace ninfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+#ifdef NINFER_VOLTA_BUILD
+    if (n == 256 && k == 5120 && t > 0) { return launch_bf16_n256_k5120; }
+#endif
     const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
     // TP2 shards of the two registered problems: attention/query_key_gate_value splits
     // column-parallel (14336 -> 7168) and attention/output row-parallel (6144 -> 3072). BF16's

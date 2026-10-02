@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -221,7 +222,8 @@ void test_official_qwen38_v3_if_configured() {
     }
     if (reader.identity().model_id != "qwen3.8-27b" ||
         reader.identity().weights_id != "nvfp4" ||
-        reader.objects().size() != 1012 + 2 * nvfp4_mlp_layers) {
+        reader.objects().size() != 1012 + 2 * nvfp4_mlp_layers +
+                                     (reader.find("dflash2/feature_projection") ? 66 : 0)) {
         throw std::runtime_error("qwen3.8 v3 projection identity or inventory mismatch");
     }
     const auto* qkgv = std::get_if<TensorDescriptor>(
@@ -234,6 +236,18 @@ void test_official_qwen38_v3_if_configured() {
         gate_up == nullptr || gate_up->format != NumericFormat::NVFP4 || divisor == nullptr ||
         divisor->format != NumericFormat::FP32 || !divisor->shape.empty()) {
         throw std::runtime_error("official qwen3.8 v3 projected tensor contract mismatch");
+    }
+    if (reader.find("dflash2/feature_projection") != nullptr) {
+        for (const auto& [name, format] : std::array{
+                 std::pair{"dflash2/feature_projection", NumericFormat::W8G32_F16S},
+                 std::pair{"dflash2/layers/0/attention/query_key_value", NumericFormat::W8G32_F16S},
+                 std::pair{"dflash2/candidate_selector/predecessor_codebook", NumericFormat::BF16},
+             }) {
+            const auto* tensor = std::get_if<TensorDescriptor>(reader.find(name));
+            if (tensor == nullptr || tensor->format != format) {
+                throw std::runtime_error(std::string("NVFP4 v3 DFlash2 projection omitted ") + name);
+            }
+        }
     }
 
     const auto tokenizer_config = reader.payload("frontend/tokenizer_config.json").data;
@@ -271,6 +285,22 @@ void test_gsq_qwen38_v3_vision_if_configured() {
     if (reader.find("frontend/preprocessor_config.json") == nullptr ||
         reader.find("frontend/video_preprocessor_config.json") == nullptr) {
         throw std::runtime_error("GSQ v3 Vision preprocessing resources are missing");
+    }
+    for (const auto& [name, format, shape] : std::array{
+             std::tuple{"dflash2/feature_projection", NumericFormat::W8G32_F16S,
+                        std::array<std::uint64_t, 2>{5120, 25600}},
+             std::tuple{"dflash2/layers/0/attention/query_key_value", NumericFormat::W8G32_F16S,
+                        std::array<std::uint64_t, 2>{6144, 5120}},
+             std::tuple{"dflash2/layers/4/mlp/gate_up", NumericFormat::W8G32_F16S,
+                        std::array<std::uint64_t, 2>{34816, 5120}},
+             std::tuple{"dflash2/candidate_selector/predecessor_codebook", NumericFormat::BF16,
+                        std::array<std::uint64_t, 2>{248320, 256}},
+         }) {
+        const auto* tensor = std::get_if<TensorDescriptor>(reader.find(name));
+        if (tensor == nullptr || tensor->format != format ||
+            tensor->shape != std::vector<std::uint64_t>(shape.begin(), shape.end())) {
+            throw std::runtime_error(std::string("GSQ v3 DFlash2 projection omitted ") + name);
+        }
     }
 }
 

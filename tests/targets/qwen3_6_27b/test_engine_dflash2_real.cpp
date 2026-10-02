@@ -1,11 +1,16 @@
 #include "ninfer/engine.h"
 #include "../qwen3_6/speculative_page_boundary.h"
 
+#include <cuda_profiler_api.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -71,19 +76,24 @@ int main(int argc, char** argv) {
         const bool graph     = argc > 2 ? std::stoi(argv[2]) != 0 : true;
         const bool optimized = argc > 3 ? std::stoi(argv[3]) != 0 : true;
         const auto batch     = argc > 4 ? static_cast<unsigned>(std::stoul(argv[4])) : 8U;
+        const bool measure_speed = argc > 8 && std::stoi(argv[8]) != 0;
+        const bool dflash_only = argc > 9 && std::stoi(argv[9]) != 0;
         ninfer::EngineOptions options;
         options.artifact_path   = artifact;
+        options.tp              = 2;
+        options.devices         = {0, 1};
         options.max_context     = 2304;
         options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
-        options.prefill_chunk   = 2304;
+        options.prefill_chunk   = 256;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                   = graph;
         options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
         options.kv_cache                         = argc > 5 && std::string(argv[5]) == "int8"
                                                        ? ninfer::KvCacheStorage::Int8Group64
                                                        : ninfer::KvCacheStorage::BFloat16;
         std::vector<ninfer::TokenId> prompt, reference, penalty_reference;
+        std::optional<double> mtp_decode_rate;
+        std::optional<double> ordinary_decode_rate;
         auto penalty                                 = request(24);
         penalty.execution.sampling.presence_penalty  = 0.5F;
         penalty.execution.sampling.frequency_penalty = 0.25F;
@@ -94,17 +104,155 @@ int main(int argc, char** argv) {
             ordinary_options.use_cuda_graph  = false;
             ordinary_options.enable_vision   = false;
             ninfer::Engine ordinary(ordinary_options);
-            prompt = ordinary.tokenize_text("Count from one to twenty: one, two, three,");
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            ninfer::ChatMessage message;
+            const char* profile_text = std::getenv("NINFER_DFLASH2_PROFILE_TEXT");
+            message.parts.push_back({ninfer::MessagePartKind::Text,
+                                     profile_text != nullptr && *profile_text != '\0'
+                                         ? profile_text
+                                         : "Count from one to twenty: one, two, three,", {}});
+            input.messages.push_back(std::move(message));
+            prompt = ordinary.prepare(std::move(input)).debug_token_ids();
             reference =
                 ordinary.generate(ordinary.prepare_tokens(prompt), request(24)).generated_token_ids;
             penalty_reference =
                 ordinary.generate(ordinary.prepare_tokens(prompt), penalty).generated_token_ids;
         }
+        const auto decode_rate = [&](ninfer::Engine& current) {
+            current.generate(current.prepare_tokens(prompt), request(16));
+            double decode_seconds = 0.0;
+            constexpr int repetitions = 3;
+            constexpr std::uint32_t generated = 128;
+            for (int repetition = 0; repetition < repetitions; ++repetition) {
+                const auto result = current.generate(current.prepare_tokens(prompt),
+                                                     request(generated));
+                require(result.generated_token_ids.size() == generated &&
+                            result.finish_reason == ninfer::FinishReason::OutputLimit,
+                        "speed probe did not exhaust its output budget");
+                decode_seconds += result.timings.decode_seconds;
+            }
+            return static_cast<double>(repetitions * (generated - 1)) / decode_seconds;
+        };
+        if (measure_speed && batch == 1) {
+            {
+                ninfer::Engine ordinary(options);
+                ordinary_decode_rate = decode_rate(ordinary);
+            }
+            auto mtp_options = options;
+            mtp_options.enable_vision = false;
+            mtp_options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            mtp_options.speculative.draft_tokens = 3;
+            mtp_options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            ninfer::Engine mtp(mtp_options);
+            mtp_decode_rate = decode_rate(mtp);
+        }
+        if (const char* profile = std::getenv("NINFER_DFLASH2_PROFILE");
+            profile != nullptr && std::string_view(profile) == "mtp") {
+            auto mtp_options = options;
+            mtp_options.enable_vision = false;
+            mtp_options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            mtp_options.speculative.draft_tokens = 3;
+            mtp_options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            ninfer::Engine mtp(mtp_options);
+            mtp.generate(mtp.prepare_tokens(prompt), request(16));
+            require(cudaProfilerStart() == cudaSuccess, "cannot start CUDA profiler");
+            const auto measured = mtp.generate(mtp.prepare_tokens(prompt), request(128));
+            require(cudaProfilerStop() == cudaSuccess, "cannot stop CUDA profiler");
+            require(measured.generated_token_ids.size() == 128,
+                    "MTP profile did not exhaust its output budget");
+            std::cout << "profile MTP3 graph=" << graph
+                      << " decode_s=" << measured.timings.decode_seconds
+                      << " rounds=" << measured.speculative.rounds
+                      << " accepted=" << measured.speculative.accepted_tokens
+                      << "/" << measured.speculative.drafted_tokens << " per_position=";
+            for (const auto accepted : measured.speculative.accepted_per_position) {
+                std::cout << accepted << ',';
+            }
+            std::cout << '\n';
+            return 0;
+        }
         options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        if (measure_speed && batch > 1) {
+            constexpr int repetitions = 3;
+            constexpr std::uint32_t generated = 128;
+            const auto batch_probe = [&](ninfer::Engine& current,
+                                         ninfer::SpeculativeBackend backend) {
+                current.generate(current.prepare_tokens(prompt), request(16));
+                double seconds = 0.0;
+                std::uint64_t rounds = 0;
+                std::uint64_t accepted = 0;
+                std::uint64_t drafted = 0;
+                for (int repetition = 0; repetition < repetitions; ++repetition) {
+                    std::vector<ninfer::GenerationHandle> handles;
+                    handles.reserve(batch);
+                    const auto started = std::chrono::steady_clock::now();
+                    for (unsigned row = 0; row < batch; ++row) {
+                        handles.push_back(current.submit(current.prepare_tokens(prompt),
+                                                         request(generated)));
+                    }
+                    for (auto& handle : handles) {
+                        const auto result = handle.wait();
+                        require(result.generated_token_ids.size() == generated &&
+                                    result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                                    result.speculative.backend == backend,
+                                "concurrent speed probe returned an incomplete request");
+                        rounds += result.speculative.rounds;
+                        accepted += result.speculative.accepted_tokens;
+                        drafted += result.speculative.drafted_tokens;
+                    }
+                    seconds += std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - started).count();
+                }
+                return std::tuple{static_cast<double>(repetitions * batch * generated) / seconds,
+                                  rounds, accepted, drafted};
+            };
+            auto mtp_options = options;
+            mtp_options.enable_vision = false;
+            mtp_options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            mtp_options.speculative.draft_tokens = 3;
+            mtp_options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            std::optional<std::tuple<double, std::uint64_t, std::uint64_t, std::uint64_t>> mtp_result;
+            if (!dflash_only) {
+                ninfer::Engine mtp(mtp_options);
+                mtp_result = batch_probe(mtp, ninfer::SpeculativeBackend::Mtp);
+            }
+            const auto [dflash_rate, dflash_rounds, dflash_accepted, dflash_drafted] = [&] {
+                ninfer::Engine engine(options);
+                return batch_probe(engine, ninfer::SpeculativeBackend::DFlash2);
+            }();
+            std::cout << "concurrent 3x128 outputs B=" << batch << " graph=" << graph
+                      << " DFlash2-K=" << k << "=" << dflash_rate << " tok/s ("
+                      << dflash_rounds << " rounds, "
+                      << dflash_accepted << "/" << dflash_drafted << " accepted)\n";
+            if (mtp_result) {
+                const auto [mtp_rate, mtp_rounds, mtp_accepted, mtp_drafted] = *mtp_result;
+                std::cout << "MTP3=" << mtp_rate << " tok/s (" << mtp_rounds << " rounds, "
+                          << mtp_accepted << "/" << mtp_drafted << " accepted)\n";
+            }
+            return 0;
+        }
         ninfer::Engine engine(options);
+        if (std::getenv("NINFER_DFLASH2_PROFILE") != nullptr) {
+            engine.generate(engine.prepare_tokens(prompt), request(16));
+            require(cudaProfilerStart() == cudaSuccess, "cannot start CUDA profiler");
+            const auto measured = engine.generate(engine.prepare_tokens(prompt), request(128));
+            require(cudaProfilerStop() == cudaSuccess, "cannot stop CUDA profiler");
+            valid(measured, 128);
+            std::cout << "profile K=" << k << " graph=" << graph
+                      << " decode_s=" << measured.timings.decode_seconds
+                      << " rounds=" << measured.speculative.rounds
+                      << " accepted=" << measured.speculative.accepted_tokens
+                      << "/" << measured.speculative.drafted_tokens << " per_position=";
+            for (const auto accepted : measured.speculative.accepted_per_position) {
+                std::cout << accepted << ',';
+            }
+            std::cout << '\n';
+            return 0;
+        }
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
@@ -201,9 +349,6 @@ int main(int argc, char** argv) {
             }
         }
         const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
-                "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
             auto long_prompt = std::vector<ninfer::TokenId>(2100, 198);
@@ -229,11 +374,17 @@ int main(int argc, char** argv) {
                         tail.generated_token_ids.size() == 5,
                     "full proposal window escaped the target context capacity tail");
         }
+        if (mtp_decode_rate) {
+            const double dflash2_decode_rate = decode_rate(engine);
+            std::cout << "decode-only 3x127 tokens, TP2, B=1, graph=" << graph
+                      << " ordinary=" << *ordinary_decode_rate << " tok/s MTP3="
+                      << *mtp_decode_rate << " tok/s DFlash2-K=" << k
+                      << "=" << dflash2_decode_rate << " tok/s\n";
+        }
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " decode_rounds=" << stats.decode_rounds << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

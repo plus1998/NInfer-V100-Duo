@@ -401,9 +401,11 @@ private:
         add(old_mtp + "mlp/down", {new_mtp + "mlp/down"});
 
         add_vision();
+        add_dflash2();
 
         constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
+        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers +
+                                     (directory_.at("components").contains("dflash2") ? 66 : 0);
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
                                 std::to_string(selected_.size()) + " objects; expected " +
@@ -520,13 +522,48 @@ private:
         add_segments(old_mtp + "mlp/down", {new_mtp + "mlp/down"});
 
         add_vision();
+        add_dflash2();
+        return project("gguf-blocks");
+    }
 
-        // Every object reachable from a Text, MTP, proposal or Vision parameter must be projected
+    void add_dflash2() {
+        if (directory_.at("components").contains("dflash2")) {
+            add("dflash2/feature_projection", {"dflash2/feature_projection"});
+            add("dflash2/context_norm", {"dflash2/context_norm"});
+            add("dflash2/final_norm", {"dflash2/final_norm"});
+            for (int layer = 0; layer < 5; ++layer) {
+                const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
+                add(prefix + "input_norm", {prefix + "input_norm"});
+                add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
+                add(prefix + "attention/query_key_value",
+                    {prefix + "attention/query", prefix + "attention/key",
+                     prefix + "attention/value"});
+                for (const char* role : {"query_norm", "key_norm", "output"}) {
+                    add(prefix + "attention/" + role, {prefix + "attention/" + role});
+                }
+                add(prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
+                add(prefix + "mlp/down", {prefix + "mlp/down"});
+                for (const char* branch : {"attention_conv", "mlp_conv"}) {
+                    for (const char* role : {"base_kernel", "kernel_projection"}) {
+                        const std::string name = prefix + branch + "/" + role;
+                        add(name, {name});
+                    }
+                }
+            }
+            for (const char* role : {"hidden_projection", "predecessor_codebook",
+                                     "successor_codebook"}) {
+                const std::string name = "dflash2/candidate_selector/" + std::string(role);
+                add(name, {name});
+            }
+        }
+
+        // Every object reachable from a Text, MTP, proposal, Vision or DFlash2 parameter must be projected
         // exactly once; `select` already rejects a second selection.
         std::set<std::string> required;
         for (const auto& [name, binding] : directory_.at("bindings").items()) {
             if (!name.starts_with("text/") && !name.starts_with("mtp/") &&
-                !name.starts_with("proposal/") && !name.starts_with("vision/")) {
+                !name.starts_with("proposal/") && !name.starts_with("vision/") &&
+                !name.starts_with("dflash2/")) {
                 continue;
             }
             for (const auto& part : binding_parts(name)) {
@@ -535,10 +572,9 @@ private:
         }
         for (const auto& id : required) {
             if (!physical_names_.contains(id)) {
-                throw ArtifactError("qwen3.8-27b GGUF v3 object was not projected: " + id);
+                throw ArtifactError("qwen3.8-27b v3 object was not projected: " + id);
             }
         }
-        return project("gguf-blocks");
     }
 
     V3CompatibilityDirectory project(std::string_view weights_id) {

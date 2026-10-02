@@ -267,6 +267,21 @@ add_library(ninfer_ops STATIC
   ops/wrapper/vision_pos_embed.cpp)
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_sources(ninfer_ops PRIVATE
+    ops/linear/bf16/bf16_n256_k5120_volta.cu
+    ops/attn_input_proj/w8/w8_dflash2_attn_input_volta.cu
+    ops/linear_topk/linear_topk.cpp
+    ops/linear_topk/dflash2_linear_topk_volta.cu
+    ops/launcher/swa_dflash2_volta.cu
+    ops/wrapper/candidate_selector.cpp
+    ops/candidate_selector/bf16/dflash2_selector_volta.cu
+    ops/wrapper/dynamic_grouped_conv.cpp
+    ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
+    ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.cpp
+    ops/dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.cu
+    ops/rmsnorm_rope/rmsnorm_rope.cpp
+    ops/common/dflash2_rmsnorm_rope_volta.cu
+    ops/context_kv_materialize/context_kv_materialize.cpp
+    ops/context_kv_materialize/append_volta.cu
     ops/linear/bf16/bf16_cutlass_sm70.cu
     ops/attn_input_proj/bf16/bf16_attn_input_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu

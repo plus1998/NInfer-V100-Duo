@@ -113,4 +113,24 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream);
 
+/**
+ * Applies the side-1 dynamic grouped convolution and adds it to residual.
+ * Let H=5120, G=320, W=2..16, B=1..8, h=16*g+j and z=projected:
+ *
+ *   residual[h,i,b] += (base_kernel[h,0,1]+finish_delta[g,0,i,b])*z[h,i,b]
+ *     + I(i>0)*(base_kernel[h,1,1]+finish_delta[g,1,i,b])*z[h,i-1,b].
+ *
+ * projected is contiguous BF16 [5120,W,B], base_kernel BF16 [5120,2,2],
+ * finish_delta BF16 [320,2,W,B], residual BF16 [5120,W,B]. All buffers
+ * must be disjoint and 16-byte aligned. The inputs are preserved and residual
+ * is stored in BF16; there is no workspace, allocation, or persistent state.
+ * The independent oracle evaluates the complete expression in FP64 from the
+ * represented BF16 inputs. When the projection is row-sharded, call the
+ * existing linear_row_parallel() first so the convolution is applied to the
+ * all-reduced projection, and add the original residual only once.
+ */
+void dynamic_grouped_conv_finish_add(const Tensor& projected, const Tensor& base_kernel,
+                                     const Tensor& finish_delta, Tensor& residual,
+                                     cudaStream_t stream);
+
 } // namespace ninfer::ops

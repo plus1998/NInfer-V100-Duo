@@ -229,6 +229,7 @@ struct PeerRuntime {
     // from records neither ever exchanges.
     std::optional<GdnReplayRecords> replay_records;
     qwen3_6::RoundState io;
+    std::optional<typename qwen3_6::detail::TP2DFlashExtension<Variant>::State> tp2_dflash;
     Tensor prefill_hidden;
     // Rank 1's OWN penalty counters. `ops::SamplingConfig::token_counts` is a raw device pointer,
     // and the MTP round's acceptance runs on both devices (see the replicated-accept note in
@@ -336,6 +337,7 @@ public:
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
+    std::optional<typename qwen3_6::detail::TP2DFlashExtension<Variant>::State> tp2_dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
@@ -349,6 +351,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    DecodeGraphFamily dflash2_graphs;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
@@ -394,6 +397,11 @@ public:
     std::optional<PinnedHostBuffer> dflash_host;
     qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     qwen3_6::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    std::optional<PinnedHostBuffer> dflash2_host;
+    qwen3_6::DFlash2DecodeIngress* dflash2_host_ingress = nullptr;
+    qwen3_6::DFlash2DecodeEgress* dflash2_host_egress = nullptr;
+    std::optional<PinnedHostBuffer> dflash2_peer_host;
+    qwen3_6::DFlash2DecodeIngress* dflash2_peer_host_ingress = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
 
@@ -434,6 +442,7 @@ private:
     // Mirrors `mtp_host_ingress` into `mtp_peer_host_ingress`, swapping every row's counter
     // pointer for rank 1's. No-op at tp1 or without MTP.
     void publish_peer_mtp_ingress(std::span<const std::uint32_t> lanes);
+    void publish_peer_dflash2_ingress(std::span<const std::uint32_t> lanes);
     // Mirrors `ordinary_host_ingress` into `ordinary_peer_host_ingress` with every row's counter
     // pointer nulled. No-op at tp1 or without an ordinary frame.
     void publish_peer_ordinary_ingress();
@@ -465,6 +474,9 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_dflash2_batch(std::span<const std::uint32_t> lanes,
+                         std::span<const runtime::RoundBudget> budgets);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,

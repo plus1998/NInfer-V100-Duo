@@ -18,9 +18,17 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     const bool row_shard    = n == 5120 && (k == 3072 ||    // 6144   / 2 (attention/gdn output)
                                             k == 5120 ||    // 10240  / 2 (mtp/input_projection)
                                             k == 8704);     // 17408  / 2 (mlp/down)
-    if (!column_shard && !row_shard) { return nullptr; }
+#ifdef NINFER_VOLTA_BUILD
+    const bool dflash2_shard = n == 5120 && (k == 2048 || k == 12800);
+#else
+    const bool dflash2_shard = false;
+#endif
+    if (!column_shard && !row_shard && !dflash2_shard) { return nullptr; }
     if (t <= 4) { return launch_w8_simt_r8_c4; }
     if (t <= 16) { return launch_w8_simt_r8_c8; }
+#ifdef NINFER_VOLTA_BUILD
+    if (k == 12800 && w8_volta_mma_supported(n, k, t)) { return launch_w8_volta_mma; }
+#endif
     return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 
@@ -29,6 +37,14 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
 // both registered here and listed as a shard extent keeps its tuned tp1 launcher.
 W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
+#ifdef NINFER_VOLTA_BUILD
+    case 25600:
+        if (n == 5120 && t <= 2048) {
+            if (t <= 8) { return launch_w8_simt_r8_c8; }
+            return launch_w8_volta_mma;
+        }
+        break;
+#endif
     case 10240:
         if (n == 5120) {
             if (t <= 48) { return launch_w8_small_t; }
@@ -74,6 +90,13 @@ W8Launch select_w8_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
         }
         break;
     case 4096:
+#ifdef NINFER_VOLTA_BUILD
+        if (n == 5120) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_volta_mma;
+        }
+#endif
         if (n == 2048) {
             if (t <= 48) { return launch_w8_small_t; }
             if (t <= 56) { return launch_w8_simt_r8_c4; }

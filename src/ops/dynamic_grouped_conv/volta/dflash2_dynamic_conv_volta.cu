@@ -117,18 +117,17 @@ __global__ void dflash2_bf16_matvec_kernel(const __nv_bfloat16* __restrict__ w,
     }
 }
 
-// K=7 DFlash2 always projects eight normalized positions through the same control matrix. The
-// scalar fallback launches one CTA per (row, position), rereading every weight row eight times.
-// This route keeps all eight dot products in one CTA: each weight is loaded once, activations are
-// shared by cache, and the reduction tree matches the fallback's four-warp block reduction.
+// Keep each weight row resident across eight control columns instead of rereading it for each
+// position; the last tile may contain fewer than eight live columns.
 __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_w8_kernel(
     const __nv_bfloat16* __restrict__ w, const __nv_bfloat16* __restrict__ x,
-    __nv_bfloat16* __restrict__ out) {
+    __nv_bfloat16* __restrict__ out, int columns) {
     constexpr int kRows = 1280;
     constexpr int k     = 5120;
     constexpr int kCols = 8;
     constexpr int kWarps = 4;
     const int row = static_cast<int>(blockIdx.x);
+    const int column_begin = static_cast<int>(blockIdx.y) * kCols;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const __nv_bfloat16* wrow = w + static_cast<std::int64_t>(row) * k;
@@ -138,8 +137,12 @@ __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_w8_kernel(
         const float weight = __bfloat162float(wrow[i]);
 #pragma unroll
         for (int col = 0; col < kCols; ++col) {
-            acc[col] = fmaf(weight, __bfloat162float(x[static_cast<std::int64_t>(col) * k + i]),
-                            acc[col]);
+            if (column_begin + col < columns) {
+                acc[col] = fmaf(weight,
+                                __bfloat162float(x[static_cast<std::int64_t>(column_begin + col) *
+                                                     k + i]),
+                                acc[col]);
+            }
         }
     }
 
@@ -150,10 +153,11 @@ __global__ __launch_bounds__(128, 4) void dflash2_bf16_control_w8_kernel(
         if (lane == 0) { sums[warp][col] = acc[col]; }
     }
     __syncthreads();
-    if (warp == 0 && lane < kCols) {
+    if (warp == 0 && lane < kCols && column_begin + lane < columns) {
         // Preserve block_reduce_sum<128>'s pairwise order: (warp0 + warp2) + (warp1 + warp3).
         const float total = (sums[0][lane] + sums[2][lane]) + (sums[1][lane] + sums[3][lane]);
-        out[row + static_cast<std::int64_t>(lane) * kRows] = __float2bfloat16_rn(total);
+        out[row + static_cast<std::int64_t>(column_begin + lane) * kRows] =
+            __float2bfloat16_rn(total);
     }
 }
 
@@ -174,8 +178,9 @@ void dflash2_dynamic_conv_prepare_launch(const __nv_bfloat16* n, const __nv_bflo
 void dflash2_bf16_control_projection_launch(const __nv_bfloat16* w, const __nv_bfloat16* x,
                                            int n_rows, int k, int cols, __nv_bfloat16* out,
                                            cudaStream_t stream) {
-    if (n_rows == 1280 && k == 5120 && cols == 8) {
-        dflash2_bf16_control_w8_kernel<<<n_rows, 128, 0, stream>>>(w, x, out);
+    if (n_rows == 1280 && k == 5120 && cols >= 8) {
+        dflash2_bf16_control_w8_kernel<<<dim3(n_rows, (cols + 7) / 8), 128, 0, stream>>>(
+            w, x, out, cols);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -473,6 +474,142 @@ int run_q4(const DeviceBuffer& hidden, const std::vector<double>& base_score) {
     return failures;
 }
 
+int run_tp2(QType qtype, const std::vector<std::uint16_t>& host_hidden,
+            const std::vector<double>& base_score) {
+    int device_count = 0;
+    cuda_check(cudaGetDeviceCount(&device_count), "tp2 device count");
+    if (device_count < 2) {
+        std::cout << "SKIP linear_topk tp2: requires two devices\n";
+        return 0;
+    }
+    ExecutionContext execution({0, 1});
+    ops::PeerEvents events(execution, ops::enable_peer_access(execution));
+    std::vector<std::int32_t> host_map(kShortRows);
+    for (std::int32_t row = 0; row < kShortRows; ++row) {
+        host_map[row] = kValidRows - 1 - row;
+    }
+    const bool full = qtype == QType::W8G32_F16S;
+    const int rows = full ? kFullRows : kShortRows;
+    const auto expected = full ? expected_order(kFullWinnerRows, nullptr)
+                               : expected_order(kShortWinnerRows, &host_map);
+    struct Rank {
+        FixtureWeight fixture;
+        DeviceBuffer hidden;
+        DeviceBuffer map;
+        DeviceBuffer scratch;
+        std::unique_ptr<WorkspaceArena> arena;
+    };
+    std::array<Rank, 2> ranks;
+    const auto capacity = ops::linear_topk_tp2_workspace_capacity_bytes(qtype, rows / 2, 120);
+    std::array<Tensor, 2> hidden_views, map_views;
+    std::array<Weight, 2> weights;
+    std::array<WorkspaceArena*, 2> workspaces;
+    for (int rank = 0; rank < 2; ++rank) {
+        cuda_check(cudaSetDevice(execution.dev[rank]->device), "tp2 select device");
+        auto& buffers = ranks[rank];
+        buffers.fixture = make_rowsplit(qtype, rows / 2);
+        if (full) {
+            for (std::size_t index = 0; index < kFullWinnerRows.size(); ++index) {
+                const int row = kFullWinnerRows[index] - rank * (rows / 2);
+                if (row >= 0 && row < rows / 2) {
+                    patch_rowsplit_row(buffers.fixture, qtype, row, factor_for(index));
+                }
+            }
+            if (rank == 1) {
+                patch_rowsplit_row(buffers.fixture, qtype, rows / 2 - 1, 64.0F);
+            }
+        } else {
+            for (std::size_t index = 0; index < kShortWinnerRows.size(); ++index) {
+                const int row = kShortWinnerRows[index] - rank * (rows / 2);
+                if (row >= 0 && row < rows / 2) {
+                    patch_rowsplit_row(buffers.fixture, qtype, row, factor_for(index));
+                }
+            }
+        }
+        buffers.hidden = DeviceBuffer(host_hidden.size() * sizeof(std::uint16_t));
+        buffers.hidden.copy_from_host(host_hidden.data(), buffers.hidden.bytes);
+        if (!full) {
+            buffers.map = DeviceBuffer(host_map.size() * sizeof(std::int32_t));
+            buffers.map.copy_from_host(host_map.data(), buffers.map.bytes);
+        }
+        buffers.scratch = DeviceBuffer(capacity);
+        buffers.arena = std::make_unique<WorkspaceArena>(
+            DeviceSpan{buffers.scratch.p, buffers.scratch.bytes});
+        hidden_views[rank] = Tensor(buffers.hidden.p, DType::BF16, {kHidden, 120});
+        if (!full) {
+            map_views[rank] = Tensor(buffers.map.p, DType::I32, {kShortRows});
+        }
+        weights[rank] = buffers.fixture.weight;
+        workspaces[rank] = buffers.arena.get();
+    }
+    cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 select output device");
+    DeviceBuffer ids(kTopK * 120 * sizeof(std::int32_t));
+    DeviceBuffer scores(kTopK * 120 * sizeof(float));
+    int failures = 0;
+    for (int columns : {1, 3, 24, 120}) {
+        std::array<Tensor, 2> input{
+            Tensor(hidden_views[0].data, DType::BF16, {kHidden, columns}),
+            Tensor(hidden_views[1].data, DType::BF16, {kHidden, columns})};
+        Tensor output_ids(ids.p, DType::I32, {kTopK, columns});
+        Tensor output_scores(scores.p, DType::FP32, {kTopK, columns});
+        ops::linear_topk_tp2(input, weights, full ? nullptr : &map_views,
+                             output_ids, output_scores,
+                             workspaces, execution, events);
+        for (int rank = 0; rank < 2; ++rank) {
+            cuda_check(cudaSetDevice(execution.dev[rank]->device), "tp2 sync device");
+            execution.dev[rank]->synchronize();
+            if (workspaces[rank]->used() != 0 || workspaces[rank]->peak_used() > capacity) {
+                std::cerr << "linear_topk tp2 workspace accounting failure\n";
+                ++failures;
+            }
+        }
+        cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 check output");
+        failures += verify_invocation(full ? "w8-tp2" : "q4-tp2", columns,
+                                      output_ids, output_scores,
+                                      base_score, expected);
+    }
+    constexpr int graph_columns = 3;
+    std::array<Tensor, 2> graph_input{
+        Tensor(hidden_views[0].data, DType::BF16, {kHidden, graph_columns}),
+        Tensor(hidden_views[1].data, DType::BF16, {kHidden, graph_columns})};
+    Tensor graph_ids(ids.p, DType::I32, {kTopK, graph_columns});
+    Tensor graph_scores(scores.p, DType::FP32, {kTopK, graph_columns});
+    cudaEvent_t fork = nullptr;
+    cudaEvent_t join = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_execution = nullptr;
+    cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 graph origin");
+    cuda_check(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming), "tp2 graph fork");
+    cuda_check(cudaSetDevice(execution.dev[1]->device), "tp2 graph peer");
+    cuda_check(cudaEventCreateWithFlags(&join, cudaEventDisableTiming), "tp2 graph join");
+    cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 graph origin");
+    cuda_check(cudaStreamBeginCapture(execution.dev[0]->stream, cudaStreamCaptureModeThreadLocal),
+               "tp2 graph begin");
+    cuda_check(cudaEventRecord(fork, execution.dev[0]->stream), "tp2 graph record fork");
+    cuda_check(cudaSetDevice(execution.dev[1]->device), "tp2 graph peer");
+    cuda_check(cudaStreamWaitEvent(execution.dev[1]->stream, fork, 0), "tp2 graph peer fork");
+    ops::linear_topk_tp2(graph_input, weights, full ? nullptr : &map_views,
+                         graph_ids, graph_scores, workspaces, execution, events);
+    cuda_check(cudaEventRecord(join, execution.dev[1]->stream), "tp2 graph record join");
+    cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 graph origin");
+    cuda_check(cudaStreamWaitEvent(execution.dev[0]->stream, join, 0), "tp2 graph origin join");
+    cuda_check(cudaStreamEndCapture(execution.dev[0]->stream, &graph), "tp2 graph end");
+    cuda_check(cudaGraphInstantiate(&graph_execution, graph, 0), "tp2 graph instantiate");
+    cuda_check(cudaGraphLaunch(graph_execution, execution.dev[0]->stream), "tp2 graph replay 1");
+    cuda_check(cudaGraphLaunch(graph_execution, execution.dev[0]->stream), "tp2 graph replay 2");
+    execution.dev[0]->synchronize();
+    cuda_check(cudaSetDevice(execution.dev[1]->device), "tp2 graph peer");
+    execution.dev[1]->synchronize();
+    cuda_check(cudaSetDevice(execution.dev[0]->device), "tp2 graph origin");
+    failures += verify_invocation(full ? "w8-tp2 graph" : "q4-tp2 graph", graph_columns,
+                                  graph_ids, graph_scores, base_score, expected);
+    cuda_check(cudaGraphExecDestroy(graph_execution), "tp2 graph destroy execution");
+    cuda_check(cudaGraphDestroy(graph), "tp2 graph destroy");
+    cuda_check(cudaEventDestroy(join), "tp2 graph destroy join");
+    cuda_check(cudaEventDestroy(fork), "tp2 graph destroy fork");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -491,6 +628,10 @@ int main() {
         failures += run_full(QType::FP8_E4M3FN_ROW_BF16S, "fp8-full", hidden,
                              base_scores(QType::FP8_E4M3FN_ROW_BF16S, host_hidden));
         failures += run_q4(hidden, base_scores(QType::Q4G64_F16S, host_hidden));
+        failures += run_tp2(QType::Q4G64_F16S, host_hidden,
+                            base_scores(QType::Q4G64_F16S, host_hidden));
+        failures += run_tp2(QType::W8G32_F16S, host_hidden,
+                            base_scores(QType::W8G32_F16S, host_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

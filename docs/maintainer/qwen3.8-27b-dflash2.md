@@ -1,12 +1,22 @@
 # Qwen3.8-27B DFlash2 算法核心
 
-> 状态：正式 Engine 已接入，支持启动固定 `K=1..15`、`B=1..8`、eager/CUDA Graph、Text/Vision 和 Device/Host 状态复用。
+> 状态：双 V100 (`sm_70`)、TP2 的 GSQ v3 和 NVFP4 v3 DFlash2 已接入公开 Engine；
+> NVFP4 仅支持优化 proposal head (`--lm-head-draft`)，不支持 FP8 full head。
+> 五层 draft、top-16 proposal、稀疏 target 接受、pending context catch-up、
+> GDN replay fold、部分 terminal 提交、rewrite checkpoint 和 Vision prefill 共用一条
+> Program 路线；支持独立的 eager 与双卡 CUDA Graph decode。
+> GSQ v3 真权重 Engine 测试在 2 × V100-SXM2 16 GB、CUDA 12.8 上通过：
+> `K=7/B=1` eager 和 Graph、`K=7/B=3` eager + Vision，
+> `K=15/B=3` Graph + Vision（含跨 2048 ring、terminal/stop、复用与混合预算）。
+> 这是 Engine 行为回归；五层 draft 作为整体未建立独立模型 oracle。
+> 该短 counting-prompt 的单请求 Graph decode，DFlash2-K7 为 43.7 tok/s，
+> MTP3 为 96.4 tok/s；top-16 并行归并后的 K3 为 55.45 tok/s。第一 draft 接受率及
+> 每轮 top-16/小矩阵开销均造成差距，见 [性能记录](../performance.md#dflash2-versus-mtp3-one-request-decode)。
+> 长上下文资源上限和其他工作负载的速度仍须独立测量。
 >
 > 范围：本文只固定 Qwen3.8-27B DFlash2 的模型计算、proposal、target
 > verification 和状态语义。Artifact inventory 与存储格式由
-> [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md) 管理；Op 拆分、shape 和融合边界由
-> [`2026-09-05-qwen3.8-27b-dflash2-op-checklist.md`](2026-09-05-qwen3.8-27b-dflash2-op-checklist.md)
-> 管理。
+> [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md) 管理；下述验收合同不代表当前构建已通过。
 
 ## 1. 核对依据与结论
 
@@ -531,9 +541,12 @@ candidate edge/conditional walk 和 sparse-`q` accept 都是必须的语义边�
 ## 11. Engine 实现与验收
 
 27B package 的 immutable model view 绑定本 checkpoint 的 DFlash2 payload；family runtime
-拥有共同的 masked-draft prefill、round、Frontend commit、StateImage 和 Graph 生命周期。
-五层动态卷积及 coherent selector 在 family 的 `dflash_impl.h` 中按编译期配置选择，target
-projection/post-mixer 继续使用既有三个 execution-leaf families。所有计算 kernel 仍归 `src/ops`。
+拥有共同的 Text/Vision prefill、target verify、Frontend commit、StateImage 和 Graph 生命周期。
+27B Variant 持有五层 TP2 draft/context、动态卷积和 coherent selector 的专用执行叶；
+现有 family `dflash_impl.h` 是 35B DFlash1 路线，不可直接分派 DFlash2。
+所有计算 kernel 仍归 `src/ops`。Program 必须为 27B 的 TP2 DFlash2 独立规划双卡
+BF16 K/FP16 V 的五层 cyclic state、pending features 与 proposal ids/q，而不能复用
+35B 的六层 local/full backend KV 布局；普通 target KV/ReplaySSM 保持 family 合同。
 
 每个 Engine 仅为所选 K 分配 proposal、verify、top-16 ids/q 和 ReplaySSM records。Graph
 按 exact B 和有界 attention frontier 区间构造；普通 target KV 保持所选 codec，DFlash2
@@ -545,15 +558,16 @@ Sparse accept 保留实际 q 且只读 token counts。Frontend preview 后，Pro
 的 N 个 token 增加 counts，以 N fold ReplaySSM；partial terminal 的 continuation hidden
 选 N−1。terminal、checkpoint 和保留状态的 context materialization 包含全部已提交输入。
 
-真实 Engine 验证入口为 `ninfer_qwen3_8_27b_dflash2_real_test`，命令和所覆盖行为见
+目标真实 Engine 验证入口为 `ninfer_qwen3_8_27b_dflash2_real_test`，命令和所覆盖行为见
 [tests README](../../tests/README.md)。RTX 5090、sm_120a、CUDA 13.1 上已验证两种本地
 companion artifact、K=1/2/7/15、full/optimized head、BF16/INT8 target KV、eager/Graph、
 B=1/2/8、penalty counts、固定 seed 重放、partial terminal、超过 2048 token 的 ring
 替换/续接、image/video 及 Host State restore。固定贪心 fixture 与 ordinary decoding
 比较用于检测接线/状态回归；它不把不同浮点执行路线的任意输入都要求为 token parity。
-各 Op 的数学或 exact-state 判据仍由对应 qualification 定义。
+各 Op 的数学或 exact-state 判据仍由对应 qualification 定义。以上为原始目标的历史
+验证，不能作为 V100 Duo 当前 27B 路线的执行资格证据。
 
-正式吞吐/逐阶段测量使用 [product benchmark](../../bench/README.md) 的
+接通后的正式吞吐/逐阶段测量应使用 [product benchmark](../../bench/README.md) 的
 `--spec dflash2 --draft-tokens K`；无需私有推理入口。每个常规 decode round 传输固定
 1184 B ingress 和 576 B egress，前者为位置/slot/采样控制，后者为 token ids 和接受数量。
 q、hidden、KV、ReplaySSM records 和 local ring 留在 Device；Host StateImage 传输属于

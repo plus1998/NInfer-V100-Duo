@@ -94,6 +94,24 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * DFlash2 target verification with the actual sparse proposal distribution.
+ * `proposal_ids` is I32 [16,K,B], `proposal_q` is FP32 [16,K,B], with distinct global
+ * ids per proposal column, normalized nonnegative probabilities and drafts[i,b] drawn from
+ * that column. All other shapes, target sampling/penalty semantics and state effects match
+ * speculative_accept_greedy_drafts. For positive temperature, accept draft d with probability
+ * min(1,p(d)/q(d)); on first rejection sample from normalized max(p(v)-q(v),0) over the
+ * target's filtered support. For greedy target rows q is ignored and exact argmax matching
+ * applies. The caller supplies the same workspace capacity as the greedy-draft route.
+ * The target/proposal operands and workspace must be disjoint from mutated state/output tensors.
+ */
+void speculative_accept_sparse_drafts(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& proposal_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, std::int32_t token_domain, const SamplingConfig* configs,
+    WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Op: speculative_select_accepted_hidden
  *
  * Math / indexing:

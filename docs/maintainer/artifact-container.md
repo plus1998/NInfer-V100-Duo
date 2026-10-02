@@ -406,10 +406,12 @@ layout names map to the registered identities, and the chat template from
   version-2 NVFP4 inventory, including Vision;
 - otherwise it projects to `qwen3.8-27b/gguf-blocks` (Section 15 of the artifact reference). A
   fused parameter group whose parts span several physical objects becomes ordered row segments
-  `<name>#0..#3`; Vision and DFlash2 objects are not projected.
+  `<name>#0..#3`; Vision and, when present, DFlash2 companion objects are projected. The DFlash2
+  projection does not enable DFlash2 execution; this target still runs Text/Vision/MTP only.
 
 Projection rejects any binding that is not whole rows of its objects, segments that disagree on
-columns, unregistered formats or layouts, and any Text/MTP/proposal object left unprojected.
+columns, unregistered formats or layouts, and any Text/MTP/proposal/Vision/DFlash2 object left
+unprojected.
 
 ## 10. Explicit exclusions
 

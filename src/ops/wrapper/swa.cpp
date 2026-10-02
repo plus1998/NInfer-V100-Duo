@@ -36,8 +36,9 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
-    if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+    const bool dflash2 = context.capacity == 2048 && context.num_kv_heads == 4;
+    if ((!dflash2 && (context.num_kv_heads != kKVHeads || context.capacity != kWindow)) ||
+        context.head_dim != kHeadDim || context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -46,11 +47,14 @@ void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
         throw std::overflow_error(std::string(op) + ": padded capacity exceeds int32");
     }
     const auto padded = static_cast<std::int32_t>(context.padded_capacity);
-    if (context.k.dtype != DType::BF16 || context.v.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
+    if (context.k.dtype != DType::BF16 ||
+        context.v.dtype != (dflash2 ? DType::FP16 : DType::BF16)) {
+        throw std::invalid_argument(std::string(op) + ": invalid context K/V dtype");
     }
-    require_shape(context.k, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context k");
-    require_shape(context.v, kHeadDim, padded, kKVHeads, context.lane_capacity, op, "context v");
+    require_shape(context.k, kHeadDim, padded, context.num_kv_heads, context.lane_capacity, op,
+                  "context k");
+    require_shape(context.v, kHeadDim, padded, context.num_kv_heads, context.lane_capacity, op,
+                  "context v");
     require_contiguous_nonnull(context.k, op, "context k");
     require_contiguous_nonnull(context.v, op, "context v");
 }
@@ -107,13 +111,16 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
         throw std::invalid_argument("swa: optimized domain is T=1..16");
     }
     if (batch < 1 || batch > 8) { throw std::invalid_argument("swa: B must be 1..8"); }
-    require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
-    require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
-    require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");
+    const bool dflash2 = context.capacity == 2048 && context.num_kv_heads == 4;
+    const auto query_heads = dflash2 ? 16 : kQHeads;
+    const auto kv_heads = dflash2 ? 4 : kKVHeads;
+    require_shape(q, kHeadDim, query_heads, tokens, batch, op, "q");
+    require_shape(query_k, kHeadDim, kv_heads, tokens, batch, op, "query k");
+    require_shape(query_v, kHeadDim, kv_heads, tokens, batch, op, "query v");
     require_shape(positions, tokens, batch, 1, 1, op, "positions");
     require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
     require_shape(lanes, batch, 1, 1, 1, op, "lanes");
-    require_shape(out, kHeadDim, kQHeads, tokens, batch, op, "out");
+    require_shape(out, kHeadDim, query_heads, tokens, batch, op, "out");
     require_contiguous_nonnull(q, op, "q");
     require_contiguous_nonnull(query_k, op, "query k");
     require_contiguous_nonnull(query_v, op, "query v");
@@ -132,8 +139,22 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::swa_resolve_plan(tokens, envelope);
+    auto plan                = detail::swa_resolve_plan(tokens, envelope);
+#ifdef NINFER_VOLTA_BUILD
+    if (dflash2 && tokens == 8 && batch == 3 && plan.route == detail::SwaRoute::SplitKv) {
+        plan.split_capacity = std::min(plan.split_capacity, 8);
+    }
+#endif
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
+#ifdef NINFER_VOLTA_BUILD
+    if (dflash2) {
+        detail::swa_dflash2_launch(q, query_k, query_v, positions, valid_columns, lanes, scale,
+                                   context, plan, partial.acc, partial.m, partial.l, out, stream);
+        return;
+    }
+#else
+    if (dflash2) { throw std::invalid_argument("DFlash2 swa requires sm_70"); }
+#endif
     detail::swa_launch(q, query_k, query_v, positions, valid_columns, lanes, scale, context, plan,
                        partial.acc, partial.m, partial.l, out, stream);
 }

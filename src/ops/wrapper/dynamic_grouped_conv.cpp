@@ -2,6 +2,7 @@
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_plan.h"
+#include "ops/dynamic_grouped_conv/volta/dflash2_dynamic_conv_volta.h"
 
 #include <array>
 #include <cmath>
@@ -117,6 +118,15 @@ void require_finish_nonoverlap(const Tensor& x, const Weight& projection_weight,
     }
 }
 
+template <std::size_t N>
+void require_disjoint(const std::array<Range, N>& ranges, const char* op) {
+    for (std::size_t first = 0; first < ranges.size(); ++first)
+        for (std::size_t second = first + 1; second < ranges.size(); ++second)
+            if (overlaps(ranges[first], ranges[second]))
+                throw std::invalid_argument(std::string(op) + ": " + ranges[first].label +
+                                            " overlaps " + ranges[second].label);
+}
+
 void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
                         const Tensor& base_kernel, const Weight& kernel_projection_weight,
                         const Tensor& prepared, const Tensor& finish_delta,
@@ -218,6 +228,31 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
 
     detail::w8_linear_dynamic_grouped_conv_add_dispatch(x, projection_weight, base_kernel,
                                                         finish_delta, residual, workspace, stream);
+}
+
+void dynamic_grouped_conv_finish_add(const Tensor& projected, const Tensor& base_kernel,
+                                     const Tensor& finish_delta, Tensor& residual,
+                                     cudaStream_t stream) {
+    constexpr const char* op = "dynamic grouped conv finish add";
+    const std::int32_t width = projected.ne[1];
+    const std::int32_t batch = projected.ne[2];
+    if (width < 2 || width > 16 || batch < 1 || batch > 8)
+        throw std::invalid_argument(std::string(op) + ": invalid W/B profile");
+    require_tensor(projected, DType::BF16, kHidden, width, batch, 1, op, "projected");
+    require_tensor(base_kernel, DType::BF16, kHidden, kTaps, kSides, 1, op, "base_kernel");
+    require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch, op, "finish_delta");
+    require_tensor(residual, DType::BF16, kHidden, width, batch, 1, op, "residual");
+    require_disjoint(std::array<Range, 4>{{
+        {projected.data, projected.bytes(), "projected"},
+        {base_kernel.data, base_kernel.bytes(), "base_kernel"},
+        {finish_delta.data, finish_delta.bytes(), "finish_delta"},
+        {residual.data, residual.bytes(), "residual"},
+    }}, op);
+    detail::dflash2_dynamic_conv_finish_add_launch(
+        static_cast<const __nv_bfloat16*>(projected.data),
+        static_cast<const __nv_bfloat16*>(finish_delta.data),
+        static_cast<const __nv_bfloat16*>(base_kernel.data), width, batch,
+        static_cast<__nv_bfloat16*>(residual.data), stream);
 }
 
 } // namespace ninfer::ops

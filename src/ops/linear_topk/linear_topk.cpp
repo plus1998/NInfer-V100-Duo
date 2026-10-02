@@ -1,10 +1,9 @@
 #include "ninfer/ops/linear_topk.h"
 
 #include "core/layout.h"
-#include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/gguf/gguf.h"
 #include "ops/linear_topk/dflash2_linear_topk_volta.h"
-#include "ops/linear_topk/linear_topk_launch.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
@@ -120,23 +119,6 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
     const std::int32_t valid_rows = profile == HeadProfile::Q4Optimized
                                         ? detail::kLinearTopKOptimizedRows
                                         : detail::kLinearTopKFullValidRows;
-#ifdef NINFER_VOLTA_BUILD
-    // K=4..7 DFlash2 supplies 5..8 proposal columns, exactly the one-tile Volta QPN band. Emit
-    // each 32-row CTA's top 16 order keys from the projection epilogue and merge those lists;
-    // avoid both the dense BF16 logits and a second full-vocabulary read.
-    if (profile == HeadProfile::Q4Optimized && hidden.ne[1] >= detail::kVoltaQpnMinT &&
-        hidden.ne[1] <= detail::kVoltaQpnMaxT) {
-        auto scope = workspace.scope();
-        auto topk_workspace = detail::allocate_linear_topk_workspace(
-            workspace, head.n, hidden.ne[1], detail::kVoltaQpnRowsPerTopKProducer);
-        detail::launch_q4_volta_qpn_topk(
-            hidden, head, *id_map,
-            static_cast<std::uint64_t*>(topk_workspace.partial_keys.data),
-            topk_workspace.producer_groups, stream);
-        detail::linear_topk_merge_launch(topk_workspace, ids, scores, stream);
-        return;
-    }
-#endif
     // sm_70 port: materialize the head logits with the general linear op, then a single
     // top-16 selection kernel. The BF16 logit scratch is a rounding the fused kernel avoids.
     for (int first = 0; first < hidden.ne[1];) {
@@ -146,14 +128,152 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
         auto out_scores = column_slice(scores, first, columns);
         auto scope      = workspace.scope();
         Tensor logits   = workspace.alloc(DType::BF16, {head.n, columns});
+        const int tiles = (valid_rows + detail::kDflash2TopKTileRows - 1) /
+                          detail::kDflash2TopKTileRows;
+        Tensor partial_ids = workspace.alloc(DType::I32, {16 * tiles, columns});
+        Tensor partial_scores = workspace.alloc(DType::FP32, {16 * tiles, columns});
         linear(x, head, logits, stream);
         detail::dflash2_linear_topk16_launch(
             logits, id_map != nullptr ? static_cast<const std::int32_t*>(id_map->data) : nullptr,
-            valid_rows, out_ids, out_scores, stream);
+            valid_rows, out_ids, out_scores, partial_ids, partial_scores, stream);
         first += columns;
     }
 }
 } // namespace
+
+std::size_t linear_topk_tp2_workspace_capacity_bytes(QType qtype, std::int32_t local_rows,
+                                                     std::int32_t columns) {
+    if (columns < 1 || columns > 120 ||
+        !((qtype == QType::W8G32_F16S && local_rows == 124160) ||
+          (qtype == QType::Q4G64_F16S && local_rows == 65536) ||
+          (qtype == QType::GGUF && (local_rows == 124160 || local_rows == 65536)))) {
+        throw std::invalid_argument("linear_topk tp2: unsupported head or column count");
+    }
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {local_rows, columns});
+    (void)layout.alloc(DType::I32, {16, columns});
+    (void)layout.alloc(DType::FP32, {16, columns});
+    (void)layout.alloc(DType::I32, {16, 2 * columns});
+    (void)layout.alloc(DType::FP32, {16, 2 * columns});
+    const int tiles = (local_rows + detail::kDflash2TopKTileRows - 1) /
+                      detail::kDflash2TopKTileRows;
+    (void)layout.alloc(DType::I32, {16 * tiles, columns});
+    (void)layout.alloc(DType::FP32, {16 * tiles, columns});
+    const auto linear_bytes = linear_workspace_capacity_bytes(
+        qtype, local_rows, 5120, LinearPolicy::A16Only, columns, columns);
+    if (linear_bytes != 0) { (void)layout.alloc_bytes(linear_bytes); }
+    return layout.peak_bytes(256);
+}
+
+void linear_topk_tp2(const std::array<Tensor, 2>& hidden, const std::array<Weight, 2>& head,
+                     const std::array<Tensor, 2>* id_map, Tensor& candidate_ids,
+                     Tensor& candidate_scores, const std::array<WorkspaceArena*, 2>& workspace,
+                     const ExecutionContext& execution, const PeerEvents& events) {
+    if (execution.tp != 2 || !execution.dev[0] || !execution.dev[1] ||
+        execution.dev[0]->device == execution.dev[1]->device ||
+        !workspace[0] || !workspace[1] || head[0].qtype != head[1].qtype ||
+        hidden[0].ne[1] != hidden[1].ne[1]) {
+        throw std::invalid_argument("linear_topk tp2: invalid ranks");
+    }
+    const bool full = head[0].n == 124160;
+    const int local_rows = full ? 124160 : 65536;
+    const int columns = hidden[0].ne[1];
+    const std::size_t workspace_bytes =
+        linear_topk_tp2_workspace_capacity_bytes(head[0].qtype, local_rows, columns);
+    require_matrix(candidate_ids, DType::I32, 16, columns, "tp2 ids");
+    require_matrix(candidate_scores, DType::FP32, 16, columns, "tp2 scores");
+    if (overlaps(candidate_ids, candidate_scores)) {
+        throw std::invalid_argument("linear_topk tp2: candidate outputs overlap");
+    }
+    if (full ? id_map != nullptr : id_map == nullptr) {
+        throw std::invalid_argument("linear_topk tp2: id map does not match head");
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        require_matrix(hidden[rank], DType::BF16, 5120, columns, "tp2 hidden");
+        const Weight& shard = head[rank];
+        const auto* scratch_begin =
+            static_cast<const std::byte*>(workspace[rank]->base()) + workspace[rank]->used();
+        if (shard.qtype == QType::GGUF) {
+            detail::validate_gguf_weight(shard, "linear_topk tp2 GGUF shard");
+        }
+        if (shard.n != local_rows || shard.k != 5120 || shard.ndim != 2 ||
+            shard.shape[0] != local_rows || shard.shape[1] != 5120 ||
+            shard.padded_shape[0] != local_rows || shard.padded_shape[1] != 5120 ||
+            (shard.qtype != QType::GGUF &&
+             (shard.layout != QuantLayout::RowSplit || shard.scale_dtype != DType::FP16 ||
+              shard.group_size != (full ? 32 : 64) || shard.group != (full ? 32 : 64) ||
+              shard.qhigh != nullptr || shard.high_plane_bytes != 0 ||
+              !aligned_to(shard.qdata, 16) || !aligned_to(shard.scales, 16))) ||
+            workspace[rank]->capacity() - workspace[rank]->used() < workspace_bytes ||
+            (id_map && (id_map->at(rank).dtype != DType::I32 ||
+                        id_map->at(rank).ne[0] != 131072 ||
+                        id_map->at(rank).ne[1] != 1 || id_map->at(rank).ne[2] != 1 ||
+                        id_map->at(rank).ne[3] != 1 ||
+                        !aligned_to(id_map->at(rank).data, 16) ||
+                        !id_map->at(rank).is_contiguous())) ||
+            overlaps(hidden[rank], candidate_ids) || overlaps(hidden[rank], candidate_scores) ||
+            overlaps(scratch_begin, workspace_bytes, hidden[rank].data, hidden[rank].bytes()) ||
+            (id_map && overlaps(scratch_begin, workspace_bytes, id_map->at(rank).data,
+                                id_map->at(rank).bytes())) ||
+            (shard.payload &&
+             (overlaps(scratch_begin, workspace_bytes, shard.payload, shard.payload_bytes) ||
+              overlaps(shard.payload, shard.payload_bytes, hidden[rank].data,
+                       hidden[rank].bytes()) ||
+              (rank == 0 &&
+               (overlaps(shard.payload, shard.payload_bytes, candidate_ids.data,
+                         candidate_ids.bytes()) ||
+                overlaps(shard.payload, shard.payload_bytes, candidate_scores.data,
+                         candidate_scores.bytes()))))) ||
+            (rank == 0 &&
+             (overlaps(scratch_begin, workspace_bytes, candidate_ids.data,
+                       candidate_ids.bytes()) ||
+              overlaps(scratch_begin, workspace_bytes, candidate_scores.data,
+                       candidate_scores.bytes())))) {
+            throw std::invalid_argument("linear_topk tp2: invalid shard or workspace");
+        }
+    }
+
+    auto first_scope = workspace[0]->scope();
+    auto second_scope = workspace[1]->scope();
+    std::array<Tensor, 2> local_ids, local_scores, gathered_ids, gathered_scores;
+    int previous_device = 0;
+    CUDA_CHECK(cudaGetDevice(&previous_device));
+    try {
+        for (int rank = 0; rank < 2; ++rank) {
+            CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+            WorkspaceArena& scratch = *workspace[rank];
+            Tensor logits = scratch.alloc(DType::BF16, {local_rows, columns});
+            local_ids[rank] = scratch.alloc(DType::I32, {16, columns});
+            local_scores[rank] = scratch.alloc(DType::FP32, {16, columns});
+            gathered_ids[rank] = scratch.alloc(DType::I32, {16, 2 * columns});
+            gathered_scores[rank] = scratch.alloc(DType::FP32, {16, 2 * columns});
+            const int count = full ? (rank == 0 ? local_rows : 248077 - local_rows)
+                                   : local_rows;
+            const int tiles = (count + detail::kDflash2TopKTileRows - 1) /
+                              detail::kDflash2TopKTileRows;
+            Tensor partial_ids = scratch.alloc(DType::I32, {16 * tiles, columns});
+            Tensor partial_scores = scratch.alloc(DType::FP32, {16 * tiles, columns});
+            linear(hidden[rank], head[rank], logits, LinearPolicy::A16Only, scratch,
+                   execution.dev[rank]->stream);
+            const auto* map = full ? nullptr :
+                static_cast<const std::int32_t*>(id_map->at(rank).data) + rank * local_rows;
+            detail::dflash2_linear_topk16_launch(logits, map, count, local_ids[rank],
+                                                 local_scores[rank], partial_ids, partial_scores,
+                                                 execution.dev[rank]->stream,
+                                                 rank * local_rows);
+        }
+        allgather_rows(gathered_ids, local_ids, execution, events);
+        allgather_rows(gathered_scores, local_scores, execution, events);
+        CUDA_CHECK(cudaSetDevice(execution.dev[0]->device));
+        detail::dflash2_merge_tp2_topk16_launch(gathered_ids[0], gathered_scores[0],
+                                                 candidate_ids, candidate_scores,
+                                                 execution.dev[0]->stream);
+    } catch (...) {
+        (void)cudaSetDevice(previous_device);
+        throw;
+    }
+    CUDA_CHECK(cudaSetDevice(previous_device));
+}
 
 std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_rows,
                                                  std::int32_t input_rows, std::int32_t min_columns,
@@ -163,18 +283,15 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         throw std::invalid_argument("linear_topk workspace: invalid column interval");
     }
     const std::int32_t chunk = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
-    std::size_t capacity = static_cast<std::size_t>(head_rows) * chunk * sizeof(std::uint16_t);
-#ifdef NINFER_VOLTA_BUILD
-    if (qtype == QType::Q4G64_F16S && head_rows == detail::kLinearTopKOptimizedRows &&
-        min_columns <= detail::kVoltaQpnMaxT && max_columns >= detail::kVoltaQpnMinT) {
-        const int columns = std::min(max_columns, detail::kVoltaQpnMaxT);
-        WorkspaceLayoutBuilder layout;
-        (void)detail::allocate_linear_topk_workspace(
-            layout, head_rows, columns, detail::kVoltaQpnRowsPerTopKProducer);
-        capacity = std::max(capacity, layout.peak_bytes());
-    }
-#endif
-    return capacity;
+    const int valid_rows = head_rows == detail::kLinearTopKOptimizedRows
+                               ? head_rows : detail::kLinearTopKFullValidRows;
+    const int tiles = (valid_rows + detail::kDflash2TopKTileRows - 1) /
+                      detail::kDflash2TopKTileRows;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {head_rows, chunk});
+    (void)layout.alloc(DType::I32, {16 * tiles, chunk});
+    (void)layout.alloc(DType::FP32, {16 * tiles, chunk});
+    return layout.peak_bytes(256);
 }
 
 void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,

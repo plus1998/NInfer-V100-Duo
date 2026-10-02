@@ -1,12 +1,14 @@
 #pragma once
 
 #include "core/arena.h"
+#include "ninfer/ops/allreduce.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 namespace ninfer::ops {
 
@@ -60,5 +62,24 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
 void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
                  cudaStream_t stream);
+
+/**
+ * Two-rank row-sharded top sixteen for the V100 DFlash2 proposal head. The head shards are
+ * W8 or GGUF [124160,5120] (full, rows >=248077 excluded), or Q4 or GGUF
+ * [65536,5120] (shortlist).
+ * `hidden` is replicated BF16 [5120,U] on both ranks, with U=1..120. For Q4, `id_map` is a
+ * replicated I32 [131072] global-token map; for W8 it is null. The operation projects and
+ * selects sixteen on each rank, exchanges only the selected ids/scores, and returns the global
+ * stable top sixteen on rank 0 as I32/FP32 [16,U]. Ties choose the lower global token id.
+ * Each rank's workspace is disjoint from all operands, stream-ordered and caller-owned. The
+ * returned tensors, weights, and inputs may not overlap one another or the workspaces.
+ */
+[[nodiscard]] std::size_t linear_topk_tp2_workspace_capacity_bytes(QType qtype,
+                                                                    std::int32_t local_rows,
+                                                                    std::int32_t columns);
+void linear_topk_tp2(const std::array<Tensor, 2>& hidden, const std::array<Weight, 2>& head,
+                     const std::array<Tensor, 2>* id_map, Tensor& candidate_ids,
+                     Tensor& candidate_scores, const std::array<WorkspaceArena*, 2>& workspace,
+                     const ExecutionContext& execution, const PeerEvents& events);
 
 } // namespace ninfer::ops

@@ -34,9 +34,12 @@ Vision is disabled by default: its weights, Vision scratch phase, and frozen req
 buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
-`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
+`--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
-cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
+cannot be combined with `--vision`. DFlash2 requires a registered Qwen3.8 artifact with
+its embedded companion and `--tp 2`; it also supports Vision. The NVFP4 profile
+requires `--lm-head-draft` for DFlash2 (its FP8 full-head top-16 route is not
+supported). A later request cannot enable a capability omitted at startup.
 
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
 distinct device per rank. It supports `--spec mtp` (with `--draft-tokens` and `--lm-head-draft`)

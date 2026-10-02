@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
+#include "targets/qwen3_6/impl/runtime/tp2_feature_sink.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -266,9 +267,17 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end, TP2FeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end,
+                  TP2FeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
@@ -321,7 +330,8 @@ public:
                              ops::GqaExecutionEnvelope envelope,
                              const std::array<Tensor, 2>& hidden,
                              const std::array<Tensor, 2>& logits,
-                             const std::array<Tensor, 2>& target_tokens);
+                             const std::array<Tensor, 2>& target_tokens,
+                             TP2FeatureSink* sink = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const std::array<Tensor, 2>& hidden,
                                   const std::array<Tensor, 2>& cache_positions,
                                   const std::array<Tensor, 2>& rope_positions,
@@ -393,7 +403,7 @@ private:
                       const MlpW& m1, std::array<Tensor, 2>& x, Phase phase,
                       const std::array<Tensor, 2>& staging);
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
-                        const std::array<Tensor, 2>& staging);
+                        const std::array<Tensor, 2>& staging, TP2FeatureSink* sink = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -495,7 +505,8 @@ private:
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                       const TextPrefill& text_prefill,
                                                       bool finalize_at_end,
-                                                      const MultimodalPrefill* multimodal = nullptr);
+                                                      const MultimodalPrefill* multimodal = nullptr,
+                                                      TP2FeatureSink* sink = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

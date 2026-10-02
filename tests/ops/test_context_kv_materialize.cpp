@@ -22,7 +22,6 @@ namespace {
 
 constexpr int kLayers             = static_cast<int>(ops::kContextKVMaterializeLayers);
 constexpr int kHidden             = 5120;
-constexpr int kRows               = 1024;
 constexpr int kHeadDim            = 128;
 constexpr int kHeads              = 8;
 constexpr int kCapacity           = 2048;
@@ -44,16 +43,16 @@ constexpr ReductionCriterion kValueCriterion{
     3.8e-3,
 };
 
-std::size_t cache_elements() {
-    return static_cast<std::size_t>(kHeadDim) * kPaddedCapacity * kHeads * kLaneCapacity;
+std::size_t cache_elements(int heads) {
+    return static_cast<std::size_t>(kHeadDim) * kPaddedCapacity * heads * kLaneCapacity;
 }
 
-std::size_t cache_index(int lane, int head, int slot, int dim) {
+std::size_t cache_index(int lane, int head, int slot, int dim, int heads) {
     return static_cast<std::size_t>(dim) +
            static_cast<std::size_t>(kHeadDim) *
                (static_cast<std::size_t>(slot) +
                 static_cast<std::size_t>(kPaddedCapacity) *
-                    (static_cast<std::size_t>(head) + static_cast<std::size_t>(kHeads) * lane));
+                    (static_cast<std::size_t>(head) + static_cast<std::size_t>(heads) * lane));
 }
 
 std::vector<float> make_context(int columns, std::uint32_t seed) {
@@ -87,24 +86,31 @@ struct LayerStorage {
     std::vector<std::uint8_t> parent_host;
     std::vector<float> norm_host;
     DeviceBuffer norm_device;
-    GuardedDeviceBuffer cache_k{cache_elements() * sizeof(std::uint16_t)};
-    GuardedDeviceBuffer cache_v{cache_elements() * sizeof(std::uint16_t)};
+    GuardedDeviceBuffer cache_k;
+    GuardedDeviceBuffer cache_v;
+
+    explicit LayerStorage(int heads)
+        : cache_k(cache_elements(heads) * sizeof(std::uint16_t)),
+          cache_v(cache_elements(heads) * sizeof(std::uint16_t)) {}
 };
 
 struct Fixture {
-    std::array<LayerStorage, kLayers> storage;
+    std::vector<LayerStorage> storage;
+    int heads;
     std::array<std::size_t, 9> observed_peak{};
     std::array<ops::ContextKVMaterializeLayerView, kLayers> views;
 
-    Fixture() {
+    explicit Fixture(int kv_heads = kHeads) : heads(kv_heads) {
+        storage.reserve(kLayers);
         const quantized_weight::PatternedWeightOptions weight_options{
             quantized_weight::RowSplitScalePattern::Tiny};
         for (int layer = 0; layer < kLayers; ++layer) {
-            LayerStorage& target = storage[static_cast<std::size_t>(layer)];
+            storage.emplace_back(heads);
+            LayerStorage& target = storage.back();
             target.key_host      = quantized_weight::make_patterned_weight(
-                QType::W8G32_F16S, kRows, kHidden, 0x310U + 2U * layer, weight_options);
+                QType::W8G32_F16S, heads * kHeadDim, kHidden, 0x310U + 2U * layer, weight_options);
             target.value_host = quantized_weight::make_patterned_weight(
-                QType::W8G32_F16S, kRows, kHidden, 0x311U + 2U * layer, weight_options);
+                QType::W8G32_F16S, heads * kHeadDim, kHidden, 0x311U + 2U * layer, weight_options);
             constexpr std::size_t parent_codes = 6144ULL * kHidden;
             target.parent_host.resize(parent_codes + 6144ULL * (kHidden / 32) * 2, 0x63);
             const auto put = [&](const quantized_weight::PackedWeight& weight, int row) {
@@ -115,7 +121,7 @@ struct Fixture {
                             target.parent_host.data() + parent_codes + row * (kHidden / 32) * 2);
             };
             put(target.key_host, 4096);
-            put(target.value_host, 5120);
+            put(target.value_host, 4096 + heads * kHeadDim);
             target.parent_device = to_device(target.parent_host);
             const auto row_view  = [&](const quantized_weight::PackedWeight& weight, int row) {
                 auto result = weight.device_weight(target.parent_device.p);
@@ -133,16 +139,16 @@ struct Fixture {
 
             views[static_cast<std::size_t>(layer)] = {
                 row_view(target.key_host, 4096),
-                row_view(target.value_host, 5120),
+                row_view(target.value_host, 4096 + heads * kHeadDim),
                 Tensor(target.norm_device.p, DType::BF16, {kHeadDim}),
                 CyclicKVCacheLayerView{
                     .k               = Tensor(target.cache_k.data(), DType::BF16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
+                                              {kHeadDim, kPaddedCapacity, heads, kLaneCapacity}),
                     .v               = Tensor(target.cache_v.data(), DType::FP16,
-                                              {kHeadDim, kPaddedCapacity, kHeads, kLaneCapacity}),
+                                              {kHeadDim, kPaddedCapacity, heads, kLaneCapacity}),
                     .capacity        = kCapacity,
                     .padded_capacity = kPaddedCapacity,
-                    .num_kv_heads    = kHeads,
+                    .num_kv_heads    = heads,
                     .head_dim        = kHeadDim,
                     .lane_capacity   = kLaneCapacity,
                 },
@@ -208,16 +214,19 @@ int verify_state_effect(const std::string& label, const Fixture& fixture,
     int failures = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
-        const auto cache_k = from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
-        const auto cache_v = from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
+        const auto cache_k =
+            from_device<std::uint16_t>(source.cache_k.data(), cache_elements(fixture.heads));
+        const auto cache_v =
+            from_device<std::uint16_t>(source.cache_v.data(), cache_elements(fixture.heads));
         int first_bad      = -1;
         for (int lane = 0; lane < kLaneCapacity && first_bad < 0; ++lane) {
-            for (int head = 0; head < kHeads && first_bad < 0; ++head) {
+            for (int head = 0; head < fixture.heads && first_bad < 0; ++head) {
                 for (int slot = 0; slot < kPaddedCapacity && first_bad < 0; ++slot) {
                     const bool written =
                         written_slots[static_cast<std::size_t>(lane)].contains(slot);
                     for (int dim = 0; dim < kHeadDim; ++dim) {
-                        const std::size_t index = cache_index(lane, head, slot, dim);
+                        const std::size_t index =
+                            cache_index(lane, head, slot, dim, fixture.heads);
                         const bool k_changed    = cache_k[index] != kSentinel;
                         const bool v_changed    = cache_v[index] != kSentinel;
                         if (k_changed != written || v_changed != written) {
@@ -255,17 +264,19 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
     for (int layer = 0; layer < kLayers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
         const auto cache_k_bits =
-            from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
+            from_device<std::uint16_t>(source.cache_k.data(), cache_elements(fixture.heads));
         const auto cache_v_bits =
-            from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
+            from_device<std::uint16_t>(source.cache_v.data(), cache_elements(fixture.heads));
         std::vector<double> key_got;
         std::vector<double> key_expected;
         std::vector<double> value_got;
         std::vector<double> value_expected;
         const std::vector<int> heads = (width == 1 || width == 8 || width == 16 || width > 16)
-                                           ? std::vector<int>{0, 3, 7}
-                                           : std::vector<int>{width % 8};
-        const std::array<int, 4> value_rows{0, 127, 511, 1023};
+                                           ? std::vector<int>{0, fixture.heads / 2,
+                                                              fixture.heads - 1}
+                                           : std::vector<int>{width % fixture.heads};
+        const std::array<int, 4> value_rows{0, 127, fixture.heads * kHeadDim / 2 - 1,
+                                             fixture.heads * kHeadDim - 1};
         for (const auto [batch, local] : samples) {
             const int column   = batch * width + local;
             const int position = positions[static_cast<std::size_t>(column)];
@@ -279,10 +290,12 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
                     const int first_dim  = pair;
                     const int second_dim = pair + kHeadDim / 2;
                     key_got.push_back(
-                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, first_dim)]));
+                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, first_dim,
+                                                              fixture.heads)]));
                     key_expected.push_back(head_expected[static_cast<std::size_t>(2 * pair)]);
                     key_got.push_back(
-                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, second_dim)]));
+                        bf16_to_f32(cache_k_bits[cache_index(lane, head, slot, second_dim,
+                                                              fixture.heads)]));
                     key_expected.push_back(head_expected[static_cast<std::size_t>(2 * pair + 1)]);
                 }
             }
@@ -294,7 +307,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
                     quantized_weight::detail::f32_to_f16(represented);
                 value_expected.push_back(quantized_weight::detail::f16_to_f32(expected_bits));
                 value_got.push_back(quantized_weight::detail::f16_to_f32(
-                    cache_v_bits[cache_index(lane, head, slot, dim)]));
+                    cache_v_bits[cache_index(lane, head, slot, dim, fixture.heads)]));
             }
         }
         failures += verify_reduction(label + " K layer=" + std::to_string(layer), key_got,
@@ -457,6 +470,22 @@ int main() {
         fixture.reset_cache();
         failures += run_case(fixture, "zero projection", 3, 3, {0, 1, 3}, {-1, 7, 2},
                              {-1, -1, -1, 2047, -1, -1, 262142, 262143, 262144}, 0, true, true);
+        Fixture tp2_fixture(4);
+        for (int width : {2, 8, 16}) {
+            tp2_fixture.reset_cache();
+            std::vector<int> positions(width * 3, -1);
+            for (int index = 0; index < width; ++index) {
+                positions[width + index] = 2046 + index;
+                positions[2 * width + index] = 262140 + index;
+            }
+            failures += run_case(tp2_fixture, "TP2 4-head W=" + std::to_string(width), width,
+                                 3, {0, width, width}, {-1, 2, 7}, positions, 0x706U);
+        }
+        tp2_fixture.reset_cache();
+        std::vector<int> tp2_positions(128);
+        for (int index = 0; index < 128; ++index) tp2_positions[index] = 262140 + index;
+        failures += run_case(tp2_fixture, "TP2 4-head prefill W=128", 128, 1, {128}, {3},
+                             tp2_positions, 0x707U);
         for (int batch = 1; batch <= 8; ++batch) {
             const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
                 batch, 1, batch == 1 ? 2048 : 16);

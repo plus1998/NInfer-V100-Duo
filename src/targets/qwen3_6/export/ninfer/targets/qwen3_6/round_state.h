@@ -24,6 +24,7 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     bool enable_mtp              = false;
     bool enable_dflash           = false;
+    bool enable_dflash2          = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -87,6 +88,25 @@ struct DFlashDecodeEgress {
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
 };
 
+struct DFlash2DecodeIngress {
+    std::array<TokenId, kMaximumConcurrency> anchors{};
+    std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
+    std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
+    std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
+    std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
+    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth>
+        target_rope_positions{};
+    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+};
+
+struct DFlash2DecodeEgress {
+    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+};
+
 struct OrdinaryDecodeStateLayout {
     LayoutRegion ingress;
     LayoutRegion egress;
@@ -140,6 +160,17 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_continuation_hidden;
 };
 
+struct DFlash2DecodeStateLayout {
+    LayoutRegion ingress;
+    LayoutRegion egress;
+    TensorRegion verify_ids;
+    TensorRegion target_positions;
+    TensorRegion target_logits;
+    TensorRegion target_tokens;
+    TensorRegion target_hidden;
+    TensorRegion target_continuation_hidden;
+};
+
 struct RoundStateLayout {
     RoundStateSpec spec;
     std::optional<OrdinaryDecodeStateLayout> ordinary;
@@ -154,6 +185,7 @@ struct RoundStateLayout {
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
     std::optional<DFlashDecodeStateLayout> dflash_decode;
+    std::optional<DFlash2DecodeStateLayout> dflash2_decode;
     bool complete = false;
 };
 
@@ -271,6 +303,33 @@ struct DFlashDecodeState {
                       std::uint32_t batch_capacity, std::uint32_t draft_window);
 };
 
+struct DFlash2DecodeState {
+    DeviceSpan ingress;
+    DeviceSpan egress;
+    Tensor anchors;
+    Tensor execution_frontiers;
+    Tensor context_frontiers;
+    Tensor proposal_extents;
+    Tensor target_valid_columns;
+    Tensor text_kv_table_rows;
+    Tensor lanes;
+    Tensor target_rope_positions;
+    const ops::SamplingConfig* sampling = nullptr;
+    Tensor licensed_tokens;
+    Tensor licensed_counts;
+    Tensor accepted_drafts;
+    Tensor verify_ids;
+    Tensor target_positions;
+    Tensor target_logits;
+    Tensor target_tokens;
+    Tensor target_hidden;
+    Tensor target_continuation_hidden;
+
+    DFlash2DecodeState() = default;
+    DFlash2DecodeState(DeviceSpan backing, const DFlash2DecodeStateLayout& layout,
+                       std::uint32_t batch_capacity, std::uint32_t draft_window);
+};
+
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
     Tensor token;
@@ -284,6 +343,7 @@ struct RoundState {
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;
     std::optional<DFlashDecodeState> dflash_decode;
+    std::optional<DFlash2DecodeState> dflash2_decode;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

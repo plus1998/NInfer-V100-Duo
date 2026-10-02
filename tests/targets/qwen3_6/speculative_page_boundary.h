@@ -22,7 +22,13 @@ inline void speculative_page_boundary(Engine& engine) {
         return options;
     };
 
-    auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
+    PromptInput input;
+    input.options.enable_thinking = false;
+    ChatMessage message;
+    message.parts.push_back({MessagePartKind::Text,
+                             "Count from one to twenty: one, two, three,", {}});
+    input.messages.push_back(std::move(message));
+    auto prompt = engine.prepare(std::move(input)).debug_token_ids();
     check(prompt.size() <= 63, "page-boundary prompt exceeds its fixed prefix");
     prompt.insert(prompt.begin(), 63 - prompt.size(), 198);
     const auto reference = engine.generate(engine.prepare_tokens(prompt), request(false));

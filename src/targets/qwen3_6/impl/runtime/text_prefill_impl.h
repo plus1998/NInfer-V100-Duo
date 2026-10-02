@@ -86,6 +86,11 @@ PrefillChunkResult prefill_text_chunk(
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
     }
+    if (state.tp2_feature_sink != nullptr) {
+        if (!tp) { throw std::logic_error("TP2 feature prefill requires two ranks"); }
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  *state.tp2_feature_sink);
+    }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }
 
@@ -112,6 +117,11 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
+    if (state.tp2_feature_sink != nullptr) {
+        if (!tp) { throw std::logic_error("TP2 visual feature prefill requires two ranks"); }
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
+                                  finalize_at_end, *state.tp2_feature_sink);
+    }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 

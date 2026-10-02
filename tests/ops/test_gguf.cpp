@@ -566,6 +566,10 @@ int main() {
                 check_projection(wide, tokens, 2, true, false, false, rng, "wide");
                 check_projection(wide, tokens, 2, true, false, false, rng, "wide", true);
             }
+            const HostWeight draft_head = make_weight({{GgufType::Q4_K, 65536}}, 5120, rng);
+            for (const int tokens : {2, 3, 4}) {
+                check_projection(draft_head, tokens, 1, false, false, false, rng, "draft head");
+            }
             const HostWeight output = make_weight({{GgufType::IQ4_XS, 512}}, 6144, rng);
             const HostWeight shard = make_weight({{GgufType::Q4_K, 512}}, 3072, rng);
             for (const int tokens : {1, 5, 24}) {

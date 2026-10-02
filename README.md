@@ -2,17 +2,22 @@
 
 Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB (NVLink)**, TP2, CUDA 12.8:
 the **official NVFP4** artifact (executed in software on Volta) and the
-**GSQ-RCO IQ3_S GGUF-blocks** artifact (Text + Vision + MTP, [below](#gsq-rco-iq3_s-gguf-blocks)).
+**GSQ-RCO IQ3_S GGUF-blocks** artifact. Both contain Text, Vision, MTP and a
+DFlash2 companion; MTP3 is the faster measured choice for short decode.
 Based on
 [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 
 ## Start
 
-Build with `tools/v100/build.sh` and download the
-[official Qwen3.8-27B NVFP4 artifact](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
-or the
-[GSQ-RCO IQ3_S NInfer v3 artifact](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3).
+Build with `tools/v100/build.sh` and download one of these **registered
+`.ninfer` files** (not the source checkpoint or a raw GGUF):
+
+| Model | Download | Local filename used below | Strength on 2 × 16 GB |
+|---|---|---|---|
+| Official Qwen3.8-27B NVFP4 | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_nvfp4.ninfer` | Faster short MTP3 decode; smaller maximum context |
+| GSQ-RCO IQ3_S NInfer v3 | [Hugging Face](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3) | `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | Faster long-prompt prefill; native 262K context |
+
 All commands below use TP2 on two V100s, INT8 KV, MTP3 with an optimized draft
 head, and CUDA Graph. The server listens on `127.0.0.1:8080`; stop it before
 starting another profile.
@@ -20,18 +25,49 @@ starting another profile.
 On the tested **2 × 16 GB** setup, choose a profile by workload (commands and
 capacity limits are detailed below):
 
-| Workload | Artifact | Startup flags after `model=...` |
+| Model | Workload | Startup flags after `model=...` |
 |---|---|---|
-| [Vision, one request](#vision-one-request) | NVFP4 | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 1 --kv-capacity 155648` |
-| [Text concurrency, up to four requests](#concurrent-text-requests) | NVFP4 | `--max-context 131072 --prefill-chunk 1024 --max-concurrency 4 --kv-capacity 131072` |
-| [Vision + concurrency, up to two requests](#vision-with-concurrency) | NVFP4 | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 2 --kv-capacity 155648` |
-| [Native 262K context + two text slots](#gsq-rco-iq3_s-gguf-blocks) | GSQ-RCO | `--max-context 262144 --kv-capacity 262144 --max-concurrency 2` |
-| [Native 262K context + three Vision/text slots](#gsq-rco-iq3_s-gguf-blocks) | GSQ-RCO | `--vision --vision-max-tokens 2048 --max-context 262144 --prefill-chunk 1024 --max-concurrency 3 --kv-capacity 400000` |
+| NVFP4 | [Text, one request](#vision-one-request) | Launcher defaults: `--max-context 180224 --prefill-chunk 4096 --max-concurrency 1` |
+| NVFP4 | [Vision, one request](#vision-one-request) | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 1 --kv-capacity 155648` |
+| NVFP4 | [Text concurrency, four slots](#concurrent-text-requests) | `--max-context 131072 --prefill-chunk 1024 --max-concurrency 4 --kv-capacity 131072` |
+| NVFP4 | [Vision + concurrency, two slots](#vision-with-concurrency) | `--vision --vision-max-tokens 2048 --max-context 155648 --prefill-chunk 1024 --max-concurrency 2 --kv-capacity 155648` |
+| NVFP4 | [Maximum observed text context, **near-OOM**, not recommended](#vision-one-request) | `--max-context 200000 --prefill-chunk 1024 --max-concurrency 1` |
+| GSQ-RCO | [Text, one request / native context](#gsq-rco-iq3_s-gguf-blocks) | `--max-context 262144 --kv-capacity 262144 --max-concurrency 1` |
+| GSQ-RCO | [Vision, one request / native context](#gsq-rco-iq3_s-gguf-blocks) | `--vision --vision-max-tokens 2048 --max-context 262144 --prefill-chunk 1024 --max-concurrency 1 --kv-capacity auto` |
+| GSQ-RCO | [Text concurrency, three slots](#gsq-rco-iq3_s-gguf-blocks) | `--max-context 262144 --prefill-chunk 1024 --max-concurrency 3 --kv-capacity auto` |
+| GSQ-RCO | [Vision + concurrency, three slots](#gsq-rco-iq3_s-gguf-blocks) | `--vision --vision-max-tokens 2048 --max-context 262144 --prefill-chunk 1024 --max-concurrency 3 --kv-capacity auto` |
 
 Four text slots favor aggregate short-prompt throughput; use the [two-slot
 text profile](#concurrent-text-requests) for a 155K per-request ceiling. Slots
 share a KV pool, so these profiles do not guarantee simultaneous full-context
 requests.
+
+**Adjusting to available VRAM.** Begin with the row for your artifact, then
+check the *smaller* of the two GPUs' free memory after startup. For more margin,
+lower `--kv-capacity` first (but keep it at least `--max-context` if one full
+length request must fit); next lower `--prefill-chunk`, `--max-concurrency`,
+`--vision-max-tokens`, or `--max-context` as the workload permits. Larger
+prefill chunks usually improve long-prompt prefill but reserve more scratch.
+`--kv-capacity auto` maximizes the **shared** main-KV pool under its planned
+headroom; it does not reserve one full `--max-context` per concurrent slot.
+For simultaneous near-limit requests budget roughly the *sum* of their
+occupied contexts, not just one context. Memory headroom and the native
+262,144-token ceiling do not by themselves guarantee long-context speed or
+multiple full-context completions. Vision weights live mainly on GPU 0, so
+check both GPUs rather than assuming the same margin.
+
+| Parameter | What it changes |
+|---|---|
+| `--max-context N` | Per-request token ceiling, including input, media expansion and generated tokens; larger values also enlarge planned per-request state/graphs. |
+| `--kv-capacity N\|auto` | Shared physical main-KV token pool; explicit `N` makes memory usage predictable; `auto` chooses an admissible pool with planned margin. |
+| `--max-concurrency N` | Startup-fixed active request slots and decode graph shapes; slots without KV entitlement wait for admission. |
+| `--prefill-chunk N` | Maximum text prefill chunk; lowering it saves transient workspace at the cost of more/smaller prefill passes. |
+| `--vision --vision-max-tokens N` | Enables image/video and caps merged visual tokens *per prompt*; raises primary-GPU allocations. |
+| `draft-tokens=3\|4\|5` | MTP draft window in the launcher; compare output quality as well as rate. |
+
+These flags go **after** `model=...`; the launcher applies them after its MTP3
+defaults. For DFlash2 experiments, override `--spec dflash2 --draft-tokens K
+--lm-head-draft` explicitly; the profiles and tables below use MTP, not DFlash2.
 
 ### Vision, one request
 
@@ -66,7 +102,8 @@ tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 The text-only default leaves approximately 233 MiB of planned per-GPU
-headroom. The 200K variant **must set both flags**; 200K with a 4,096-token
+headroom. A fresh 200K startup left only **153 MiB free on the primary GPU**; treat it as a
+capacity boundary, **not** a reliable serving recommendation. The 200K variant **must set both flags**; 200K with a 4,096-token
 chunk does not fit on these 16 GB cards and uses slower prefill. The model's
 262,144-token native limit does not fit this setup. Do not simply add
 `--vision` to either text-only command: Vision adds GPU allocations.
@@ -77,6 +114,77 @@ To change the MTP draft window in any command, put `draft-tokens=4` or
 fastest in the measured decode task but generated different output.
 
 ## Prefill
+
+### Two-model comparison after rebuild
+
+Rebuilt `build-v100-duo` on **2 × V100-SXM2 16 GB / CUDA 12.8** and measured
+both explicit artifacts through the public Engine on October 2, 2026.
+Both use TP2, INT8 KV, CUDA Graph, optimized MTP3, **131,072** context
+capacity and 4,096-token chunks. For each code-chat prompt, the two artifacts
+produced identical input token IDs; each rate below averages **two fresh,
+uncached requests** with one first token from prefill and **512 measured
+decode tokens**. Model loading and graph preparation are excluded. This fixed
+budget disables model stops and is a speed workload, not an answer-quality
+test. The 512-token point uses a different, shorter source excerpt than the
+10K/30K points.
+
+| Input length | NVFP4 prefill | GSQ prefill | NVFP4 decode | GSQ decode |
+|---:|---:|---:|---:|---:|
+| 512 tokens | 878 tok/s | **1,358 tok/s** | **128.60 tok/s** | 110.03 tok/s |
+| 10,000 tokens | 1,123 tok/s | **1,857 tok/s** | **120.12 tok/s** | 107.61 tok/s |
+| 30,000 tokens | 1,062 tok/s | **1,683 tok/s** | **119.22 tok/s** | 104.55 tok/s |
+
+These measurements show GSQ's prefill advantage and NVFP4's decode advantage
+on the *same* inputs/capacity. They are not an old/new binary A/B and cannot
+prove zero speed regression; the earlier [context-decay](#context-decay-上下文衰减)
+and [GSQ 262K](#gsq-rco-iq3_s-gguf-blocks) numbers use different capacities,
+source snapshots or output windows. See the [exact commands and output](docs/performance.md#v100-duo-october-2026-rebuild-two-artifact-comparison).
+
+### MTP3/4/5: peak and average decode
+
+The same rebuilt server, TP2, INT8 KV, Graph, optimized proposal, **131,072**
+capacity, one active request, no thinking or prefix reuse. For the same
+74-token pelican-HTML user prompt, each model/window ran **three naturally
+completed greedy requests**. Peak is the fastest logged five-second decode
+interval; average is the arithmetic mean of three full-request decode rates
+(`(output tokens − 1) / decode seconds`, excluding prefill and loading).
+
+| Model | Window | Outputs per request | Peak 5 s | Average whole-request decode |
+|---|---|---:|---:|---:|
+| NVFP4 | MTP3 | 9,668 | 148.2 tok/s | 138.06 tok/s |
+| NVFP4 | MTP4 | 9,324 | 156.4 tok/s | 142.87 tok/s |
+| NVFP4 | MTP5 | 9,881 | **176.0 tok/s** | **151.45 tok/s** |
+| GSQ-RCO | MTP3 | 6,986 | **121.0 tok/s** | **109.61 tok/s** |
+| GSQ-RCO | MTP4 | 5,887 | 110.4 tok/s | 95.16 tok/s |
+| GSQ-RCO | MTP5 | 6,531 | 119.6 tok/s | 93.75 tok/s |
+
+**Different artifacts and MTP windows produce different text and lengths**;
+neither the peak nor the average establishes answer-quality parity. MTP3 is
+the default for both models: it is fastest of the measured GSQ windows and
+the earlier NVFP4 pelican response better fulfilled the requested animation
+than NVFP4 MTP4/5. The lower 131K capacity also differs from the older
+NVFP4 180K table below; do not compare their rates as a code regression.
+See [measurement details](docs/performance.md#v100-duo-october-2026-rebuild-two-artifact-comparison).
+
+### Three Agent first requests
+
+One uncached Engine request per captured *first SDK turn* after the same rebuild,
+with **131,072** context, 4,096-token chunks, MTP3 and eight decode tokens;
+the benchmark primes the decode Graph separately, but does not warm up the
+measured Agent prompt:
+
+| Captured SDK | Qwen input tokens | NVFP4 TTFT | GSQ TTFT | NVFP4 prefill | GSQ prefill |
+|---|---:|---:|---:|---:|---:|
+| Pi | 1,298 | 1.248 s | **0.912 s** | 1,040 tok/s | **1,424 tok/s** |
+| Codex | 11,720 | 10.452 s | **6.213 s** | 1,121 tok/s | **1,886 tok/s** |
+| Claude Code | 16,368 | 14.759 s | **8.978 s** | 1,109 tok/s | **1,823 tok/s** |
+
+The SDKs send requests to a localhost capture server; their rendered payloads
+are tokenized independently with each NInfer artifact (the IDs matched).
+**TTFT** is from Engine request start to its first generated token, not model
+load, SDK startup, network latency or an Agent's visible answer. This new
+Codex SDK capture has 11,720 tokens, not the 11,718-token capture below;
+it is not an identical-input rerun of the earlier table.
 
 **Text-only default above**, using the official NVFP4 artifact, INT8 KV and
 captured **first-turn API requests** from the three Agent SDKs:

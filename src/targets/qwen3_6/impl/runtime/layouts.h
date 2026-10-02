@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/tp2_dflash_extension.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -38,6 +39,7 @@ struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<typename qwen3_6::detail::TP2DFlashExtension<Variant>::Layout> tp2_dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
@@ -55,6 +57,8 @@ struct WorkspacePlan {
     std::size_t mtp_round      = 0;
     std::size_t dflash_context = 0;
     std::size_t dflash_round   = 0;
+    std::size_t dflash2_proposal = 0;
+    std::size_t dflash2_verify = 0;
     std::size_t vision_encode  = 0;
     std::size_t capacity       = 0;
 };

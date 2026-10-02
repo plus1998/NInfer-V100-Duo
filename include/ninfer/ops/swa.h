@@ -25,21 +25,24 @@ struct SwaContextExecutionEnvelope {
 /**
  * Op: symmetric non-causal sliding-window grouped-query attention
  *
- * The fixed optimized geometry is D=128, Hq=32, Hkv=8, group=4, and window W=4096.
- * q/out are contiguous BF16 [128,32,W,B], query_k/query_v are contiguous BF16 [128,8,W,B],
+ * The registered profiles are D=128, group=4, and scale=1/sqrt(128):
+ * - 4096-window Hq=32/Hkv=8 with BF16 context K/V;
+ * - sm_70 2048-window Hq=16/Hkv=4 with BF16 context K and FP16 context V (TP2 DFlash2).
+ * q/out are contiguous BF16 [128,Hq,W,B], query_k/query_v are BF16 [128,Hkv,W,B],
  * positions is contiguous device I32 [W,B], valid_columns and lanes are contiguous device I32
  * [B]. Row b has V=valid_columns[b] live query columns with positions[i,b]=L[b]+i for i<V;
  * lanes[b] selects its cyclic-cache lane. Columns i>=V are an inert physical tail and produce
  * zero output.
  *
- * The read-only cyclic context contains committed absolute positions [max(0,L-4096),L), with
- * absolute position p stored at physical slot p mod 4096. Query K/V is a separate temporary
+ * The read-only cyclic context contains committed absolute positions [max(0,L-capacity),L), with
+ * absolute position p stored at physical slot p mod capacity. Query K/V is a separate temporary
  * segment at positions [L,L+V). For every live query position p_i, admitted populated keys satisfy
- * abs(p_j-p_i)<4096. Thus distance 4095 is included, distance 4096 is excluded, and every query
+ * abs(p_j-p_i)<capacity. Thus distance capacity-1 is included, distance capacity is excluded,
+ * and every query
  * row sees every live temporary query row from the same batch row. scale is 1/sqrt(128).
  *
  * Context and query K/V are unchanged. out is the only observable mutation and is completely
- * overwritten. The current optimized implementation domain is T=1..16 on sm_120a.
+ * overwritten. The optimized implementation domain is W=1..16, B=1..8.
  *
  * The caller guarantees min_context <= L <= max_context, sequential nonnegative positions, and
  * that the cyclic context contains the declared live interval. The execution envelope may affect

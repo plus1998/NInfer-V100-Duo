@@ -49,6 +49,29 @@ endfunction()
 ninfer_add_op_test(ninfer_gguf_test
   SOURCES ops/test_gguf.cpp
   LIBRARIES ninfer_ops)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_test(ninfer_linear_topk_test
+    SOURCES ops/test_linear_topk.cu
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_candidate_selector_test
+    SOURCES ops/test_candidate_selector.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test
+    SOURCES ops/test_dynamic_grouped_conv_prepare.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test
+    SOURCES ops/test_linear_dynamic_grouped_conv_add.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_dflash2_tp2_conv_finish_test
+    SOURCES ops/test_dflash2_tp2_conv_finish.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_rmsnorm_rope_test
+    SOURCES ops/test_rmsnorm_rope.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_context_kv_materialize_test
+    SOURCES ops/test_context_kv_materialize.cpp
+    LIBRARIES ninfer_ops)
+endif()
 
 ninfer_add_op_test(ninfer_ggml_k_test
   SOURCES ops/test_ggml_k.cpp
@@ -208,6 +231,21 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash2_binding_test
+  SOURCES targets/qwen3_6_27b/test_dflash2_binding.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
+  LIBRARIES ninfer_engine ninfer_product_prompt_input)
+target_link_libraries(ninfer_qwen3_8_27b_dflash2_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 3600)
+target_link_libraries(ninfer_qwen3_8_27b_dflash2_binding_test PRIVATE CUDA::cudart)
+target_include_directories(ninfer_qwen3_8_27b_dflash2_binding_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_8_27b_dflash2_binding_test PROPERTIES SKIP_RETURN_CODE 77)
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
@@ -347,6 +385,11 @@ ninfer_add_op_test(ninfer_allreduce_test
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/test_linear_split.cpp
   LIBRARIES ninfer_ops)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  add_test(NAME ninfer_linear_dflash2_split_test
+    COMMAND ninfer_linear_split_test --dflash2)
+  set_tests_properties(ninfer_linear_dflash2_split_test PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 ninfer_add_op_test(ninfer_linear_add_split_test
   SOURCES ops/test_linear_add_split.cpp
   LIBRARIES ninfer_ops)
@@ -389,6 +432,14 @@ ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
 ninfer_add_op_test(ninfer_swa_test
   SOURCES ops/test_swa.cpp
   LIBRARIES ninfer_ops)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_test(ninfer_swa_dflash2_test
+    SOURCES ops/test_swa_dflash2.cpp
+    LIBRARIES ninfer_ops)
+  ninfer_add_op_test(ninfer_dflash2_tp2_attn_input_test
+    SOURCES ops/test_dflash2_tp2_attn_input.cpp
+    LIBRARIES ninfer_ops)
+endif()
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)
@@ -406,6 +457,9 @@ ninfer_add_op_test(ninfer_mtp_round_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_speculative_sparse_test
+  SOURCES ops/test_speculative_sparse.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
@@ -479,6 +533,11 @@ ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
   SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp
   LIBRARIES ninfer_engine ninfer_core)
 set_tests_properties(ninfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_test(ninfer_tp2_feature_capture_test
+    SOURCES targets/qwen3_6_27b/test_tp2_feature_sink.cpp
+    LIBRARIES ninfer_core)
+endif()
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.

@@ -177,17 +177,19 @@ void execute(Launch launch, Reset reset, bool graph) {
 }
 
 int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
-                  bool graph = false) {
+                  bool graph = false, int tensor_parallel = 1) {
+    const int query_heads = kQueryHeads / tensor_parallel;
+    const int key_heads = kKeyHeads / tensor_parallel;
     const int tokens              = width * batch;
-    const std::size_t q_count     = static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens;
-    const std::size_t k_count     = static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens;
+    const std::size_t q_count     = static_cast<std::size_t>(kHeadDim) * query_heads * tokens;
+    const std::size_t k_count     = static_cast<std::size_t>(kHeadDim) * key_heads * tokens;
     const auto q                  = make_bf16_values(q_count, seed, -4.0F, 4.0F);
     const auto k                  = make_bf16_values(k_count, seed + 1U, -4.0F, 4.0F);
     const auto q_weight           = make_bf16_values(kHeadDim, seed + 2U, 0.25F, 1.75F);
     const auto k_weight           = make_bf16_values(kHeadDim, seed + 3U, 0.25F, 1.75F);
     const auto positions          = make_positions(tokens, first_position);
-    const OracleResult q_expected = fused_oracle(q, q_weight, positions, kQueryHeads);
-    const OracleResult k_expected = fused_oracle(k, k_weight, positions, kKeyHeads);
+    const OracleResult q_expected = fused_oracle(q, q_weight, positions, query_heads);
+    const OracleResult k_expected = fused_oracle(k, k_weight, positions, key_heads);
     const auto q_bits             = bf16_bits(q);
     const auto k_bits             = bf16_bits(k);
     const auto q_weight_bits      = bf16_bits(q_weight);
@@ -200,8 +202,8 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
     DeviceBuffer q_weight_device = to_device(q_weight_bits);
     DeviceBuffer k_weight_device = to_device(k_weight_bits);
     DeviceBuffer position_device = to_device(positions);
-    Tensor q_tensor(q_device.data(), DType::BF16, {kHeadDim, kQueryHeads, width, batch});
-    Tensor k_tensor(k_device.data(), DType::BF16, {kHeadDim, kKeyHeads, width, batch});
+    Tensor q_tensor(q_device.data(), DType::BF16, {kHeadDim, query_heads, width, batch});
+    Tensor k_tensor(k_device.data(), DType::BF16, {kHeadDim, key_heads, width, batch});
     Tensor q_weight_tensor(q_weight_device.p, DType::BF16, {kHeadDim});
     Tensor k_weight_tensor(k_weight_device.p, DType::BF16, {kHeadDim});
     Tensor position_tensor(position_device.p, DType::I32, {width, batch});
@@ -222,6 +224,7 @@ int run_pair_case(int width, int batch, int first_position, std::uint32_t seed,
 
     const std::string label = "rmsnorm_rope pair W=" + std::to_string(width) +
                               " graph=" + std::to_string(graph) + " B=" + std::to_string(batch) +
+                              " TP=" + std::to_string(tensor_parallel) +
                               " P=" + std::to_string(first_position);
     int failures =
         verify_profile(label + " q", from_device_bf16(q_device.data(), q_count), q_expected);
@@ -297,6 +300,11 @@ int main() {
                                       0x1000U + width * 8 + batch);
     failures += run_pair_case(3, 3, 0, 0x1001U, true);
     failures += run_pair_case(16, 8, 262000, 0x1002U, true);
+    for (int width : {2, 3, 8, 16})
+        for (int batch : {1, 3, 8})
+            failures += run_pair_case(width, batch, width == 2 ? 0 : 262000,
+                                      0x3000U + width * 8 + batch, false, 2);
+    failures += run_pair_case(8, 3, 262000, 0x3100U, true, 2);
     failures += run_single_case(1, 0, 0x2001U, true);
     failures += run_single_case(2048, 260000, 0x2002U, true);
     failures += run_single_case(1, 0, 0x2001U);

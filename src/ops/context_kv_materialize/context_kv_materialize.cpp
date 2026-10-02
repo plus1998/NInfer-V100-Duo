@@ -1,9 +1,9 @@
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
-#include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ops/common/dflash2_rmsnorm_rope_volta.h"
+#include "ops/context_kv_materialize/append_volta.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -35,16 +35,16 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
     }
 }
 
-void require_weight(const Weight& weight, const char* name) {
-    constexpr std::uint64_t kCodeBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
-    constexpr std::uint64_t kScaleBytes =
-        static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
+void require_weight(const Weight& weight, std::int32_t kv_size, const char* name) {
+    const std::uint64_t kCodeBytes =
+        static_cast<std::uint64_t>(kv_size) * static_cast<std::uint64_t>(kHidden);
+    const std::uint64_t kScaleBytes =
+        static_cast<std::uint64_t>(kv_size) * static_cast<std::uint64_t>(kHidden / 32) * 2U;
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
-        weight.ndim != 2 || weight.n != kKVSize || weight.k != kHidden ||
-        weight.shape[0] != kKVSize || weight.shape[1] != kHidden ||
-        weight.padded_shape[0] != kKVSize || weight.padded_shape[1] != kHidden ||
+        weight.ndim != 2 || weight.n != kv_size || weight.k != kHidden ||
+        weight.shape[0] != kv_size || weight.shape[1] != kHidden ||
+        weight.padded_shape[0] != kv_size || weight.padded_shape[1] != kHidden ||
         weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
         weight.payload_bytes < kCodeBytes + kScaleBytes || !aligned_to(weight.qdata, 16) ||
         !aligned_to(weight.scales, 4)) {
@@ -77,15 +77,15 @@ void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t m
 }
 
 void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
-                    std::int32_t lane_capacity) {
+                    std::int32_t lane_capacity, std::int32_t heads) {
     if (cache.capacity != kCapacity ||
         cache.padded_capacity != static_cast<std::uint32_t>(padded) ||
-        cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim ||
+        cache.num_kv_heads != heads || cache.head_dim != kHeadDim ||
         cache.lane_capacity != lane_capacity || padded < kCapacity || lane_capacity <= 0) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
-    require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K");
-    require_tensor(cache.v, DType::FP16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache V");
+    require_tensor(cache.k, DType::BF16, kHeadDim, padded, heads, lane_capacity, 16, "cache K");
+    require_tensor(cache.v, DType::FP16, kHeadDim, padded, heads, lane_capacity, 16, "cache V");
 }
 
 } // namespace
@@ -101,7 +101,7 @@ std::size_t context_kv_materialize_workspace_capacity_bytes(std::int32_t batch_s
                                                             std::int32_t max_width) {
     require_interval(batch_size, min_width, max_width);
     // sm_70 port: composed from general W8 linear + head rmsnorm + rope + cyclic append, one
-    // layer at a time under a scoped sub-arena, so the peak is a single layer's three BF16
+    // layer at a time under a scoped sub-arena, so the peak is a single layer's two BF16
     // [1024, max_width*B] scratch tensors.
     WorkspaceLayoutBuilder layout;
     allocate_layer_scratch(layout, max_width * batch_size);
@@ -132,41 +132,44 @@ void context_kv_materialize(
     }
     const std::int32_t padded = static_cast<std::int32_t>(layers.front().cache.padded_capacity);
     const std::int32_t lane_capacity = layers.front().cache.lane_capacity;
+    const std::int32_t heads = layers.front().cache.num_kv_heads;
+    if (heads != kKVHeads && heads != kKVHeads / 2) {
+        throw std::invalid_argument("context_kv_materialize: KV heads must be 4 or 8");
+    }
+    const std::int32_t kv_size = heads * kHeadDim;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const ContextKVMaterializeLayerView& layer = layers[index];
-        require_weight(layer.key_weight, "key weight");
-        require_weight(layer.value_weight, "value weight");
+        require_weight(layer.key_weight, kv_size, "key weight");
+        require_weight(layer.value_weight, kv_size, "value weight");
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight");
-        validate_cache(layer.cache, padded, lane_capacity);
+        validate_cache(layer.cache, padded, lane_capacity, heads);
     }
 
     if (envelope.max_count == 0) return;
 
     // sm_70 port: no fused kernel yet. Compose the five layers from the general W8 projection,
-    // per-head RMSNorm, 1-D RoPE and the cyclic-prefix append -- exactly the unfused reference
+    // per-head RMSNorm, 1-D RoPE and the DFlash2 cyclic append -- exactly the unfused reference
     // in the header's formula. One layer at a time keeps the workspace to a single layer.
     const std::int32_t width_columns = width * batch;
-    const KVCacheAppendPrefixExecutionEnvelope append_envelope{envelope.min_count,
-                                                               envelope.max_count};
     const Tensor context_flat  = context.view({kHidden, width_columns});
     const Tensor positions_flat = positions.view({width_columns});
 
     for (const ContextKVMaterializeLayerView& layer : layers) {
         auto layer_scope = workspace.scope();
-        Tensor key   = workspace.alloc(DType::BF16, {kKVSize, width_columns});
-        Tensor value = workspace.alloc(DType::BF16, {kKVSize, width_columns});
+        Tensor key   = workspace.alloc(DType::BF16, {kv_size, width_columns});
+        Tensor value = workspace.alloc(DType::BF16, {kv_size, width_columns});
 
         linear(context_flat, layer.key_weight, key, stream);
         linear(context_flat, layer.value_weight, value, stream);
 
-        Tensor key_heads = key.view({kHeadDim, kKVHeads, width_columns});
+        Tensor key_heads = key.view({kHeadDim, heads, width_columns});
         detail::dflash2_rmsnorm_rope_launch(key_heads, layer.key_norm_weight, positions_flat,
                                             1.0e-6F, 1.0e7F, stream);
 
-        Tensor key_batch   = key.view({kHeadDim, kKVHeads, width, batch});
-        Tensor value_batch = value.view({kHeadDim, kKVHeads, width, batch});
-        kv_cache_append_prefix(key_batch, value_batch, positions, counts, state_slots,
-                               append_envelope, layer.cache, stream);
+        Tensor key_batch   = key.view({kHeadDim, heads, width, batch});
+        Tensor value_batch = value.view({kHeadDim, heads, width, batch});
+        detail::dflash2_context_append_launch(key_batch, value_batch, positions, counts,
+                                              state_slots, layer.cache, envelope.max_count, stream);
     }
 }
 

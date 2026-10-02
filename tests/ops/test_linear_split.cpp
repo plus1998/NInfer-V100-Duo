@@ -610,6 +610,9 @@ int verify_registry() {
         {QType::W8G32_F16S, 7168, 5120, kA16},   {QType::W8G32_F16S, 17408, 5120, kA16},
         {QType::W8G32_F16S, 124160, 5120, kA16}, {QType::W8G32_F16S, 5120, 3072, kA16},
         {QType::W8G32_F16S, 5120, 5120, kA16},   {QType::W8G32_F16S, 5120, 8704, kA16},
+#ifdef NINFER_VOLTA_BUILD
+        {QType::W8G32_F16S, 5120, 12800, kA16}, {QType::W8G32_F16S, 5120, 2048, kA16},
+#endif
         {QType::W8G32_F16S, 5120, 8704, kA8},
         // BF16 control.
         {QType::BF16_CTRL, 7168, 5120, kA16},    {QType::BF16_CTRL, 5120, 3072, kA16},
@@ -743,7 +746,12 @@ int verify_split_rejections(const ExecutionContext& ec, const ops::PeerEvents& e
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool dflash2_only = argc == 2 && std::string_view(argv[1]) == "--dflash2";
+    if (argc != 1 && !dflash2_only) {
+        std::cerr << "usage: ninfer_linear_split_test [--dflash2]\n";
+        return 2;
+    }
     // The registry probe is pure host code -- linear_workspace_capacity_bytes only runs each
     // format's shape resolver -- so it runs BEFORE the device checks and reports a real failure
     // even on a machine that has to skip the parity cases. A shard extent silently dropped from a
@@ -775,7 +783,7 @@ int main() {
               << '\n';
     const ops::PeerEvents events(ec);
 
-    failures += verify_split_rejections(ec, events);
+    if (!dflash2_only) { failures += verify_split_rejections(ec, events); }
 
     constexpr auto kA16 = ops::LinearPolicy::A16Only;
     constexpr auto kA4  = ops::LinearPolicy::AllowA4;
@@ -821,6 +829,12 @@ int main() {
          {kA16, kA4}},
         {"q5 o_proj", QType::Q5G64_F16S, SplitAxis::Row, 5120, 6144, 23u, {1, 48}, {kA16}},
         {"w8 mlp_down", QType::W8G32_F16S, SplitAxis::Row, 5120, 17408, 24u, {1, 48}, {kA16}},
+#ifdef NINFER_VOLTA_BUILD
+        {"w8 DFlash2 feature", QType::W8G32_F16S, SplitAxis::Row, 5120, 25600, 26u,
+         {1, 8, 24, 48}, {kA16}},
+        {"w8 DFlash2 attention output", QType::W8G32_F16S, SplitAxis::Row, 5120, 4096,
+         28u, {1, 8, 24, 48}, {kA16}},
+#endif
         {"bf16 o_proj", QType::BF16_CTRL, SplitAxis::Row, 5120, 6144, 25u, {1, 8}, {kA16}},
         // FP8's residual row shapes (o_proj/gdn_output), wired into ops::linear's own
         // kernel-level dispatch AND directly load-bearing for linear_add_row_parallel's plain
@@ -833,7 +847,12 @@ int main() {
          {1, 8, 24, 25, 48, 128, 1024}, {kA16, kA8}},
     };
 
-    for (const Case& test_case : cases) { failures += run_case(test_case, ec, events); }
+    for (const Case& test_case : cases) {
+        if (dflash2_only && !std::string_view(test_case.label).starts_with("w8 DFlash2")) {
+            continue;
+        }
+        failures += run_case(test_case, ec, events);
+    }
 
     std::cout << (failures ? "FAIL" : "OK") << " linear split\n";
     return failures ? 1 : 0;

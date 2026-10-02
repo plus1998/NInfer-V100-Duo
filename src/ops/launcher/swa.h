@@ -28,4 +28,12 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
                 cudaStream_t stream);
 
+#ifdef NINFER_VOLTA_BUILD
+void swa_dflash2_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                        const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                        float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                        Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                        cudaStream_t stream);
+#endif
+
 } // namespace ninfer::ops::detail

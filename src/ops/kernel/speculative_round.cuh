@@ -61,16 +61,46 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 // (config temperature <= 0) is bit-identical to the original argmax accept: keep
 // the longest draft prefix whose target argmax matches, then take the target
 // argmax at the divergence column. The sampling branch (temperature > 0) runs
-// distribution-correct speculative rejection sampling over the verify logits with
-// a one-hot (greedy) draft: accept drafts[i] with probability p_i(drafts[i]) under
-// the truncated target distribution, resample from the masked residual on the
-// first rejection, and draw a bonus from the last column when every draft accepts.
-// The draft-proposal path stays greedy, so q is one-hot and the accept test
-// collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
+// distribution-correct speculative rejection sampling over the verify logits. The
+// one-hot route accepts with probability p(d) and excludes d on correction; the
+// sparse route accepts with min(1,p(d)/q(d)) and corrects from max(p-q,0).
+// Both draw a bonus from the last column on full acceptance. Launch with kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+__device__ __forceinline__ float speculative_sparse_q(const int* ids, const float* q,
+                                                       int token) {
+    for (int candidate = 0; candidate < 16; ++candidate) {
+        if (ids[candidate] == token) { return q[candidate]; }
+    }
+    return 0.0f;
+}
+
+__device__ __forceinline__ int speculative_sparse_correction(
+    const int* p_ids, const float* p, int support, const int* q_ids, const float* q,
+    float uniform) {
+    float mass = 0.0f;
+    for (int index = 0; index < support; ++index) {
+        mass += fmaxf(p[index] - speculative_sparse_q(q_ids, q, p_ids[index]), 0.0f);
+    }
+    if (mass <= 0.0f) { return sampling_pick_from_support(p_ids, p, support, -1, uniform); }
+    const float threshold = uniform * mass;
+    float cumulative = 0.0f;
+    int chosen = p_ids[0];
+    for (int index = 0; index < support; ++index) {
+        const float remaining = fmaxf(p[index] - speculative_sparse_q(q_ids, q, p_ids[index]),
+                                      0.0f);
+        if (remaining <= 0.0f) { continue; }
+        chosen = p_ids[index];
+        cumulative += remaining;
+        if (threshold < cumulative) { break; }
+    }
+    return chosen;
+}
+
+template <bool Sparse>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* proposal_ids, const float* proposal_q,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
@@ -157,12 +187,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 }
                 const float u =
                     sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                if (u < pd) {
+                const int* q_ids = Sparse ? proposal_ids + (row * k + i) * 16 : nullptr;
+                const float* q = Sparse ? proposal_q + (row * k + i) * 16 : nullptr;
+                const float qd = Sparse ? speculative_sparse_q(q_ids, q, d) : 1.0f;
+                if (u * qd < pd) {
                     a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar_sh       = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+                    tstar_sh = Sparse ? speculative_sparse_correction(
+                                              cand_idx, prob, n_support, q_ids, q, ur)
+                                        : sampling_pick_from_support(cand_idx, prob, n_support,
+                                                                     d, ur);
                     done_sh        = 1;
                 }
             } else {
@@ -249,8 +285,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     }
 }
 
+template <bool Sparse>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* proposal_ids, const float* proposal_q,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t cols,
@@ -395,13 +433,18 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     }
                     const float u =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    if (u < pd) {
+                    const int* q_ids = Sparse ? proposal_ids + (row * k + i) * 16 : nullptr;
+                    const float* q = Sparse ? proposal_q + (row * k + i) * 16 : nullptr;
+                    const float qd = Sparse ? speculative_sparse_q(q_ids, q, d) : 1.0f;
+                    if (u * qd < pd) {
                         a = i + 1;
                         continue;
                     }
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    tstar = Sparse ? speculative_sparse_correction(
+                                         dist_idx, dist_prob, n, q_ids, q, ur)
+                                   : sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
                     break;
                 }
                 const float u =

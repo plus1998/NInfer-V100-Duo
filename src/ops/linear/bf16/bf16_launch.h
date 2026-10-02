@@ -16,6 +16,11 @@ inline constexpr std::int32_t kBf16LinearSmallTDispatchEnd = 27;
 
 using Bf16Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+#ifdef NINFER_VOLTA_BUILD
+void launch_bf16_n256_k5120(const Tensor& x, const Weight& weight, Tensor& out,
+                            cudaStream_t stream);
+#endif
+
 void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);

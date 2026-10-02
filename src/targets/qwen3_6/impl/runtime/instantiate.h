@@ -20,6 +20,7 @@
 #include "targets/qwen3_6/impl/runtime/graph_impl.h"
 #include "targets/qwen3_6/impl/runtime/speculative_target_impl.h"
 #include "targets/qwen3_6/impl/runtime/dflash_impl.h"
+#include "targets/qwen3_6/impl/runtime/dflash2_impl.h"
 #include "targets/qwen3_6/impl/runtime/decode_impl.h"
 #include "targets/qwen3_6/impl/runtime/mtp_impl.h"
 #include "targets/qwen3_6/impl/runtime/request_plan_impl.h"

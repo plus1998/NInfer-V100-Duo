@@ -23,7 +23,8 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 }
 
 void validate_spec(const RoundStateSpec& spec) {
-    if (spec.enable_mtp && spec.enable_dflash) {
+    if (static_cast<int>(spec.enable_mtp) + static_cast<int>(spec.enable_dflash) +
+            static_cast<int>(spec.enable_dflash2) > 1) {
         throw std::invalid_argument("RoundState speculative extensions are mutually exclusive");
     }
     if (spec.hidden <= 0) { throw std::invalid_argument("RoundState hidden must be positive"); }
@@ -36,7 +37,7 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.enable_mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
         throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
     }
-    if (spec.enable_dflash &&
+    if ((spec.enable_dflash || spec.enable_dflash2) &&
         (spec.draft_window == 0 || spec.draft_window > kDFlashDecodeMaximumDrafts)) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
@@ -54,7 +55,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (!spec.enable_mtp && !spec.enable_dflash) {
+    if (!spec.enable_mtp && !spec.enable_dflash && !spec.enable_dflash2) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
@@ -200,6 +201,30 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
     }
+    if (layout.spec.enable_dflash2) {
+        DFlash2DecodeStateLayout& decode = layout.dflash2_decode.emplace();
+        decode.ingress = builder.add(sizeof(DFlash2DecodeIngress), kArenaAlign,
+                                     "DFlash2 decode ingress");
+        decode.egress = builder.add(sizeof(DFlash2DecodeEgress), kArenaAlign,
+                                    "DFlash2 decode egress");
+        const auto batch = checked_i32(layout.spec.batch_capacity,
+                                       "RoundState DFlash2 batch capacity exceeds int32");
+        decode.verify_ids = add_tensor(builder, DType::I32, {columns, batch},
+                                       "DFlash2 target verify ids");
+        decode.target_positions = add_tensor(builder, DType::I32, {columns, batch},
+                                             "DFlash2 target cache positions");
+        decode.target_logits = add_tensor(builder, DType::BF16,
+                                          {layout.spec.output_rows, columns, batch},
+                                          "DFlash2 target verify logits");
+        decode.target_tokens = add_tensor(builder, DType::I32, {columns, batch},
+                                          "DFlash2 target sampled tokens");
+        decode.target_hidden = add_tensor(builder, DType::BF16,
+                                          {layout.spec.hidden, columns, batch},
+                                          "DFlash2 target verify hidden");
+        decode.target_continuation_hidden = add_tensor(builder, DType::BF16,
+                                                       {layout.spec.hidden, batch},
+                                                       "DFlash2 target continuation hidden");
+    }
     layout.complete = true;
 }
 
@@ -340,6 +365,53 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
 }
 
+DFlash2DecodeState::DFlash2DecodeState(DeviceSpan backing,
+                                       const DFlash2DecodeStateLayout& layout,
+                                       std::uint32_t batch_capacity,
+                                       std::uint32_t draft_window) {
+    if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
+        draft_window > kDFlashDecodeMaximumDrafts) {
+        throw std::invalid_argument("DFlash2 decode state dimensions are invalid");
+    }
+    static_assert(std::is_standard_layout_v<DFlash2DecodeIngress>);
+    static_assert(std::is_standard_layout_v<DFlash2DecodeEgress>);
+    const auto batch = static_cast<std::int32_t>(batch_capacity);
+    const auto width = static_cast<std::int32_t>(draft_window) + 1;
+    ingress = layout.ingress.bind(backing);
+    egress = layout.egress.bind(backing);
+    const auto ingress_tensor = [&](std::size_t offset) {
+        return Tensor(static_cast<unsigned char*>(ingress.data) + offset, DType::I32, {batch});
+    };
+    const auto egress_tensor = [&](std::size_t offset,
+                                   std::initializer_list<std::int32_t> shape) {
+        return Tensor(static_cast<unsigned char*>(egress.data) + offset, DType::I32, shape);
+    };
+    anchors = ingress_tensor(offsetof(DFlash2DecodeIngress, anchors));
+    execution_frontiers = ingress_tensor(offsetof(DFlash2DecodeIngress, execution_frontiers));
+    context_frontiers = ingress_tensor(offsetof(DFlash2DecodeIngress, context_frontiers));
+    proposal_extents = ingress_tensor(offsetof(DFlash2DecodeIngress, proposal_extents));
+    target_valid_columns = ingress_tensor(offsetof(DFlash2DecodeIngress, target_valid_columns));
+    text_kv_table_rows = ingress_tensor(offsetof(DFlash2DecodeIngress, text_kv_table_rows));
+    lanes = ingress_tensor(offsetof(DFlash2DecodeIngress, lanes));
+    target_rope_positions = Tensor(
+        static_cast<unsigned char*>(ingress.data) +
+            offsetof(DFlash2DecodeIngress, target_rope_positions),
+        DType::I32, {width, batch});
+    sampling = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(ingress.data) +
+        offsetof(DFlash2DecodeIngress, sampling));
+    licensed_tokens = egress_tensor(offsetof(DFlash2DecodeEgress, licensed_tokens),
+                                    {width, batch});
+    licensed_counts = egress_tensor(offsetof(DFlash2DecodeEgress, licensed_counts), {batch});
+    accepted_drafts = egress_tensor(offsetof(DFlash2DecodeEgress, accepted_drafts), {batch});
+    verify_ids = layout.verify_ids.bind(backing);
+    target_positions = layout.target_positions.bind(backing);
+    target_logits = layout.target_logits.bind(backing);
+    target_tokens = layout.target_tokens.bind(backing);
+    target_hidden = layout.target_hidden.bind(backing);
+    target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
+}
+
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
@@ -361,6 +433,10 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (layout.dflash_decode) {
         dflash_decode.emplace(backing, *layout.dflash_decode, layout.spec.batch_capacity,
                               layout.spec.draft_window);
+    }
+    if (layout.dflash2_decode) {
+        dflash2_decode.emplace(backing, *layout.dflash2_decode, layout.spec.batch_capacity,
+                               layout.spec.draft_window);
     }
 }
 

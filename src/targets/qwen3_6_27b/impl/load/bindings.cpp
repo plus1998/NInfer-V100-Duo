@@ -638,6 +638,54 @@ ShardMapping shard_mapping(std::string_view object, int tp, const TextConfig& co
         return ShardMapping{artifact::ShardAxis::Columns, std::move(shards)};
     };
 
+    if (object.starts_with("dflash2/")) {
+        if (object == "dflash2/feature_projection") {
+            append_row_parallel(plan, 25600, tp, 25600, object);
+            return by_columns(std::move(plan));
+        }
+        if (object == "dflash2/context_norm" || object == "dflash2/final_norm" ||
+            object == "dflash2/candidate_selector/hidden_projection" ||
+            object == "dflash2/candidate_selector/predecessor_codebook" ||
+            object == "dflash2/candidate_selector/successor_codebook") {
+            return {};
+        }
+        const auto layer_start = object.find('/', sizeof("dflash2/layers/") - 1);
+        if (!object.starts_with("dflash2/layers/") || layer_start == std::string_view::npos ||
+            layer_start != sizeof("dflash2/layers/0") - 1 ||
+            object[sizeof("dflash2/layers/") - 1] < '0' ||
+            object[sizeof("dflash2/layers/") - 1] > '4') {
+            throw std::invalid_argument("unrecognized DFlash2 object: " + std::string(object));
+        }
+        const std::string_view leaf = object.substr(layer_start + 1);
+        if (leaf == "attention/query_key_value") {
+            append_column_block(plan, 0, 4096, tp, 32, object, false);
+            append_column_block(plan, 4096, 1024, tp, 8, object, false);
+            append_column_block(plan, 5120, 1024, tp, 8, object, false);
+            return by_rows(std::move(plan));
+        }
+        if (leaf == "mlp/gate_up") {
+            append_column_block(plan, 0, 17408, tp, 17408, object, false);
+            append_column_block(plan, 17408, 17408, tp, 17408, object, false);
+            return by_rows(std::move(plan));
+        }
+        if (leaf == "attention/output") {
+            append_row_parallel(plan, 4096, tp, 32, object);
+            return by_columns(std::move(plan));
+        }
+        if (leaf == "mlp/down") {
+            append_row_parallel(plan, 17408, tp, 17408, object);
+            return by_columns(std::move(plan));
+        }
+        if (leaf == "input_norm" || leaf == "post_attention_norm" ||
+            leaf == "attention/query_norm" || leaf == "attention/key_norm" ||
+            leaf == "attention_conv/base_kernel" || leaf == "mlp_conv/base_kernel" ||
+            leaf == "attention_conv/kernel_projection" ||
+            leaf == "mlp_conv/kernel_projection") {
+            return {};
+        }
+        throw std::invalid_argument("unrecognized DFlash2 object: " + std::string(object));
+    }
+
     // Replicated: full copy on every device (shards stays empty).
     //
     // `gdn/norm` stays here and that is VERIFIED, not inherited: its real bound shape is {128}
@@ -1109,7 +1157,56 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
     }
 
-    // Validate any companion DFlash/DFlash2 tensors present in artifact so they don't consume VRAM
+    if (features.dflash2() && binder.find("dflash2/feature_projection") == nullptr) {
+        throw std::invalid_argument("qwen3.8-27b DFlash2 needs a companion");
+    }
+    if (binder.find("dflash2/feature_projection") != nullptr) {
+        const auto placement = features.dflash2() ? artifact::TensorPlacement::Device
+                                                 : artifact::TensorPlacement::ValidateOnly;
+        const auto bind = [&](const std::string& name, NumericFormat format,
+                              std::initializer_list<std::uint64_t> shape) {
+            return artifact::bind_tensor(binder, name, format, shape, placement);
+        };
+        constexpr NumericFormat matrix = NumericFormat::W8G32_F16S;
+        constexpr NumericFormat control = NumericFormat::BF16;
+        DFlash2Plan draft;
+        draft.feature_projection = WeightPlan{
+            .object = bind("dflash2/feature_projection", matrix, {5120, 25600}), .format = matrix};
+        draft.context_norm = bind("dflash2/context_norm", control, {5120});
+        draft.final_norm = bind("dflash2/final_norm", control, {5120});
+        for (int layer = 0; layer < 5; ++layer) {
+            const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
+            auto& weights = draft.layers[static_cast<std::size_t>(layer)];
+            weights.input_norm = bind(prefix + "input_norm", control, {5120});
+            weights.post_attention_norm = bind(prefix + "post_attention_norm", control, {5120});
+            weights.query_key_value = WeightPlan{
+                .object = bind(prefix + "attention/query_key_value", matrix, {6144, 5120}),
+                .format = matrix};
+            weights.query_norm = bind(prefix + "attention/query_norm", control, {128});
+            weights.key_norm = bind(prefix + "attention/key_norm", control, {128});
+            weights.attention_output = WeightPlan{
+                .object = bind(prefix + "attention/output", matrix, {5120, 4096}), .format = matrix};
+            weights.gate_up = WeightPlan{
+                .object = bind(prefix + "mlp/gate_up", matrix, {34816, 5120}), .format = matrix};
+            weights.down = WeightPlan{
+                .object = bind(prefix + "mlp/down", matrix, {5120, 17408}), .format = matrix};
+            const auto conv = [&](std::string_view branch) {
+                const std::string name = prefix + std::string(branch) + "/";
+                return DFlash2ConvPlan{bind(name + "base_kernel", control, {2, 2, 5120}),
+                                       bind(name + "kernel_projection", control, {1280, 5120})};
+            };
+            weights.attention_conv = conv("attention_conv");
+            weights.mlp_conv = conv("mlp_conv");
+        }
+        draft.hidden_projection =
+            bind("dflash2/candidate_selector/hidden_projection", control, {256, 5120});
+        draft.predecessor_codebook =
+            bind("dflash2/candidate_selector/predecessor_codebook", control, {248320, 256});
+        draft.successor_codebook =
+            bind("dflash2/candidate_selector/successor_codebook", control, {248320, 256});
+        if (features.dflash2()) { out.dflash2.emplace(std::move(draft)); }
+    }
+
     binder.validate_unconsumed_matching("dflash");
 
     load_plan.materialization = binder.finish();
@@ -1260,6 +1357,53 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing, tp, device);
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
                                                        NumericFormat::BF16, {5120}, device);
+    }
+
+    if (plan.dflash2) {
+        const DFlash2Plan& source = *plan.dflash2;
+        DFlash2Weights& draft = runtime.dflash2.emplace();
+        draft.feature_projection =
+            materialized_weight(backing, source.feature_projection, 5120, 25600 / tp, device);
+        draft.context_norm = artifact::materialized_tensor(
+            backing, source.context_norm, NumericFormat::BF16, {5120}, device);
+        draft.final_norm = artifact::materialized_tensor(
+            backing, source.final_norm, NumericFormat::BF16, {5120}, device);
+        const auto load_conv = [&](const DFlash2ConvPlan& conv) {
+            return DFlash2ConvWeights{
+                artifact::materialized_tensor(backing, conv.base_kernel, NumericFormat::BF16,
+                                              {5120, 2, 2}, device),
+                artifact::materialized_weight(backing, conv.kernel_projection, NumericFormat::BF16,
+                                              1280, 5120, device)};
+        };
+        for (std::size_t layer = 0; layer < draft.layers.size(); ++layer) {
+            const DFlash2LayerPlan& weights = source.layers[layer];
+            DFlash2LayerWeights& target = draft.layers[layer];
+            target.input_norm = artifact::materialized_tensor(
+                backing, weights.input_norm, NumericFormat::BF16, {5120}, device);
+            target.post_attention_norm = artifact::materialized_tensor(
+                backing, weights.post_attention_norm, NumericFormat::BF16, {5120}, device);
+            target.query_key_value =
+                materialized_weight(backing, weights.query_key_value, 6144 / tp, 5120, device);
+            target.query = row_view(target.query_key_value, 0, 4096 / tp);
+            target.key = row_view(target.query_key_value, 4096 / tp, 1024 / tp);
+            target.value = row_view(target.query_key_value, 5120 / tp, 1024 / tp);
+            target.query_norm = artifact::materialized_tensor(
+                backing, weights.query_norm, NumericFormat::BF16, {128}, device);
+            target.key_norm = artifact::materialized_tensor(
+                backing, weights.key_norm, NumericFormat::BF16, {128}, device);
+            target.attention_output =
+                materialized_weight(backing, weights.attention_output, 5120, 4096 / tp, device);
+            target.gate_up = materialized_weight(backing, weights.gate_up, 34816 / tp, 5120, device);
+            target.down = materialized_weight(backing, weights.down, 5120, 17408 / tp, device);
+            target.attention_conv = load_conv(weights.attention_conv);
+            target.mlp_conv = load_conv(weights.mlp_conv);
+        }
+        draft.hidden_projection = artifact::materialized_weight(
+            backing, source.hidden_projection, NumericFormat::BF16, 256, 5120, device);
+        draft.predecessor_codebook = artifact::materialized_tensor(
+            backing, source.predecessor_codebook, NumericFormat::BF16, {256, 248320}, device);
+        draft.successor_codebook = artifact::materialized_tensor(
+            backing, source.successor_codebook, NumericFormat::BF16, {256, 248320}, device);
     }
 
     if (plan.features.vision) {

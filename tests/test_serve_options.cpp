@@ -90,6 +90,22 @@ int main() {
     } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
     failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
 
+    const ServeOptions dflash2 = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                        "--draft-tokens", "7", "--tp", "2", "--devices",
+                                        "0,1", "--vision", "--max-concurrency", "3"});
+    failures += check(dflash2.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          dflash2.speculative.draft_tokens == 7 && dflash2.enable_vision &&
+                          dflash2.max_concurrency == 3 && dflash2.tp == 2,
+                      "DFlash2 Vision TP2 startup options were not preserved");
+
+    bool invalid_dflash2_window_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
+                     "16"});
+    } catch (const std::invalid_argument&) { invalid_dflash2_window_rejected = true; }
+    failures += check(invalid_dflash2_window_rejected,
+                      "DFlash2 accepted a draft window outside the supported domain");
+
     bool implicit_backend_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
