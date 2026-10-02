@@ -29,44 +29,6 @@ Stop the previous server before switching models.
 
 ## Performance Comparison
 
-Measured October 2, 2026, after a full rebuild on 2 × V100-SXM2 16 GB,
-CUDA 12.8. Both artifacts used identical tokenized code prompts, TP2, INT8 KV,
-CUDA Graph, MTP3, optimized head, **131,072-token capacity**, 4,096-token
-prefill chunks and two uncached requests per point. Decode counts 512 output
-tokens after the first token from prefill; loading and Graph preparation are
-excluded. This fixed-length task disables model stops and is **not** an answer
-quality comparison.
-
-| Prompt tokens | NVFP4 prefill | GSQ prefill | NVFP4 decode | GSQ decode |
-|---:|---:|---:|---:|---:|
-| 512 | 878 tok/s | **1,358 tok/s** | **128.60 tok/s** | 110.03 tok/s |
-| 10,000 | 1,123 tok/s | **1,857 tok/s** | **120.12 tok/s** | 107.61 tok/s |
-| 30,000 | 1,062 tok/s | **1,683 tok/s** | **119.22 tok/s** | 104.55 tok/s |
-
-### Long-Context Decay (Earlier Campaign)
-
-The table above stops at 30K. The earlier October 1, 2026 campaign measured
-**occupied** code-chat prompt lengths up to 250K on the same 2 × V100 host,
-with TP2, INT8 KV, Graph, optimized MTP3, 4,096-token prefill chunks and two
-uncached requests per point. Each request generated one prefill token and
-**1,024 measured decode tokens**, with model stops disabled. NVFP4 used
-180,224-token *capacity*; GSQ used 262,144. They are comparable by occupied
-length but **not** a same-capacity or current-build A/B: do not combine these
-rates with the 512-output-token rebuild table above.
-
-| Occupied prompt | NVFP4 prefill | GSQ prefill | NVFP4 decode | GSQ decode |
-|---:|---:|---:|---:|---:|
-| 30,000 | 1,054 tok/s | **1,676 tok/s** | **115.88 tok/s** | 98.88 tok/s |
-| 100,000 | 873 tok/s | **1,260 tok/s** | **82.98 tok/s** | 76.19 tok/s |
-| 150,000 | 763 tok/s | **1,035 tok/s** | **77.14 tok/s** | 70.24 tok/s |
-| 250,000 | — | 734 tok/s | — | 57.84 tok/s |
-
-NVFP4's 250K entry is absent because that configuration does not admit a
-250K request. These fixed-output continuations can extend past a natural
-stop, so the table measures long-context throughput, not useful-answer or
-Agent latency. Details: [context decay](docs/performance.md#v100-duo-context-decay)
-and [GSQ long context](docs/performance.md#v100-duo-gsq-rco-iq3_s-gguf-blocks).
-
 ### MTP3, MTP4, MTP5
 
 Same rebuilt servers, 131,072-token capacity and a 74-token pelican/SVG/HTML
@@ -110,6 +72,29 @@ First-token time starts at the Engine request, **not** model load, SDK startup,
 network transport, Agent tool execution or the first visible UI character.
 These are captured prompt measurements, not interactive Agent benchmarks.
 Methods and reproduction: [two-artifact measurements](docs/performance.md#v100-duo-october-2026-rebuild-two-artifact-comparison).
+
+### Long-Context Decay (Earlier Campaign)
+
+The October 1, 2026 campaign measured **occupied** code-chat prompt lengths
+up to 250K on 2 × V100-SXM2 16 GB, with TP2, INT8 KV, Graph, optimized MTP3,
+4,096-token prefill chunks and two uncached requests per point. Each request
+generated one prefill token and **1,024 measured decode tokens**, with model
+stops disabled. NVFP4 used 180,224-token *capacity*; GSQ used 262,144. They
+are comparable by occupied length but **not** a same-capacity or current-build
+A/B with the Agent and MTP measurements above.
+
+| Occupied prompt | NVFP4 prefill | GSQ prefill | NVFP4 decode | GSQ decode |
+|---:|---:|---:|---:|---:|
+| 30,000 | 1,054 tok/s | **1,676 tok/s** | **115.88 tok/s** | 98.88 tok/s |
+| 100,000 | 873 tok/s | **1,260 tok/s** | **82.98 tok/s** | 76.19 tok/s |
+| 150,000 | 763 tok/s | **1,035 tok/s** | **77.14 tok/s** | 70.24 tok/s |
+| 250,000 | — | 734 tok/s | — | 57.84 tok/s |
+
+NVFP4's 250K entry is absent because that configuration does not admit a
+250K request. These fixed-output continuations can extend past a natural
+stop, so the table measures long-context throughput, not useful-answer or
+Agent latency. Details: [context decay](docs/performance.md#v100-duo-context-decay)
+and [GSQ long context](docs/performance.md#v100-duo-gsq-rco-iq3_s-gguf-blocks).
 
 ## Startup Profiles
 
