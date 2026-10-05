@@ -1408,6 +1408,9 @@ completions*, so this is not a fixed-output speed or quality comparison.
 | GSQ-RCO | 3 | 6,986 | 121.0 | 109.607 |
 | GSQ-RCO | 4 | 5,887 | 110.4 | 95.164 |
 | GSQ-RCO | 5 | 6,531 | 119.6 | 93.754 |
+| Swift-1.5 | 3 | 7,995 | 153.4 | 143.128 |
+| Swift-1.5 | 4 | 8,830 | 176.2 | 157.830 |
+| Swift-1.5 | 5 | 7,778 | 183.6 | 163.134 |
 
 For NVFP4, MTP5 increases this prompt's mean but the older output inspection
 favored MTP3 for the requested pelican leg animation. GSQ favors MTP3 by
@@ -1418,6 +1421,21 @@ replace the artifact path and window `N` in the command under
 [V100 Duo decode: pelican HTML](#v100-duo-decode-pelican-html), adding
 `--max-context 131072 --prefill-chunk 4096`; use the same JSON request and
 extract `request_done` timings and five-second throughput intervals as there.
+
+The Swift-1.5 rows were measured October 5, 2026 with the same
+`build-v100-duo` binary, flags, request and three-runs-per-window protocol,
+using `/home/gareth/models/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer`
+(`kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer` on Hugging
+Face), a third-party OracleRouter fine-tune that loads as the same
+`qwen3.8-27b/nvfp4` target. Its nine responses all ended with a stop token
+with zero prefix-cache hits, and each window's three completions were
+identical: 7,995, 8,830 and 7,778 output tokens with per-run full-request
+rates of 143.118–143.145, 157.782–157.860 and 163.128–163.146 tok/s. It leads
+both registered artifacts in every window of this prompt, but it is a
+different model with different completion lengths and no output-quality
+inspection, so these rows remain same-prompt throughput rather than a
+quality or fixed-output comparison. Reproduce with the same command and the
+artifact path swapped.
 
 ## V100 Duo maximum-context capacity sweep
 

@@ -394,16 +394,26 @@ model, layout, or encoding directly. A `.ninfer` reader never treats `.qus` as a
 ### 9.1 Version-3 projection for Qwen3.8-27B
 
 The reader also accepts upstream NInfer version-3 files (magic `4e 49 4e 46 45 52 00 03`, a 32-byte
-header whose `u64` at offset 8 is `json_bytes`, payload at `align_up(32 + json_bytes, 4096)`) for
-`metadata.name = qwen3.8-27b` only. It does not execute the version-3 directory. Instead
+header whose `u64` at offset 8 is `json_bytes`, payload at `align_up(32 + json_bytes, 4096)`) whose
+`components` carry the registered qwen3.8-27b layout. `metadata.name` is descriptive provenance and
+is **not** compared: third-party conversions of the registered architecture (for example the
+Swift-1.5 OracleRouter NVFP4 artifact) declare their own name. The reader validates the layout
+signature the projection assumes instead — Text `qwen3_5_text` with 64 layers, hidden size 5120,
+vocabulary 248320, 24/4/256 attention heads, intermediate size 17408 and the linear-attention head
+geometry, an indexed 131,072-row proposal, Vision `qwen3_5_vision` with depth 27, `Qwen3_5MTP`, and,
+when present, the five-layer `qwen3` DFlash2 companion — and rejects any other file with an error
+naming the offending field. It does not execute the version-3 directory. Instead
 `src/artifact/reader.cpp` projects it into the version-2 directory above: version-3 logical
 `bindings` are resolved to their physical objects, those objects are renamed to the version-2
 names of [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), lower-case version-3 format and
 layout names map to the registered identities, and the chat template from
 `tokenizer_config.json` is served as `frontend/chat_template.jinja`. Two projections exist:
 
-- if no object uses `gguf_blocks_v1`, the file projects to `qwen3.8-27b/nvfp4` with the exact
-  version-2 NVFP4 inventory, including Vision;
+- if no object uses `gguf_blocks_v1`, the file projects to `qwen3.8-27b/nvfp4` with the version-2
+  NVFP4 inventory shape, including Vision. The per-layer split between NVFP4 and row-scaled FP8
+  MLP matrices — and the matching activation input divisors — is read from the file, so a
+  conversion that stores a different split than the official converter keeps the same logical
+  names, shapes and fusion contract while projecting a different object count;
 - otherwise it projects to `qwen3.8-27b/gguf-blocks` (Section 15 of the artifact reference). A
   fused parameter group whose parts span several physical objects becomes ordered row segments
   `<name>#0..#3`; Vision and, when present, DFlash2 companion objects are projected. The DFlash2

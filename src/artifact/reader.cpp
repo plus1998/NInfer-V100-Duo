@@ -289,16 +289,104 @@ std::uint64_t require_v3_unsigned(const Json& value, std::string_view label, boo
     return result;
 }
 
+// A version-3 file is accepted for the layout the projection below hard-codes, not for its
+// descriptive metadata.name: third-party conversions of the same registered architecture carry
+// their own name. Every field listed here is an assumption of the fixed projection.
+void require_layout_field(const Json& owner, std::string_view owner_label, std::string_view field,
+                          const Json& expected) {
+    const auto label = std::string(owner_label) + "." + std::string(field);
+    if (!owner.is_object() || !owner.contains(field)) {
+        throw ArtifactError("v3 artifact does not match the qwen3.8-27b layout: " + label +
+                            " is missing");
+    }
+    const auto& found = owner.at(field);
+    if (found != expected) {
+        throw ArtifactError("v3 artifact does not match the qwen3.8-27b layout: " + label + " = " +
+                            found.dump());
+    }
+}
+
+const Json& require_layout_component(const Json& components, std::string_view name) {
+    if (!components.is_object() || !components.contains(name) ||
+        !components.at(name).is_object()) {
+        throw ArtifactError("v3 artifact does not match the qwen3.8-27b layout: components." +
+                            std::string(name));
+    }
+    return components.at(name);
+}
+
+const Json& require_layout_config(const Json& component, std::string_view component_name) {
+    if (!component.is_object() || !component.contains("config") ||
+        !component.at("config").is_object()) {
+        throw ArtifactError("v3 artifact does not match the qwen3.8-27b layout: components." +
+                            std::string(component_name) + ".config");
+    }
+    return component.at("config");
+}
+
+void require_qwen38_layout(const Json& components) {
+    const auto& text        = require_layout_component(components, "text");
+    const auto& text_config = require_layout_config(text, "text");
+    require_layout_field(text_config, "text.config", "architectures",
+                         Json::array({"Qwen3_5ForCausalLM"}));
+    require_layout_field(text_config, "text.config", "model_type", Json("qwen3_5_text"));
+    require_layout_field(text_config, "text.config", "num_hidden_layers", Json(64));
+    require_layout_field(text_config, "text.config", "hidden_size", Json(5120));
+    require_layout_field(text_config, "text.config", "vocab_size", Json(248320));
+    require_layout_field(text_config, "text.config", "num_attention_heads", Json(24));
+    require_layout_field(text_config, "text.config", "num_key_value_heads", Json(4));
+    require_layout_field(text_config, "text.config", "head_dim", Json(256));
+    require_layout_field(text_config, "text.config", "intermediate_size", Json(17408));
+    require_layout_field(text_config, "text.config", "linear_num_key_heads", Json(16));
+    require_layout_field(text_config, "text.config", "linear_key_head_dim", Json(128));
+    require_layout_field(text_config, "text.config", "linear_num_value_heads", Json(48));
+    require_layout_field(text_config, "text.config", "linear_value_head_dim", Json(128));
+    require_layout_field(text_config, "text.config", "linear_conv_kernel_dim", Json(4));
+
+    if (!text.contains("proposal") || !text.at("proposal").is_object()) {
+        throw ArtifactError(
+            "v3 artifact does not match the qwen3.8-27b layout: components.text.proposal");
+    }
+    require_layout_field(text.at("proposal"), "text.proposal", "domain", Json("indexed"));
+    require_layout_field(text.at("proposal"), "text.proposal", "rows", Json(131072));
+
+    const auto& vision        = require_layout_component(components, "vision");
+    const auto& vision_config = require_layout_config(vision, "vision");
+    require_layout_field(vision_config, "vision.config", "model_type", Json("qwen3_5_vision"));
+    require_layout_field(vision_config, "vision.config", "depth", Json(27));
+    require_layout_field(vision_config, "vision.config", "hidden_size", Json(1152));
+    require_layout_field(vision_config, "vision.config", "patch_size", Json(16));
+    require_layout_field(vision_config, "vision.config", "temporal_patch_size", Json(2));
+    require_layout_field(vision_config, "vision.config", "spatial_merge_size", Json(2));
+    require_layout_field(vision_config, "vision.config", "num_heads", Json(16));
+    require_layout_field(vision_config, "vision.config", "intermediate_size", Json(4304));
+
+    const auto& mtp        = require_layout_component(components, "mtp");
+    const auto& mtp_config = require_layout_config(mtp, "mtp");
+    require_layout_field(mtp_config, "mtp.config", "architectures", Json::array({"Qwen3_5MTP"}));
+
+    if (components.contains("dflash2")) {
+        const auto& dflash2 = require_layout_component(components, "dflash2");
+        const auto& dflash2_config = require_layout_config(dflash2, "dflash2");
+        require_layout_field(dflash2_config, "dflash2.config", "model_type", Json("qwen3"));
+        require_layout_field(dflash2_config, "dflash2.config", "num_hidden_layers", Json(5));
+    }
+}
+
 class Qwen38Nvfp4V3Adapter {
 public:
     Qwen38Nvfp4V3Adapter(const Json& directory, const MappedFile& file,
                          std::uint64_t payload_start)
         : directory_(directory), file_(file), payload_start_(payload_start) {
         if (!directory_.is_object() || !directory_.contains("metadata") ||
-            !directory_.at("metadata").is_object() ||
-            directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
-            throw ArtifactError("NInfer v3 compatibility is limited to qwen3.8-27b");
+            !directory_.at("metadata").is_object()) {
+            throw ArtifactError("NInfer v3 compatibility requires a metadata object");
         }
+        const auto& metadata = directory_.at("metadata");
+        if (!metadata.contains("name")) {
+            throw ArtifactError("NInfer v3 compatibility requires metadata.name");
+        }
+        require_string(metadata.at("name"), "v3 metadata.name");
         if (!directory_.contains("files") || !directory_.at("files").is_array() ||
             directory_.at("files").size() != 1 ||
             !directory_.at("files")[0].at("path").is_null()) {
@@ -315,6 +403,7 @@ public:
             !directory_.contains("components") || !directory_.at("components").is_object()) {
             throw ArtifactError("qwen3.8-27b v3 directory is incomplete");
         }
+        require_qwen38_layout(directory_.at("components"));
         for (const auto& object : directory_.at("objects")) {
             const auto& id = require_string(object.at("id"), "v3 object id");
             if (!objects_.emplace(id, &object).second) {
@@ -640,6 +729,8 @@ private:
         }
         (*template_it)["bytes"] = template_bytes.size();
         V3CompatibilityDirectory result;
+        // The projected identity is the registered target the layout was validated against;
+        // a version-3 file's metadata.name stays descriptive provenance and is not carried over.
         result.directory = {
             {"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", std::string(weights_id)}}},
             {"objects", std::move(objects)}};

@@ -27,7 +27,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
-  geometry behavior against a self-contained C++ fixture;
+  geometry behavior against a self-contained C++ fixture, plus the version-3 acceptance rule:
+  a synthetic file with a foreign `metadata.name` reaches the projection while another layout is
+  rejected;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
@@ -140,6 +142,15 @@ their reported colors and geometry (not exact wording), tests a 1,630-token cros
 and two images, and sends two simultaneous streaming requests. It requires overlapping content
 streams and structured-log evidence of an actual multi-row decode batch, not just two HTTP 200s.
 Use a dedicated idle server with a 1,024-token prefill chunk and at least two request slots.
+
+For version-3 artifacts, `NINFER_QWEN3_8_27B_WEIGHTS=/absolute/path/to/qwen3_8_27b_nvfp4.ninfer`
+and `NINFER_QWEN3_8_27B_SWIFT_WEIGHTS=/absolute/path/to/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer`
+each run the reader's projection checks for that file: registered inventory, tensor formats, and
+chat-template projection. Swift-1.5 is a third-party conversion whose MLP layers are all NVFP4
+rather than the official converter's NVFP4/FP8 split, so its projected inventory differs while its
+identity stays `qwen3.8-27b/nvfp4`. Without either variable the test still checks version-3
+acceptance on a synthetic fixture: a file declaring a foreign `metadata.name` reaches the
+projection, and a different layout is rejected naming the offending field.
 
 For the GSQ-RCO v3 artifact, `NINFER_QWEN3_8_27B_GSQ_WEIGHTS=/absolute/path/to/artifact.ninfer`
 enables the artifact reader's Vision and DFlash2 companion projection checks and the

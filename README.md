@@ -1,8 +1,8 @@
 # NInfer V100 Duo
 
 Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB (NVLink)**, TP2 and
-CUDA 12.8. One build supports both registered artifacts; choose one at server
-startup. Both contain Text, Vision, MTP and a DFlash2 companion; the comparison
+CUDA 12.8. One build supports all three artifacts below; choose one at server
+startup. All contain Text, Vision, MTP and a DFlash2 companion; the comparison
 and recommended profiles below use **MTP3**.
 Based on [Neroued/ninfer](https://github.com/Neroued/ninfer) and
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
@@ -15,6 +15,11 @@ Download the `.ninfer` artifact, not the source checkpoint or raw GGUF:
 |---|---|---|---|
 | Official Qwen3.8-27B NVFP4 | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `qwen3_8_27b_nvfp4.ninfer` | Faster MTP decode |
 | GSQ-RCO IQ3_S NInfer v3 | [Hugging Face](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3) | `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | Faster prefill; full native 262,144-token context |
+| Swift-1.5 Qwen3.8-27B OracleRouter DFlash2 NVFP4 | [Hugging Face](https://huggingface.co/kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer) | `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer` | Fastest measured MTP decode of the three |
+
+All three load as the same `qwen3.8-27b` target and take the same profile
+flags; only the artifact path changes. Swift-1.5 is a separately fine-tuned
+model, so its completions differ from the official artifact's.
 
 Build with `tools/v100/build.sh`. For the configurations below, run:
 
@@ -45,13 +50,20 @@ rates. Both exclude prefill and loading.
 | GSQ-RCO | MTP3 | 6,986 | **121.0 tok/s** | **109.61 tok/s** |
 | GSQ-RCO | MTP4 | 5,887 | 110.4 tok/s | 95.16 tok/s |
 | GSQ-RCO | MTP5 | 6,531 | 119.6 tok/s | 93.75 tok/s |
+| Swift-1.5 | MTP3 | 7,995 | 153.4 tok/s | 143.13 tok/s |
+| Swift-1.5 | MTP4 | 8,830 | 176.2 tok/s | 157.83 tok/s |
+| Swift-1.5 | MTP5 | 7,778 | **183.6 tok/s** | **163.13 tok/s** |
 
 Different artifacts and draft windows generate **different text and lengths**:
 these rates do not establish output-quality parity. GSQ is fastest with MTP3
-on this task. NVFP4 MTP5 is faster, but an earlier inspection found its
-pelican animation less faithful than MTP3's; therefore the launcher stays on
-MTP3 by default. Select MTP4/5 by adding `draft-tokens=4` or `draft-tokens=5`
-**immediately after** `model=...`, and review the resulting output.
+on this task. Swift-1.5 leads every window on this prompt (measured October 5,
+2026 on the same build and recipe as the rows above), but it is a different
+fine-tune, so this is same-prompt throughput only; its completions run
+7,778–8,830 tokens against NVFP4's 9,324–9,881. NVFP4 MTP5 is faster, but an
+earlier inspection found its pelican animation less faithful than MTP3's;
+therefore the launcher stays on MTP3 by default. Select MTP4/5 by adding
+`draft-tokens=4` or `draft-tokens=5` **immediately after** `model=...`, and
+review the resulting output.
 
 ### Three Agent First Requests
 
@@ -125,6 +137,25 @@ quality is more important than that measured decode gain. On the rebuilt
 server, this exact MTP5 command started with **297 MiB free on GPU 0**;
 if that margin is too small for your host, lower both context and KV capacity
 to 163,840 without giving up the 4,096-token prefill chunk.
+
+**Swift-1.5 — the NVFP4 profiles with its own path, in the measured
+configuration:**
+
+```bash
+tools/v100/ninfer-v100-duo.sh model=/absolute/path/to/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer \
+  draft-tokens=3 --max-context 131072 --prefill-chunk 4096 \
+  --max-concurrency 1 --kv-capacity 131072
+```
+
+It loads as the same `qwen3.8-27b` target, so every NVFP4 flag above and below
+applies with only the artifact path changed; this block is the exact
+configuration of its three measurement rows in the comparison above. It is the
+fastest of the three artifacts on that prompt (143.13 tok/s average with MTP3,
+163.13 tok/s with MTP5), but its completion quality was not inspected, so keep
+MTP3 unless you have reviewed MTP5's output. Its startup free memory at
+180,224 tokens has **not** been measured; if you use the NVFP4 180,224 profile
+above, check both GPUs after startup and reduce context/KV as described below
+when the margin is small.
 
 **GSQ-RCO — text default (one request or up to three concurrent):**
 
