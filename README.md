@@ -55,7 +55,54 @@ these numbers do not describe long-answer quality or end-to-end Agent latency.
 For these runs, generated token IDs matched the same workload on the build
 before the prefill fix.
 
-Reproduce from a CUDA build, replacing the executable and weight paths:
+### Long occupied contexts
+
+Measured with the official NVFP4 artifact, TP2, INT8 KV, CUDA Graph, optimized
+MTP3, a 180,224-token context capacity and 4,096-token prefill chunks. The
+code-chat token corpus has the occupied prompt lengths shown below. Each row
+is the mean of two uncached requests, with no discarded warmup; each request
+generates one prefill token and 1,024 measured decode tokens. Model loading
+is excluded.
+
+| Occupied prompt | First token | Prefill | Decode |
+|---:|---:|---:|---:|
+| 30,000 | 16.108 s | 1,862.5 tok/s | 118.5 tok/s |
+| 100,000 | 73.125 s | 1,367.6 tok/s | 91.9 tok/s |
+| 150,000 | 132.261 s | 1,134.2 tok/s | 78.0 tok/s |
+
+These fixed-output runs disable model stops and can continue past a natural
+stop; they measure throughput, not useful answer length or completion
+quality. Prompt contents differ by length. For the corpus generator and
+benchmark recipe, see [context decay](docs/performance.md#v100-duo-context-decay).
+
+### Agent first requests
+
+The Pi, Codex and Claude Agent SDKs sent their first requests to a local
+capture endpoint; no request was sent to a model provider. The captured
+system, tool and message fields were serialized and tokenized, then measured
+on the official NVFP4 artifact with TP2, INT8 KV, CUDA Graph, optimized MTP3,
+131,072-token context capacity and 4,096-token prefill chunks. Each result is
+the mean of three uncached Engine requests, with no measured-request warmup,
+followed by eight measured decode tokens.
+
+| Captured SDK | Input tokens | Engine first token | Prefill |
+|---|---:|---:|---:|
+| Pi | 1,296 | 0.675 s | 1,919.4 tok/s |
+| Codex | 11,689 | 5.735 s | 2,038.3 tok/s |
+| Claude Code | 16,362 | 8.208 s | 1,993.3 tok/s |
+
+First-token time starts at the Engine request and ends at its first generated
+token. It excludes model loading, SDK startup, protocol translation, network,
+Agent tool execution and UI rendering; it is not the time to the first visible
+character in a Codex client. The captured requests and SDK versions affect
+prompt length and performance. This capture used Pi SDK 0.73.1, Codex SDK
+0.158.0 and Claude Agent SDK 0.3.283. Capture and tokenization tools are in
+[agent_prefill](tools/v100/agent_prefill/README.md).
+
+### Reproduction
+
+For the fixed-corpus measurements above, use a CUDA build and replace the
+executable and weight paths:
 
 ```bash
 BENCH=/path/to/build/bench/ninfer_bench
@@ -67,6 +114,24 @@ CORPUS=bench/fixtures/bench_corpus.ids
 "$BENCH" --weights "$WEIGHTS" --corpus "$CORPUS" --tp 2 --devices 0,1 \
   --kv-dtype int8 --max-ctx 32768 --prefill-chunk 2048 \
   --mtp-draft-tokens 3 --lm-head-draft -pg 16384,256 --warmup 1 -r 3 -o json
+```
+
+For the SDK captures, install the harness dependencies as described in its
+README, then capture to a private temporary directory and tokenize with the
+same model. SDK updates can change the captured payload and token counts.
+
+```bash
+CAPTURE=/tmp/ninfer-agent-capture
+CORPUS_TOOL=/path/to/build/bench/ninfer_v100_corpus
+node tools/v100/agent_prefill/capture.mjs "$CAPTURE"
+for agent in pi codex claude; do
+  "$CORPUS_TOOL" "$WEIGHTS" "$CAPTURE/$agent.ids" "$CAPTURE/$agent.prompt.txt"
+  tokens=$(wc -l < "$CAPTURE/$agent.ids")
+  "$BENCH" --weights "$WEIGHTS" --corpus "$CAPTURE/$agent.ids" \
+    --tp 2 --devices 0,1 --kv-dtype int8 --max-ctx 131072 \
+    --prefill-chunk 4096 --mtp-draft-tokens 3 --lm-head-draft \
+    -pg "$tokens,8" --warmup 0 -r 3 -o json
+done
 ```
 
 ## Startup Profiles
