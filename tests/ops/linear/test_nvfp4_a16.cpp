@@ -42,6 +42,16 @@ int run_nvfp4_a16() {
     failures += run_shape("NVFP4_A16 TP2 down", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 8704, 711U, Comparison::Sampled, true,
                            new_problem_invocations});
+#ifdef NINFER_VOLTA_BUILD
+    constexpr std::array wide_tp2_invocations{
+        Invocation{127, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{128, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("NVFP4_A16 prepacked TP2 down wide", ActivationCompute::A16,
+                          make_nvfp4_weight,
+                          {5120, 8704, 713U, Comparison::Sampled, true, wide_tp2_invocations});
+#endif
     return failures;
 }
 

@@ -53,35 +53,30 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
                                           const std::uint8_t* __restrict__ scales, int n, int k,
                                           float inverse_weight_divisor,
                                           cutlass::half_t* __restrict__ out) {
-    const int row      = static_cast<int>(blockIdx.y);
-    const int segment  = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int segments_per_row = k / 8;
-    if (row >= n || segment >= segments_per_row) { return; }
-
-    const int group      = segment / 2;
-    const int group_half = segment & 1;
-    const int local_row  = row & 31;
-    const int qp         = local_row / 8;
-    const int r          = local_row & 7;
-    const int lane       = (qp << 2) | (r & 3) | ((r & 4) << 2);
-    const int groups     = k / 16;
-    const std::int64_t tuple =
-        (static_cast<std::int64_t>(row / 32) * groups + group) * 32 + lane;
+    // Adjacent threads read adjacent packed tuples and decode each K16 group once.
+    const std::int64_t tuple = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int groups = k / 16;
+    if (tuple >= static_cast<std::int64_t>(n) * groups) { return; }
+    const int lane = static_cast<int>(tuple & 31);
+    const int group = static_cast<int>((tuple / 32) % groups);
+    const int row = static_cast<int>(tuple / (static_cast<std::int64_t>(32) * groups)) * 32 +
+                    ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
     constexpr int inverse_order[16] = {0, 4, 1, 5, 2, 6, 3, 7,
                                        8, 12, 9, 13, 10, 14, 11, 15};
-    const std::uint8_t* packed = codes + tuple * 8;
+    const uint2 packed_words = __ldg(reinterpret_cast<const uint2*>(codes) + tuple);
+    const auto* packed = reinterpret_cast<const std::uint8_t*>(&packed_words);
     const float coefficient = decode_nvfp4_e4m3(scales[tuple]) * inverse_weight_divisor;
-    cutlass::half_t values[8];
+    alignas(16) cutlass::half_t values[16];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int logical_k = group_half * 8 + j;
-        const int position  = inverse_order[logical_k];
+    for (int j = 0; j < 16; ++j) {
+        const int position  = inverse_order[j];
         const float2 pair   = decode_nvfp4_e2m1x2(packed[position / 2]);
         values[j] = cutlass::half_t(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
     }
     auto* destination = reinterpret_cast<uint4*>(
-        out + static_cast<std::int64_t>(row) * k + segment * 8);
-    *destination = *reinterpret_cast<const uint4*>(values);
+        out + static_cast<std::int64_t>(row) * k + group * 16);
+    destination[0] = reinterpret_cast<const uint4*>(values)[0];
+    destination[1] = reinterpret_cast<const uint4*>(values)[1];
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -166,7 +161,7 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
 
     const dim3 block(256);
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        const dim3 grid(static_cast<unsigned>(div_up_i(k / 8, 256)), static_cast<unsigned>(n), 1u);
+        const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
         dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,

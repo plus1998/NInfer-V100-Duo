@@ -4,6 +4,9 @@
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/fp8/fp8_launch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_cutlass_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -73,9 +76,14 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     throw std::logic_error("unreachable FP8 linear problem");
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
+                WorkspaceArena* workspace, cudaStream_t stream) {
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
 #ifdef NINFER_VOLTA_BUILD
+    if (workspace != nullptr && x.ne[1] >= 128 && !is_fp8_vocabulary_problem(problem)) {
+        fp8_cutlass_sm70_launch(x, weight, out, *workspace, stream);
+        return;
+    }
     // The vocabulary head's A16 MMA kernel is ldmatrix-based and traps below sm_75, so on Volta it
     // takes the SIMT decode/small-T families like every other problem (registered in fp8_config.h).
     //
@@ -97,7 +105,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
 #ifdef NINFER_VOLTA_BUILD
-        if (fp8_volta_qpn_supported(weight.n, weight.k, active)) {
+        if (fp8_volta_qpn_supported(weight.n, weight.k, active) ||
+            (active == 1 && weight.layout == QuantLayout::VoltaQpnPrepacked)) {
             launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
             continue;
         }
@@ -152,6 +161,12 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);
+#ifdef NINFER_VOLTA_BUILD
+    if (policy == LinearPolicy::A16Only && max_tokens >= 128 &&
+        !is_fp8_vocabulary_problem(problem)) {
+        return fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
+    }
+#endif
     return interval_uses_a8(problem, policy, min_tokens, max_tokens)
                ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -162,7 +177,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     validate_fp8_weight(weight, "fp8 linear");
     const Fp8LinearRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Fp8LinearRoute::A16) {
-        launch_a16(x, weight, out, stream);
+        launch_a16(x, weight, out, workspace, stream);
         return;
     }
     if (workspace == nullptr) {

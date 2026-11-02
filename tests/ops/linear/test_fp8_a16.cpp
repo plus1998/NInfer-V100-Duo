@@ -105,6 +105,17 @@ int run_fp8_a16() {
     failures += run_shape("FP8_A16 Volta QPN prepacked", ActivationCompute::A16, make_fp8_weight,
                           {7168, 5120, 835U, Comparison::Sampled, true,
                            prepacked_invocations, true});
+#ifdef NINFER_VOLTA_BUILD
+    constexpr std::array wide_tp2_invocations{
+        Invocation{127, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{128, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("FP8_A16 Volta QPN prepacked TP2 down wide", ActivationCompute::A16,
+                          make_fp8_weight,
+                          {5120, 8704, 837U, Comparison::Sampled, true, wide_tp2_invocations,
+                           true});
+#endif
 
     auto packed = make_fp8_weight(14336, 5120, 831U);
     try {

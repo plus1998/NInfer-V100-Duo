@@ -4,6 +4,9 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -58,6 +61,22 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
+    // Prepacked QPN cannot use the native-layout wide-T MMA kernel. Materialize the
+    // weights once for the entire prefill instead of decoding them for each QPN tile.
+    if (weight.layout == QuantLayout::VoltaQpnPrepacked && workspace != nullptr &&
+        workspace->base() != nullptr &&
+        total_t >= 128) {
+        const std::size_t need = nvfp4_cutlass_sm70_workspace_bytes(weight.n, weight.k, total_t);
+        const std::size_t offset_mod =
+            (reinterpret_cast<std::uintptr_t>(workspace->base()) % 256 + workspace->used() % 256) %
+            256;
+        const std::size_t padding = (256 - offset_mod) % 256;
+        const std::size_t available = workspace->capacity() - workspace->used();
+        if (padding <= available && need <= available - padding) {
+            nvfp4_cutlass_sm70_launch(x, weight, out, *workspace, stream);
+            return;
+        }
+    }
     // Above QPN2's own range, a single wide-T MMA pass (nvfp4_volta_mma_gemm.cuh) beats
     // chunking through QPN2 in kNvfp4VoltaQpnMaxTokens pieces -- QPN2's whole design assumes T is
     // small enough that decoding the weight once per ~32 tokens is cheap; at prefill widths that
@@ -122,10 +141,17 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
     // so a caller sizing for the widest T this interval reaches has it available. A caller that
     // doesn't (the zero-workspace linear() overload) still works -- launch_a16 falls back to the
     // chunked route rather than fault.
-    if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
+    std::size_t bytes = 0;
+    if (max_tokens > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
-        return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
+        bytes = nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
     }
+    // The planner has no weight layout, so it must also cover prepacked weights.
+    if (max_tokens >= 128) {
+        bytes = std::max(bytes,
+                         nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens));
+    }
+    return bytes;
 #endif
     return 0;
 }
